@@ -3,3 +3,8 @@ uvicorn==0.44.0
 
 # Multipart parsing for the local video upload endpoint.
 python-multipart==0.0.20
+
+# Local speech-to-text (Milestone 3). Pulls in CTranslate2 and PyAV. Model
+# weights are downloaded on first use into the normal Hugging Face cache and are
+# never committed to the repository.
+faster-whisper==1.2.1

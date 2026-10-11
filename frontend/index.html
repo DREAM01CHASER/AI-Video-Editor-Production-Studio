@@ -77,13 +77,16 @@
             <button id="btn-run-demo" class="btn btn-ghost" type="button">Run layout demo</button>
           </div>
           <p id="processing-message" class="processing-message">Waiting to start…</p>
-          <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="processing-progress" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div id="progress-fill" class="progress-fill"></div>
           </div>
           <ol id="processing-steps" class="steps"></ol>
           <p id="processing-error" class="processing-error is-hidden" role="alert"></p>
           <p id="processing-log" class="processing-log" aria-label="Processing log"></p>
-          <p class="panel__hint">Layout demo only — nothing is analysed or rendered.</p>
+          <p class="panel__hint">
+            Layout animation only — this button neither analyses nor renders anything.
+            The real transcription button is in the Transcript panel below.
+          </p>
         </section>
 
         <section class="panel panel--preview">
@@ -115,6 +118,37 @@
           <p class="drop-zone__title">Drop a video here or click to browse</p>
           <p id="drop-zone-hint" class="drop-zone__hint">
             Supported: MP4, MOV, M4V, AVI, MKV, WebM. Files stay on this machine.
+          </p>
+        </section>
+
+        <section id="transcript-panel" class="panel">
+          <div class="panel__heading">
+            <h2>Transcript</h2>
+            <span id="transcript-badge" class="badge badge-muted">Not transcribed</span>
+          </div>
+
+          <div class="transcript-actions">
+            <button id="btn-transcribe" class="btn btn-primary" type="button" disabled
+              title="Import a video first — transcription runs on the imported source.">
+              Transcribe audio
+            </button>
+            <button id="btn-transcribe-cancel" class="btn btn-ghost is-hidden" type="button">Cancel</button>
+            <button id="btn-transcribe-retry" class="btn btn-ghost is-hidden" type="button">Retry</button>
+            <span id="transcript-summary" class="transcript-summary"></span>
+          </div>
+
+          <div id="transcribe-progress" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="transcribe-progress-fill" class="progress-fill"></div>
+          </div>
+
+          <p id="transcript-status" class="processing-message">Import a video, then transcribe it locally.</p>
+          <p id="transcript-error" class="processing-error is-hidden" role="alert"></p>
+          <ol id="transcript-list" class="transcript"></ol>
+          <p id="transcript-empty" class="transcript__empty">No transcript yet.</p>
+
+          <p class="panel__hint">
+            Transcription runs on this machine with faster-whisper. The first run may
+            download the model weights, so nothing appears until that finishes.
           </p>
         </section>
 
@@ -261,8 +295,8 @@
 
     <footer class="app-footer">
       <p>
-        Milestone 1 frontend shell. Sample data is illustrative; import, transcription,
-        clip suggestions, and export are implemented in later milestones.
+        Milestone 3. Import and local transcription are real. Sample data is illustrative:
+        clip suggestions, captions, and export are not implemented yet.
       </p>
     </footer>
 

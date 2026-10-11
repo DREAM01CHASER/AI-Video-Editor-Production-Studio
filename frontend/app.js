@@ -1,10 +1,15 @@
 /**
- * Frontend shell for the AI Video Production Studio.
+ * Frontend for the AI Video Production Studio.
  *
- * Import and the project list talk to the local FastAPI backend (Milestone 2).
- * Transcription, clip suggestions, captions, and rendering are still layout
- * only: their controls are disabled or clearly marked as a demo, and the
- * processing panel labels anything that is not real.
+ * Import, the project list, and local transcription talk to the FastAPI backend
+ * (Milestones 2 and 3). Transcription runs as a background job: the page starts
+ * it, polls /api/jobs/{id} for real progress, and then loads the saved transcript
+ * from /api/projects/{id}/transcript so a reload restores it without re-running
+ * the model.
+ *
+ * Clip suggestions, captions, and rendering are still layout only: their controls
+ * are disabled or clearly marked as a demo, and the processing panel labels
+ * anything that is not real.
  */
 
 const DEMO_PROJECT = {
@@ -77,6 +82,9 @@ const DEMO_STEPS = [
 
 const SUPPORTED_EXTENSIONS = [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"];
 
+/** How often the page asks the backend for transcription progress. */
+const TRANSCRIBE_POLL_MS = 800;
+
 const els = {
   projectName: document.getElementById("project-name"),
   projectId: document.getElementById("project-id-value"),
@@ -93,11 +101,22 @@ const els = {
   assetList: document.getElementById("asset-list"),
   processingPanel: document.getElementById("processing-panel"),
   processingMessage: document.getElementById("processing-message"),
-  progressBar: document.querySelector(".progress-bar"),
+  progressBar: document.getElementById("processing-progress"),
   progressFill: document.getElementById("progress-fill"),
   processingSteps: document.getElementById("processing-steps"),
   processingError: document.getElementById("processing-error"),
   processingLog: document.getElementById("processing-log"),
+  transcriptBadge: document.getElementById("transcript-badge"),
+  btnTranscribe: document.getElementById("btn-transcribe"),
+  btnTranscribeCancel: document.getElementById("btn-transcribe-cancel"),
+  btnTranscribeRetry: document.getElementById("btn-transcribe-retry"),
+  transcriptSummary: document.getElementById("transcript-summary"),
+  transcribeProgress: document.getElementById("transcribe-progress"),
+  transcribeProgressFill: document.getElementById("transcribe-progress-fill"),
+  transcriptStatus: document.getElementById("transcript-status"),
+  transcriptError: document.getElementById("transcript-error"),
+  transcriptList: document.getElementById("transcript-list"),
+  transcriptEmpty: document.getElementById("transcript-empty"),
   video: document.getElementById("video-element"),
   previewEmpty: document.getElementById("preview-empty"),
   previewEmptyHint: document.getElementById("preview-empty-hint"),
@@ -129,6 +148,14 @@ const state = {
   demoRunning: false,
   busy: false,
   projects: [],
+  transcript: {
+    document: null,
+    segments: [],
+    jobId: null,
+    timer: null,
+    failed: false,
+    lastMessage: "",
+  },
 };
 
 /* ----------------------------------------------------------- formatting */
@@ -157,6 +184,11 @@ function formatSize(bytes) {
 /** Read the backend's structured error envelope, falling back to a plain message. */
 function apiErrorMessage(payload, fallback) {
   return payload?.error?.message || fallback;
+}
+
+/** True when the open project is a real imported one that has a source file. */
+function isRealProject() {
+  return Boolean(state.project.id) && state.project.id !== DEMO_PROJECT.id;
 }
 
 /* ---------------------------------------------------------------- health */
@@ -196,9 +228,10 @@ function renderProjectList() {
     name.textContent = project.name || project.project_id;
     const meta = document.createElement("span");
     meta.className = "list__meta";
-    meta.textContent = project.duration
-      ? `${formatTimecode(project.duration)} · ${project.clip_count} clips`
-      : "Imported";
+    const parts = [];
+    if (project.duration) parts.push(formatTimecode(project.duration));
+    parts.push(project.has_transcript ? "transcribed" : "not transcribed");
+    meta.textContent = parts.join(" · ");
 
     button.append(name, meta);
     button.addEventListener("click", () => openProject(project.project_id));
@@ -273,6 +306,7 @@ function renderProject() {
   renderMetadata(project.source);
   renderCandidates();
   renderTimeline();
+  updateTranscribeControls();
 }
 
 function renderMetadata(source) {
@@ -479,6 +513,332 @@ els.video.addEventListener("error", () => {
   showError("This browser could not play the source video. The file is still saved to the project.");
 });
 
+/* -------------------------------------------------------- transcription */
+
+function setTranscribeProgress(percent) {
+  const value = Math.min(100, Math.max(0, Number(percent) || 0));
+  els.transcribeProgressFill.style.width = `${value}%`;
+  els.transcribeProgress.setAttribute("aria-valuenow", String(Math.round(value)));
+}
+
+function setTranscriptBadge(text, className) {
+  els.transcriptBadge.textContent = text;
+  els.transcriptBadge.className = className;
+}
+
+function showTranscriptError(message) {
+  els.transcriptError.textContent = message;
+  els.transcriptError.classList.remove("is-hidden");
+}
+
+function hideTranscriptError() {
+  els.transcriptError.textContent = "";
+  els.transcriptError.classList.add("is-hidden");
+}
+
+/**
+ * Enable transcription only for a real imported project, and only when no job is
+ * already running. Every disabled state has a reason in the button's title.
+ */
+function updateTranscribeControls() {
+  const real = isRealProject();
+  const running = Boolean(state.transcript.jobId);
+
+  els.btnTranscribe.disabled = !real || running || state.busy;
+  els.btnTranscribe.title = real
+    ? "Transcribe the source audio locally with faster-whisper."
+    : "Import a video first — transcription runs on the imported source.";
+
+  els.btnTranscribeCancel.classList.toggle("is-hidden", !running);
+
+  const canRetry =
+    real && !running && state.transcript.failed && state.transcript.segments.length === 0;
+  els.btnTranscribeRetry.classList.toggle("is-hidden", !canRetry);
+}
+
+/** Clear the transcript panel to its "nothing transcribed yet" state. */
+function resetTranscript(
+  statusText = "Import a video, then transcribe it locally.",
+  badgeText = "Not transcribed"
+) {
+  clearTimeout(state.transcript.timer);
+  state.transcript.timer = null;
+  state.transcript.jobId = null;
+  state.transcript.failed = false;
+  state.transcript.document = null;
+  state.transcript.segments = [];
+  state.transcript.lastMessage = "";
+
+  els.transcriptList.replaceChildren();
+  els.transcriptSummary.textContent = "";
+  els.transcriptEmpty.textContent = "No transcript yet.";
+  els.transcriptEmpty.classList.remove("is-hidden");
+  els.transcriptStatus.textContent = statusText;
+  setTranscriptBadge(badgeText, "badge badge-muted");
+  setTranscribeProgress(0);
+  hideTranscriptError();
+  updateTranscribeControls();
+}
+
+/** Render a saved transcript document and describe how it was produced. */
+function renderTranscript(document_) {
+  const segments = Array.isArray(document_?.segments) ? document_.segments : [];
+  state.transcript.document = document_ || null;
+  state.transcript.segments = segments;
+  state.transcript.failed = false;
+  state.transcript.lastMessage = "";
+
+  els.transcriptList.replaceChildren();
+
+  for (const [index, segment] of segments.entries()) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "transcript__item";
+    button.dataset.index = String(index);
+
+    const time = document.createElement("span");
+    time.className = "transcript__time";
+    time.textContent = formatTimecode(segment.start);
+
+    const text = document.createElement("span");
+    text.className = "transcript__text";
+    text.textContent = segment.text || "(no speech)";
+
+    button.append(time, text);
+    button.addEventListener("click", () => seekToSegment(index));
+    item.append(button);
+    els.transcriptList.append(item);
+  }
+
+  const empty = segments.length === 0;
+  els.transcriptEmpty.classList.toggle("is-hidden", !empty);
+  if (empty) {
+    els.transcriptEmpty.textContent =
+      "The model found no speech in this file. Check that the video has an audible audio track.";
+  }
+
+  const bits = [document_?.model, document_?.language, `${segments.length} segments`];
+  if (document_?.device) bits.push(String(document_.device).toUpperCase());
+  if (document_?.elapsed_seconds) bits.push(`${Number(document_.elapsed_seconds).toFixed(1)}s`);
+  if (document_?.has_word_timestamps) bits.push("word timings");
+  els.transcriptSummary.textContent = bits.filter(Boolean).join(" · ");
+
+  const notes = Array.isArray(document_?.notes) ? document_.notes : [];
+  els.transcriptStatus.textContent = notes.length
+    ? notes.join(" ")
+    : `Saved transcript for ${segments.length} segments.`;
+
+  setTranscriptBadge(`${segments.length} segments`, "badge status-ready");
+  setTranscribeProgress(100);
+  hideTranscriptError();
+  updateTranscribeControls();
+}
+
+/** Jump the preview to a transcript segment so timings can be checked by ear. */
+function seekToSegment(index) {
+  const segment = state.transcript.segments[index];
+  if (!segment) return;
+
+  for (const button of els.transcriptList.querySelectorAll(".transcript__item")) {
+    button.classList.toggle("is-active", button.dataset.index === String(index));
+  }
+
+  if (els.video.src) {
+    els.video.currentTime = Number(segment.start) || 0;
+  }
+}
+
+/** Load a saved transcript, returning null when there is nothing to show yet. */
+async function loadTranscript(projectId) {
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/transcript`, {
+      headers: { Accept: "application/json" },
+    });
+
+    // Both "project not found" and "no transcript yet" mean the same thing here.
+    if (response.status === 404) {
+      resetTranscript("This project has not been transcribed yet.");
+      return null;
+    }
+
+    const document_ = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(document_, `Could not read the transcript (HTTP ${response.status}).`)
+      );
+    }
+    return document_;
+  } catch (error) {
+    resetTranscript("The saved transcript could not be read.");
+    showTranscriptError(error.message);
+    return null;
+  }
+}
+
+async function startTranscription() {
+  const projectId = state.project.id;
+  if (!projectId || state.transcript.jobId) return;
+
+  hideTranscriptError();
+  state.transcript.failed = false;
+  state.transcript.lastMessage = "";
+  setTranscriptBadge("Starting…", "badge badge-demo");
+  els.transcriptStatus.textContent = "Starting local transcription…";
+  setTranscribeProgress(0);
+  els.processingLog.textContent = "";
+  log(`Starting local transcription for ${projectId}.`);
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/transcribe`,
+      { method: "POST" }
+    );
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(job, `Could not start transcription (HTTP ${response.status}).`)
+      );
+    }
+
+    state.transcript.jobId = job.job_id;
+    updateTranscribeControls();
+    pollTranscription(job.job_id, projectId);
+  } catch (error) {
+    state.transcript.failed = true;
+    setTranscriptBadge("Failed", "badge status-error");
+    els.transcriptStatus.textContent = "Transcription could not start.";
+    showTranscriptError(error.message);
+    updateTranscribeControls();
+  }
+}
+
+/**
+ * Poll a transcription job until it finishes.
+ *
+ * If the user opens another project while the job runs, progress keeps being
+ * fetched but is not painted onto the wrong project's panel.
+ */
+async function pollTranscription(jobId, projectId) {
+  const stillOpen = state.project.id === projectId;
+
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(job, `Lost track of the transcription job (HTTP ${response.status}).`)
+      );
+    }
+
+    if (stillOpen) {
+      setTranscribeProgress(job.progress);
+      els.transcriptStatus.textContent = job.message || job.status;
+      if (job.message && job.message !== state.transcript.lastMessage) {
+        state.transcript.lastMessage = job.message;
+        log(`Transcription ${Math.round(Number(job.progress) || 0)}% — ${job.message}`);
+      }
+    }
+
+    if (job.status === "succeeded") {
+      await onTranscriptionSucceeded(job, projectId, stillOpen);
+      return;
+    }
+    if (job.status === "failed") {
+      onTranscriptionFailed(job.error?.message || "Transcription failed.", stillOpen);
+      return;
+    }
+    if (job.status === "cancelled") {
+      onTranscriptionCancelled(stillOpen);
+      return;
+    }
+
+    state.transcript.timer = setTimeout(
+      () => pollTranscription(jobId, projectId),
+      TRANSCRIBE_POLL_MS
+    );
+  } catch (error) {
+    onTranscriptionFailed(error.message, stillOpen);
+  }
+}
+
+async function onTranscriptionSucceeded(job, projectId, stillOpen) {
+  state.transcript.jobId = null;
+  clearTimeout(state.transcript.timer);
+  state.transcript.timer = null;
+
+  const result = job.result || {};
+  log(
+    `Transcript saved: ${result.segment_count ?? 0} segments, language ${result.language}, ` +
+      `${result.model} on ${result.device}.`
+  );
+
+  if (!stillOpen) {
+    updateTranscribeControls();
+    await fetchProjects();
+    return;
+  }
+
+  setTranscriptBadge("Transcribed", "badge status-ready");
+  const document_ = await loadTranscript(projectId);
+  if (document_) {
+    renderTranscript(document_);
+  }
+  updateTranscribeControls();
+  await fetchProjects();
+}
+
+function onTranscriptionFailed(message, stillOpen = true) {
+  state.transcript.jobId = null;
+  state.transcript.failed = true;
+  clearTimeout(state.transcript.timer);
+  state.transcript.timer = null;
+  if (!stillOpen) return;
+
+  setTranscriptBadge("Failed", "badge status-error");
+  els.transcriptStatus.textContent = "Transcription failed.";
+  showTranscriptError(message);
+  log(`Error: ${message}`);
+  updateTranscribeControls();
+}
+
+function onTranscriptionCancelled(stillOpen = true) {
+  state.transcript.jobId = null;
+  state.transcript.failed = true;
+  clearTimeout(state.transcript.timer);
+  state.transcript.timer = null;
+  if (!stillOpen) return;
+
+  setTranscriptBadge("Cancelled", "badge badge-muted");
+  els.transcriptStatus.textContent = "Transcription cancelled. Retry when ready.";
+  setTranscribeProgress(0);
+  log("Transcription cancelled.");
+  updateTranscribeControls();
+}
+
+async function cancelTranscription() {
+  const jobId = state.transcript.jobId;
+  if (!jobId) return;
+
+  els.btnTranscribeCancel.disabled = true;
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(job, `Could not cancel (HTTP ${response.status}).`));
+    }
+    els.transcriptStatus.textContent = "Cancelling…";
+  } catch (error) {
+    showTranscriptError(error.message);
+  } finally {
+    els.btnTranscribeCancel.disabled = false;
+  }
+}
+
 /* -------------------------------------------------- projects from backend */
 
 function projectFromServer(payload) {
@@ -510,10 +870,21 @@ function projectFromServer(payload) {
   els.dropZoneHint.textContent = `${state.project.name} · saved in the local workspace.`;
   els.previewEmptyHint.textContent = "Source video loaded from the local workspace.";
 
+  resetTranscript("This project has not been transcribed yet.");
   renderProjectList();
   renderProject();
   setPreviewSource(`/api/projects/${payload.project_id}/source`);
   selectCandidate(null);
+
+  // Restore an existing transcript without re-running the model.
+  if (payload.transcript) {
+    els.transcriptStatus.textContent = "Loading the saved transcript…";
+    loadTranscript(payload.project_id).then((document_) => {
+      if (document_ && state.project.id === payload.project_id) {
+        renderTranscript(document_);
+      }
+    });
+  }
 }
 
 async function openProject(projectId) {
@@ -543,6 +914,7 @@ function loadDemoProject() {
   els.previewEmptyHint.textContent =
     "Sample project loaded — import a video to preview real footage.";
   resetPreview();
+  resetTranscript("Import a video to transcribe it — the sample project has no media.");
   renderProjectList();
   renderProject();
   selectCandidate(state.selectedId);
@@ -569,6 +941,7 @@ function handleFile(file) {
 async function uploadFile(file) {
   state.busy = true;
   els.btnImport.disabled = true;
+  updateTranscribeControls();
   hideError();
   showProcessing(`Uploading ${file.name}…`, INGEST_STEPS);
   setProgress(10);
@@ -602,6 +975,7 @@ async function uploadFile(file) {
     state.busy = false;
     els.btnImport.disabled = false;
     els.fileInput.value = "";
+    updateTranscribeControls();
   }
 }
 
@@ -742,6 +1116,10 @@ els.dropZone.addEventListener("drop", (event) => {
 
 els.btnRunDemo.addEventListener("click", runProcessingDemo);
 
+els.btnTranscribe.addEventListener("click", startTranscription);
+els.btnTranscribeRetry.addEventListener("click", startTranscription);
+els.btnTranscribeCancel.addEventListener("click", cancelTranscription);
+
 // Export stays disabled until the render milestone; the title explains why.
 els.btnExport.title =
   "Rendering is not implemented yet; it arrives in the captions and export milestone.";
@@ -752,6 +1130,7 @@ function resetToEmptyProject() {
   els.dataSourceBadge.textContent = "No project";
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();
+  resetTranscript();
   renderProject();
   renderProjectList();
   selectCandidate(null);

@@ -1,8 +1,13 @@
-"""HTTP routes for project creation and local video ingest.
+"""HTTP routes for project creation, local video ingest, and transcription.
 
 Uploads are streamed to a project-scoped temp file in bounded chunks, probed with
 FFprobe, then moved into the project's ``source/`` directory, so a large video is
 never held in memory.
+
+Transcription is asynchronous: ``POST /api/projects/{id}/transcribe`` starts a
+background job and returns it, and the client polls ``GET /api/jobs/{job_id}``
+for real progress. ``GET /api/projects/{id}/transcript`` returns the saved
+transcript so the UI can restore it without re-running the model.
 """
 
 from __future__ import annotations
@@ -14,17 +19,28 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from .errors import ApiError
+from .jobs import JobRegistry
 from .media import probe_video
 from .projects import ProjectStore
 from .storage import CONTENT_TYPES_BY_EXTENSION, validate_upload_metadata
+from .transcription import TranscriptionService
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+TRANSCRIBE_JOB_KIND = "transcribe"
 
 
 def _store(request: Request) -> ProjectStore:
     return request.app.state.projects
+
+
+def _jobs(request: Request) -> JobRegistry:
+    return request.app.state.jobs
+
+
+def _transcriber(request: Request) -> TranscriptionService:
+    return request.app.state.transcriber
 
 
 def _media_type(path: Path) -> str:
@@ -130,3 +146,92 @@ def get_project_source(project_id: str, request: Request) -> FileResponse:
     project = store.load(project_id)
     path = store.source_path(project)
     return FileResponse(path, media_type=_media_type(path))
+
+
+@router.get("/projects/{project_id}/transcript")
+def get_project_transcript(project_id: str, request: Request) -> dict[str, object]:
+    """Return the saved transcript for a project.
+
+    Raises a structured 404 when the project has not been transcribed yet, so the
+    UI can tell "not transcribed" apart from "transcription failed".
+    """
+
+    return _store(request).load_transcript(project_id)
+
+
+@router.post("/projects/{project_id}/transcribe", status_code=202)
+def start_transcription(project_id: str, request: Request) -> dict[str, object]:
+    """Start local transcription and return the job to poll.
+
+    The work runs on a background thread because transcription takes far longer
+    than an HTTP request, and the project may only have one transcription in
+    flight at a time.
+    """
+
+    # Capture everything the worker needs now: the Request is not valid once the
+    # response has been sent.
+    store = _store(request)
+    registry = _jobs(request)
+    service = _transcriber(request)
+
+    project = store.load(project_id)
+    source_path = store.source_path(project)
+
+    existing = registry.running_for(TRANSCRIBE_JOB_KIND, project_id)
+    if existing is not None:
+        raise ApiError(
+            "transcription_in_progress",
+            f"A transcription is already running for this project (job "
+            f"{existing.id[:8]}). Wait for it to finish or cancel it first.",
+            409,
+        )
+
+    source_video = str(project.get("source_video") or "")
+    metadata = project.get("source_metadata") or {}
+    duration_hint = float(metadata.get("duration") or 0.0)
+
+    job = registry.create(TRANSCRIBE_JOB_KIND, subject=project_id)
+
+    def work() -> dict[str, object]:
+        document, _loaded = service.transcribe(
+            source_path=source_path,
+            project_id=project_id,
+            source_video=source_video,
+            duration_hint=duration_hint,
+            progress=lambda value, message: registry.update(
+                job, progress=value, message=message
+            ),
+            should_cancel=lambda: registry.is_cancel_requested(job.id),
+        )
+        registry.update(job, progress=99.0, message="Saving transcript…")
+        saved = store.save_transcript(project_id, document)
+        return {
+            "project_id": project_id,
+            "transcript": saved.get("transcript"),
+            "segment_count": document.get("segment_count"),
+            "language": document.get("language"),
+            "model": document.get("model"),
+            "device": document.get("device"),
+            "has_word_timestamps": document.get("has_word_timestamps"),
+        }
+
+    registry.start(job, work)
+    return job.as_dict()
+
+
+@router.get("/jobs/{job_id}")
+def get_job(job_id: str, request: Request) -> dict[str, object]:
+    """Return the current state of a background job."""
+
+    return _jobs(request).get(job_id).as_dict()
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, request: Request) -> dict[str, object]:
+    """Ask a running job to stop.
+
+    The work checks the flag as it makes progress, so cancellation happens
+    between decoded segments rather than killing the thread mid-write.
+    """
+
+    return _jobs(request).request_cancel(job_id).as_dict()

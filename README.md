@@ -41,9 +41,23 @@ Milestone 2 makes video import real:
 - The frontend import button, drop zone, project list, metadata panel, and
   preview are wired to the live API.
 
-Transcription, clip suggestions, captions, and rendering are planned for later
-milestones. Their controls are present for layout but **disabled or clearly
-marked as a demo** — no button pretends to transcribe video or export a file.
+Milestone 3 makes transcription real:
+
+- `POST /api/projects/{project_id}/transcribe` starts a background job and
+  `GET /api/jobs/{job_id}` reports **real progress**, measured from decoded
+  segments rather than animated.
+- Speech is transcribed **locally** with `faster-whisper`; the source video is
+  decoded directly, so no intermediate audio file is written.
+- Word-level timings are saved per segment when the model provides them, and
+  segment timings are used when it does not — timings are never invented.
+- The transcript is saved to `transcripts/transcript.json` and referenced from
+  `project.json`, so reopening a project restores it without re-running the model.
+- GPU is used when available, with an automatic CPU/int8 fallback recorded in the
+  transcript, and a cancel/retry control in the UI.
+
+Clip suggestions, captions, and rendering are planned for later milestones. Their
+controls are present for layout but **disabled or clearly marked as a demo** — no
+button pretends to suggest clips, caption video, or export a file.
 
 ## Working directory
 
@@ -111,6 +125,10 @@ Stop the server with `Ctrl+C`.
 | `GET` | `/api/projects` | List saved projects for the sidebar. |
 | `GET` | `/api/projects/{project_id}` | Read the saved JSON project document. |
 | `GET` | `/api/projects/{project_id}/source` | Serve the source video for browser preview. |
+| `POST` | `/api/projects/{project_id}/transcribe` | Start local transcription; returns `202` and the job. |
+| `GET` | `/api/jobs/{job_id}` | Poll a job's status, progress, and result. |
+| `POST` | `/api/jobs/{job_id}/cancel` | Ask a running job to stop between segments. |
+| `GET` | `/api/projects/{project_id}/transcript` | Read the saved transcript (`404` until it exists). |
 
 Upload limits and supported formats come from `.env`/`.env.example`
 (`MAX_UPLOAD_SIZE_MB`). Accepted containers are MP4, MOV, M4V, AVI, MKV, and
@@ -122,16 +140,44 @@ WebM; the original filename is never used as the stored filename.
 python -m pytest
 ```
 
-The suite also asserts the frontend shell exposes the expected layout and keeps
-sample data clearly labelled. The interface can be opened without any API key,
-AI model, or uploaded media.
+The suite asserts the frontend shell exposes the expected layout and keeps sample
+data clearly labelled, and it covers the transcription helpers, the job registry,
+and transcript persistence without needing a model at all. The end-to-end
+transcription test synthesises real speech, runs the **real** Whisper model, and
+checks that the transcript is readable with usable timestamps; it is skipped with
+an explicit reason when FFmpeg, Windows speech synthesis, or the cached model is
+unavailable, so it never silently passes.
+
+The interface can be opened without any API key or uploaded media, but
+transcription needs `faster-whisper` and a model.
+
+## Transcription settings
+
+Transcription defaults to the `medium` model and can be tuned through `.env`
+(see `.env.example` for every option):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WHISPER_MODEL` | `medium` | Model name, or a path to a converted CTranslate2 model directory. |
+| `WHISPER_DEVICE` | `auto` | `auto`, `cpu`, or `cuda`. `auto` prefers a GPU when one is visible. |
+| `WHISPER_COMPUTE_TYPE` | `auto` | `auto` means `float16` on GPU and `int8` on CPU. |
+| `WHISPER_LANGUAGE` | *(detect)* | Leave empty to detect the spoken language. |
+| `WHISPER_ALLOW_DOWNLOAD` | `true` | Allow downloading weights on first use. |
+
+**The first transcription downloads model weights**, which takes a while and
+needs an internet connection; after that the model is reused from the normal
+Hugging Face cache. Set `WHISPER_ALLOW_DOWNLOAD=false` to stay offline —
+transcription then reports a clear error unless the model is already cached.
+A CUDA device that is visible but missing its cuDNN/cuBLAS runtime falls back to
+CPU automatically, and the fallback is recorded in the transcript.
 
 ## System tools
 
 **FFprobe and FFmpeg must be installed and available on `PATH`.** Video import
 reads metadata with FFprobe, so importing reports a clear error if the tools are
-missing. FFmpeg itself is used from the rendering milestone onward; both are
-system tools, not Python packages.
+missing. Transcription itself does not need FFmpeg because `faster-whisper`
+decodes audio through PyAV; FFmpeg is required from the rendering milestone
+onward. Both are system tools, not Python packages.
 
 Check the installation with:
 

@@ -14,8 +14,11 @@ from pathlib import Path
 
 from .errors import ApiError
 from .storage import ProjectWorkspace, Workspace, is_valid_project_id
+from .transcription import transcript_summary
 
 PROJECT_FILE_NAME = "project.json"
+TRANSCRIPT_FILE_NAME = "transcript.json"
+TRANSCRIPT_RELATIVE_PATH = f"transcripts/{TRANSCRIPT_FILE_NAME}"
 
 DEFAULT_CAPTION_STYLE = {
     "preset": "bold-highlight",
@@ -68,6 +71,7 @@ class ProjectStore:
             "updated_at": _utcnow(),
             "source_video": source_video,
             "source_metadata": source_metadata,
+            "transcript": None,
             "clips": [],
             "caption_style": dict(DEFAULT_CAPTION_STYLE),
             "export": dict(DEFAULT_EXPORT),
@@ -108,18 +112,72 @@ class ProjectStore:
                 500,
             ) from exc
 
-    def source_path(self, project: dict) -> Path:
-        """Resolve the project's source video, refusing any path escape."""
+    def _resolve_inside(
+        self, project_id: str, relative: str, *, code: str, message: str
+    ) -> Path:
+        """Resolve a project-relative path, refusing any escape from the project."""
 
-        relative = str(project.get("source_video") or "")
-        project_root = self._project_root(str(project.get("project_id", ""))).resolve()
+        project_root = self._project_root(project_id).resolve()
         candidate = (project_root / relative).resolve()
 
         if not candidate.is_relative_to(project_root) or not candidate.is_file():
-            raise ApiError(
-                "source_missing", "The source video for this project is not available.", 404
-            )
+            raise ApiError(code, message, 404)
         return candidate
+
+    def source_path(self, project: dict) -> Path:
+        """Resolve the project's source video, refusing any path escape."""
+
+        return self._resolve_inside(
+            str(project.get("project_id", "")),
+            str(project.get("source_video") or ""),
+            code="source_missing",
+            message="The source video for this project is not available.",
+        )
+
+    def save_transcript(self, project_id: str, document: dict) -> dict:
+        """Write the transcript JSON and reference it from ``project.json``.
+
+        The transcript is written to its own file rather than inlined into the
+        project document, so a long transcript does not bloat every project read.
+        """
+
+        project = self.load(project_id)
+        transcripts = ProjectWorkspace(
+            self._project_root(project_id)
+        ).ensure_layout().transcripts
+
+        target = transcripts / TRANSCRIPT_FILE_NAME
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        temporary.replace(target)
+
+        project["transcript"] = transcript_summary(document)
+        return self.save(project)
+
+    def transcript_path(self, project: dict) -> Path:
+        """Resolve the project's saved transcript, refusing any path escape."""
+
+        reference = project.get("transcript") or {}
+        return self._resolve_inside(
+            str(project.get("project_id", "")),
+            str(reference.get("path") or TRANSCRIPT_RELATIVE_PATH),
+            code="transcript_not_found",
+            message="This project has no transcript yet.",
+        )
+
+    def load_transcript(self, project_id: str) -> dict:
+        """Read a saved transcript document, or raise a structured 404."""
+
+        project = self.load(project_id)
+        path = self.transcript_path(project)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ApiError(
+                "transcript_unreadable",
+                f"The saved transcript for project '{project_id}' could not be read.",
+                500,
+            ) from exc
 
     def list_summaries(self) -> list[dict]:
         """List saved projects, newest first, without loading full documents."""
@@ -147,6 +205,7 @@ class ProjectStore:
                     "updated_at": project.get("updated_at"),
                     "duration": metadata.get("duration"),
                     "clip_count": len(project.get("clips") or []),
+                    "has_transcript": bool(project.get("transcript")),
                 }
             )
 
