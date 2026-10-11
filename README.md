@@ -45,10 +45,24 @@ Transcription, clip suggestions, captions, and rendering are planned for later
 milestones. Their controls are present for layout but **disabled or clearly
 marked as a demo** — no button pretends to transcribe video or export a file.
 
+## Working directory
+
+Every command in this README must be run from the project folder
+`AI-Video-Editor-Production-Studio` — the folder that contains `app/`,
+`frontend/`, `tests/`, and `requirements.txt`. It is **not** the folder above it.
+
+```powershell
+cd "$HOME\Documents\Ai video production studio\AI-Video-Editor-Production-Studio"
+```
+
+Running the server from the parent folder fails with
+`ModuleNotFoundError: No module named 'app'` because Python looks for the
+`app` package in the current directory.
+
 ## Windows setup
 
-Install Python 3.11 or newer, then run these commands from the repository root
-in PowerShell:
+Install Python 3.11 or newer, then run these commands from the project folder
+shown above in PowerShell:
 
 ```powershell
 py -3 -m venv .venv
@@ -70,6 +84,8 @@ it is ignored by Git.
 
 ## Run the local app
 
+From the project folder (`ls app` should list `main.py`):
+
 ```powershell
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -79,6 +95,12 @@ Open <http://127.0.0.1:8000/> in a browser. The health endpoint is available at
 <http://127.0.0.1:8000/docs>.
 
 Stop the server with `Ctrl+C`.
+
+| Error | Cause and fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'app'` | You are in the wrong folder. `cd` into the project folder and retry. |
+| `ModuleNotFoundError: No module named 'uvicorn'` | Dependencies are not installed for the Python you are running. Activate `.venv`, or `python -m pip install -r requirements.txt`. |
+| `[Errno 10048] address already in use` | A server is already on port 8000. Stop it, or start this one with `--port 8001`. |
 
 ## API
 
