@@ -73,6 +73,7 @@ class ProjectStore:
             "source_metadata": source_metadata,
             "transcript": None,
             "clips": [],
+            "clip_analysis": None,
             "caption_style": dict(DEFAULT_CAPTION_STYLE),
             "export": dict(DEFAULT_EXPORT),
             "assets": [],
@@ -178,6 +179,46 @@ class ProjectStore:
                 f"The saved transcript for project '{project_id}' could not be read.",
                 500,
             ) from exc
+
+    def save_clips(self, project_id: str, clips: list[dict], analysis: dict) -> dict:
+        """Store suggested clips and the analysis that produced them.
+
+        Clips live in ``project.json`` because the project document is the source
+        of truth for the edit, and they stay small: a handful of candidates.
+        """
+
+        project = self.load(project_id)
+        project["clips"] = clips
+        project["clip_analysis"] = analysis
+        return self.save(project)
+
+    def load_clips(self, project_id: str) -> dict:
+        """Return saved clips plus whether they still match the current transcript."""
+
+        project = self.load(project_id)
+        analysis = project.get("clip_analysis") or None
+        transcript = project.get("transcript") or {}
+
+        # Re-transcribing makes earlier suggestions out of date, so say so rather
+        # than presenting stale suggestions as current.
+        based_on = (analysis or {}).get("based_on_transcript_generated_at")
+        current = transcript.get("generated_at")
+        stale = bool(based_on and current and based_on != current)
+
+        return {
+            "clips": project.get("clips") or [],
+            "analysis": analysis,
+            "stale": stale,
+            "has_transcript": bool(project.get("transcript")),
+            "source_duration": (project.get("source_metadata") or {}).get("duration"),
+        }
+
+    def replace_clips(self, project_id: str, clips: list[dict]) -> dict:
+        """Save edited clips without touching the analysis that produced them."""
+
+        project = self.load(project_id)
+        project["clips"] = clips
+        return self.save(project)
 
     def list_summaries(self) -> list[dict]:
         """List saved projects, newest first, without loading full documents."""

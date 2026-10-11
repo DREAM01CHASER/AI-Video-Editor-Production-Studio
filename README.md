@@ -55,9 +55,29 @@ Milestone 3 makes transcription real:
 - GPU is used when available, with an automatic CPU/int8 fallback recorded in the
   transcript, and a cancel/retry control in the UI.
 
-Clip suggestions, captions, and rendering are planned for later milestones. Their
-controls are present for layout but **disabled or clearly marked as a demo** — no
-button pretends to suggest clips, caption video, or export a file.
+Milestone 4 makes clip suggestion real:
+
+- `POST /api/projects/{project_id}/suggest-clips` proposes 3–5 candidate clips
+  from the saved transcript, and `PATCH .../clips` saves your in/out edits.
+- Detection uses a **transparent heuristic** over transcript segments, so it needs
+  no API key, no download, and no network. Each candidate reports the signals
+  behind its score: opening hook markers, whether the cut points land on sentence
+  boundaries, words per second, and length.
+- Every score is labelled an **estimate of how self-contained and information-dense
+  a moment is**. It is never presented as a prediction of virality, and no copy
+  claims a clip will perform well.
+- Candidates that duplicate an already-chosen moment are dropped and the count is
+  reported, while any remaining overlap is flagged on the candidates themselves.
+- Whisper does not always punctuate, so when a transcript has little sentence
+  punctuation the clip edges are described as estimates that may need a trim —
+  rather than being presented as exact sentence boundaries.
+- An **optional** LLM pass can rewrite titles, reasons, and scores when a key is
+  configured. It is off by default, it can never change clip times, and if it is
+  unavailable the heuristic result is used and the analysis says why.
+
+Captions and rendering are planned for later milestones. Their controls are
+present for layout but **disabled or clearly marked as a demo** — no button
+pretends to caption video or export a file.
 
 ## Working directory
 
@@ -129,6 +149,9 @@ Stop the server with `Ctrl+C`.
 | `GET` | `/api/jobs/{job_id}` | Poll a job's status, progress, and result. |
 | `POST` | `/api/jobs/{job_id}/cancel` | Ask a running job to stop between segments. |
 | `GET` | `/api/projects/{project_id}/transcript` | Read the saved transcript (`404` until it exists). |
+| `POST` | `/api/projects/{project_id}/suggest-clips` | Detect candidate clips from the transcript (`409` until transcribed). |
+| `GET` | `/api/projects/{project_id}/clips` | Read saved candidates, plus whether they are stale. |
+| `PATCH` | `/api/projects/{project_id}/clips` | Save edited in/out points, titles, and scores. |
 
 Upload limits and supported formats come from `.env`/`.env.example`
 (`MAX_UPLOAD_SIZE_MB`). Accepted containers are MP4, MOV, M4V, AVI, MKV, and
@@ -148,8 +171,13 @@ checks that the transcript is readable with usable timestamps; it is skipped wit
 an explicit reason when FFmpeg, Windows speech synthesis, or the cached model is
 unavailable, so it never silently passes.
 
+The clip tests are fully offline: they cover the heuristic signals, the boundary
+and title handling for transcripts without punctuation, overlap and near-duplicate
+flagging, edit validation, and the optional LLM pass through an injected transport
+so no request is ever made.
+
 The interface can be opened without any API key or uploaded media, but
-transcription needs `faster-whisper` and a model.
+transcription needs `faster-whisper` and a model. Clip suggestion needs neither.
 
 ## Transcription settings
 
@@ -170,6 +198,22 @@ Hugging Face cache. Set `WHISPER_ALLOW_DOWNLOAD=false` to stay offline —
 transcription then reports a clear error unless the model is already cached.
 A CUDA device that is visible but missing its cuDNN/cuBLAS runtime falls back to
 CPU automatically, and the fallback is recorded in the transcript.
+
+## Optional LLM clip labels
+
+Clip detection works with no key at all. If you want model-written titles and
+reasons, set an OpenAI-compatible endpoint in `.env`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LLM_API_KEY` | *(empty)* | Empty keeps the optional pass off. The key stays server-side. |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible base URL. |
+| `LLM_MODEL` | `gpt-4o-mini` | Model used to re-label candidates. |
+
+The model may only rewrite titles, reasons, and scores. Clip **times always come
+from the transcript**, so a hallucinated time range can never reach the timeline or
+a render. If the call fails for any reason, the heuristic result is used and the
+analysis explains that the optional pass was unavailable.
 
 ## System tools
 

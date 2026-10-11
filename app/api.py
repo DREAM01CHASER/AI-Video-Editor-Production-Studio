@@ -15,10 +15,12 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
+from .llm import LlmSettings, make_ranker
 from .jobs import JobRegistry
 from .media import probe_video
 from .projects import ProjectStore
@@ -235,3 +237,185 @@ def cancel_job(job_id: str, request: Request) -> dict[str, object]:
     """
 
     return _jobs(request).request_cancel(job_id).as_dict()
+
+
+# ------------------------------------------------------------------- clips
+
+#: Slack allowed for a clip end, so rounding cannot push a clip past the source.
+CLIP_EDIT_TOLERANCE = 0.5
+
+
+def _source_duration(project: dict) -> float:
+    metadata = project.get("source_metadata") or {}
+    try:
+        return float(metadata.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clip_title(value: object, fallback: str) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:120] or fallback
+
+
+@router.get("/projects/{project_id}/clips")
+def get_project_clips(project_id: str, request: Request) -> dict[str, object]:
+    """Return saved candidate clips, empty before any are suggested."""
+
+    return _store(request).load_clips(project_id)
+
+
+@router.post("/projects/{project_id}/suggest-clips")
+def suggest_project_clips(project_id: str, request: Request) -> dict[str, object]:
+    """Detect candidate clips from the saved transcript and store them.
+
+    This runs synchronously on purpose: the heuristic is a pure computation over
+    a few hundred segments, so wrapping it in a background job would only add a
+    polling loop without any benefit.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+
+    if not project.get("transcript"):
+        raise ApiError(
+            "transcript_required",
+            "Transcribe this project before suggesting clips.",
+            409,
+        )
+
+    transcript = store.load_transcript(project_id)
+
+    # The optional LLM pass is built only when a key is configured, and it can
+    # only re-label candidates: the clip times always come from the transcript.
+    runtime = request.app.state.settings
+    ranker = None
+    if runtime.llm_api_key:
+        ranker = make_ranker(
+            LlmSettings(
+                api_key=runtime.llm_api_key,
+                base_url=runtime.llm_base_url,
+                model=runtime.llm_model,
+            )
+        )
+
+    result = suggest_clips(transcript, ranker=ranker)
+    analysis = result["analysis"]
+
+    if ranker is not None:
+        if analysis["generator"] == GENERATOR_HEURISTIC:
+            analysis["notes"].append(
+                "An LLM key is configured but the optional pass was unavailable, so "
+                "the transparent heuristic result is shown."
+            )
+        else:
+            analysis["llm_model"] = runtime.llm_model
+
+    saved = store.save_clips(project_id, result["clips"], analysis)
+
+    return {
+        "clips": saved.get("clips") or [],
+        "analysis": saved.get("clip_analysis"),
+    }
+
+
+@router.patch("/projects/{project_id}/clips")
+def update_project_clips(
+    request: Request, project_id: str, payload: dict = Body(...)
+) -> dict[str, object]:
+    """Save edits to candidate clip in/out points, titles, and scores.
+
+    Every timestamp is validated against the project's own clips and the source
+    duration, so a bad or hostile edit cannot be stored. Only the clips named in
+    the request change; the rest are left alone.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    existing = project.get("clips") or []
+
+    if not existing:
+        raise ApiError(
+            "no_clips", "This project has no candidate clips to edit yet.", 404
+        )
+
+    updates = payload.get("clips")
+    if not isinstance(updates, list):
+        raise ApiError(
+            "invalid_clip_edit", "Send a JSON object containing a 'clips' list.", 422
+        )
+
+    duration = _source_duration(project) or max(
+        float(clip.get("source_end") or 0.0) for clip in existing
+    )
+    by_id = {str(clip.get("id")): clip for clip in existing}
+
+    for item in updates:
+        if not isinstance(item, dict):
+            raise ApiError(
+                "invalid_clip_edit", "Each clip edit must be a JSON object.", 422
+            )
+
+        clip_id = str(item.get("id") or "")
+        clip = by_id.get(clip_id)
+        if clip is None:
+            raise ApiError(
+                "invalid_clip_edit",
+                f"This project has no candidate clip with id '{clip_id}'.",
+                422,
+            )
+
+        try:
+            start = float(item.get("source_start"))
+            end = float(item.get("source_end"))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(
+                "invalid_clip_edit",
+                f"Clip {clip_id} needs numeric source_start and source_end values.",
+                422,
+            ) from exc
+
+        if start < 0:
+            raise ApiError(
+                "invalid_clip_edit",
+                f"Clip {clip_id} cannot start before 0 seconds.",
+                422,
+            )
+        if end <= start:
+            raise ApiError(
+                "invalid_clip_edit",
+                f"Clip {clip_id} ends at {end:.2f}s, which is not after its start at "
+                f"{start:.2f}s.",
+                422,
+            )
+        if duration and end > duration + CLIP_EDIT_TOLERANCE:
+            raise ApiError(
+                "invalid_clip_edit",
+                f"Clip {clip_id} ends at {end:.2f}s, past the end of the "
+                f"{duration:.2f}s source.",
+                422,
+            )
+
+        clip["source_start"] = round(start, 3)
+        clip["source_end"] = round(end, 3)
+        clip["duration"] = round(end - start, 3)
+        # Mark the clip as human-adjusted so the UI can show that it no longer
+        # reflects the original suggestion.
+        clip["edited"] = True
+
+        if "title" in item:
+            clip["title"] = _clip_title(item.get("title"), str(clip.get("title") or clip_id))
+
+        if "score" in item:
+            try:
+                score = float(item.get("score"))
+            except (TypeError, ValueError) as exc:
+                raise ApiError(
+                    "invalid_clip_edit",
+                    f"Clip {clip_id} needs a numeric score between 0 and 1.",
+                    422,
+                ) from exc
+            clip["score"] = round(min(1.0, max(0.0, score)), 3)
+
+    saved = store.replace_clips(project_id, existing)
+    return {"clips": saved.get("clips") or []}

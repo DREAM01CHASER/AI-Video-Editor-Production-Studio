@@ -6,6 +6,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .llm import DEFAULT_BASE_URL as DEFAULT_LLM_BASE_URL
+from .llm import DEFAULT_MODEL as DEFAULT_LLM_MODEL
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
@@ -84,6 +87,12 @@ class Settings:
     #: cache, which is also shared with other local tools.
     model_cache_dir: Path | None = None
 
+    #: Optional LLM pass for clip labelling. It stays disabled unless a key is
+    #: supplied, and the heuristic result is used whenever it is unavailable.
+    llm_api_key: str | None = None
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
+    llm_model: str = DEFAULT_LLM_MODEL
+
     @classmethod
     def from_environment(cls) -> "Settings":
         workspace_value = os.getenv("AI_VIDEO_WORKSPACE", "workspace").strip()
@@ -123,4 +132,7 @@ class Settings:
             ),
             whisper_cpu_threads=_positive_int(os.getenv("WHISPER_CPU_THREADS"), 0),
             model_cache_dir=model_cache_dir,
+            llm_api_key=os.getenv("LLM_API_KEY", "").strip() or None,
+            llm_base_url=_text(os.getenv("LLM_BASE_URL"), DEFAULT_LLM_BASE_URL),
+            llm_model=_text(os.getenv("LLM_MODEL"), DEFAULT_LLM_MODEL),
         )

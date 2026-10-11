@@ -155,10 +155,19 @@
         <section class="panel">
           <div class="panel__heading">
             <h2>Suggested clips</h2>
-            <span id="candidates-count" class="badge badge-muted">0</span>
+            <div class="panel__actions">
+              <span id="candidates-count" class="badge badge-muted">0</span>
+              <button id="btn-suggest-clips" class="btn btn-secondary" type="button" disabled
+                title="Transcribe this project first — suggestions come from the transcript.">
+                Suggest clips
+              </button>
+            </div>
           </div>
+          <p id="candidates-status" class="processing-message">No candidates yet.</p>
+          <p id="candidates-error" class="processing-error is-hidden" role="alert"></p>
           <ul id="candidates-list" class="candidates"></ul>
-          <p id="candidates-empty" class="panel__hint">No candidates yet. Load the demo project to see the layout.</p>
+          <p id="candidates-empty" class="panel__hint">Transcribe a project, then press Suggest clips.</p>
+          <p id="candidates-disclaimer" class="panel__hint"></p>
         </section>
       </main>
 
@@ -195,7 +204,10 @@
               <output id="clip-duration" class="input input--readonly">0.0s</output>
             </label>
           </div>
-          <p class="panel__hint">Edits update the demo layout only; saving to a project arrives with the timeline milestone.</p>
+          <p class="panel__hint">
+            Changes to In/Out are saved to the project for imported videos. Sample-project
+            edits stay in the browser.
+          </p>
         </section>
 
         <section id="caption-controls" class="panel">
@@ -295,8 +307,8 @@
 
     <footer class="app-footer">
       <p>
-        Milestone 3. Import and local transcription are real. Sample data is illustrative:
-        clip suggestions, captions, and export are not implemented yet.
+        Milestone 4. Import, local transcription, and transcript-based clip suggestions are
+        real. Sample data is illustrative: captions and export are not implemented yet.
       </p>
     </footer>
 

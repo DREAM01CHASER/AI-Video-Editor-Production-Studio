@@ -129,6 +129,10 @@ const els = {
   candidatesList: document.getElementById("candidates-list"),
   candidatesCount: document.getElementById("candidates-count"),
   candidatesEmpty: document.getElementById("candidates-empty"),
+  candidatesStatus: document.getElementById("candidates-status"),
+  candidatesError: document.getElementById("candidates-error"),
+  candidatesDisclaimer: document.getElementById("candidates-disclaimer"),
+  btnSuggestClips: document.getElementById("btn-suggest-clips"),
   metadataDuration: document.getElementById("metadata-duration"),
   metadataResolution: document.getElementById("metadata-resolution"),
   metadataFps: document.getElementById("metadata-fps"),
@@ -155,6 +159,11 @@ const state = {
     timer: null,
     failed: false,
     lastMessage: "",
+  },
+  clips: {
+    analysis: null,
+    stale: false,
+    busy: false,
   },
 };
 
@@ -307,6 +316,7 @@ function renderProject() {
   renderCandidates();
   renderTimeline();
   updateTranscribeControls();
+  updateSuggestControls();
 }
 
 function renderMetadata(source) {
@@ -344,7 +354,8 @@ function renderCandidates() {
     title.textContent = candidate.title;
     const score = document.createElement("span");
     score.className = "candidate__score";
-    score.textContent = `Score ${candidate.score.toFixed(2)} (estimate)`;
+    const basis = candidate.scoreLabel === "llm" ? "LLM estimate" : "estimate";
+    score.textContent = `Score ${Number(candidate.score || 0).toFixed(2)} (${basis})`;
     top.append(title, score);
 
     const reason = document.createElement("p");
@@ -358,12 +369,32 @@ function renderCandidates() {
     const length = document.createElement("span");
     length.textContent = `${(candidate.end - candidate.start).toFixed(1)}s`;
     footer.append(range, length);
-    if (candidate.overlapWith) {
+
+    const flags = document.createElement("div");
+    flags.className = "candidate__flags";
+
+    if (candidate.edited) {
+      const tag = document.createElement("span");
+      tag.className = "tag tag--edited";
+      tag.textContent = "edited";
+      flags.append(tag);
+    }
+
+    // Older demo data uses a single overlapWith id; real data uses a list.
+    const overlaps = candidate.overlapsWith || (candidate.overlapWith ? [candidate.overlapWith] : []);
+    if (overlaps.length > 0) {
       const tag = document.createElement("span");
       tag.className = "tag tag--overlap";
-      tag.textContent = `overlaps ${candidate.overlapWith}`;
-      footer.append(tag);
+      tag.textContent = `overlaps ${overlaps.join(", ")}`;
+      flags.append(tag);
     }
+    if (candidate.nearDuplicateOf) {
+      const tag = document.createElement("span");
+      tag.className = "tag tag--overlap";
+      tag.textContent = `near-duplicate of ${candidate.nearDuplicateOf}`;
+      flags.append(tag);
+    }
+    if (flags.childElementCount > 0) footer.append(flags);
 
     button.append(top, reason, footer);
     button.addEventListener("click", () => selectCandidate(candidate.id));
@@ -408,7 +439,7 @@ function updateClipDuration() {
   els.clipDuration.textContent = `${duration.toFixed(1)}s`;
 }
 
-function applyClipEdit() {
+async function applyClipEdit() {
   const candidate = state.project.candidates.find((item) => item.id === state.selectedId);
   if (!candidate) return;
   candidate.start = Math.max(0, Number.parseFloat(els.clipStart.value) || 0);
@@ -416,6 +447,7 @@ function applyClipEdit() {
   updateClipDuration();
   renderCandidates();
   renderTimeline();
+  await persistClipEdits(candidate);
 }
 
 els.clipStart.addEventListener("input", updateClipDuration);
@@ -782,11 +814,18 @@ async function onTranscriptionSucceeded(job, projectId, stillOpen) {
   }
 
   setTranscriptBadge("Transcribed", "badge status-ready");
+  // A fresh transcript enables clip suggestion and makes old clips stale.
+  state.project.hasTranscript = true;
+  if (state.project.candidates.length === 0) {
+    els.candidatesStatus.textContent =
+      "Transcript ready — press Suggest clips to find candidate moments.";
+  }
   const document_ = await loadTranscript(projectId);
   if (document_) {
     renderTranscript(document_);
   }
   updateTranscribeControls();
+  updateSuggestControls();
   await fetchProjects();
 }
 
@@ -839,6 +878,151 @@ async function cancelTranscription() {
   }
 }
 
+/* --------------------------------------------------------- clip candidates */
+
+/** Map a clip from the API into the shape the interface renders. */
+function candidateFromServer(clip, index = 0) {
+  return {
+    id: clip.id || `clip-${index + 1}`,
+    title: clip.title || `Clip ${index + 1}`,
+    reason: clip.reason || "",
+    start: Number(clip.source_start) || 0,
+    end: Number(clip.source_end) || 0,
+    score: Number(clip.score) || 0,
+    scoreLabel: clip.score_label || "estimate",
+    overlapsWith: Array.isArray(clip.overlaps_with) ? clip.overlaps_with : [],
+    nearDuplicateOf: clip.near_duplicate_of || null,
+    edited: Boolean(clip.edited),
+  };
+}
+
+/** Clips suggested from an older transcript are out of date. */
+function clipAnalysisIsStale(payload) {
+  const basedOn = payload?.clip_analysis?.based_on_transcript_generated_at;
+  const current = payload?.transcript?.generated_at;
+  return Boolean(basedOn && current && basedOn !== current);
+}
+
+function showCandidateError(message) {
+  els.candidatesError.textContent = message;
+  els.candidatesError.classList.remove("is-hidden");
+}
+
+function hideCandidateError() {
+  els.candidatesError.textContent = "";
+  els.candidatesError.classList.add("is-hidden");
+}
+
+/** Describe how the current candidates were produced, and how much to trust them. */
+function applyClipAnalysis(analysis, stale) {
+  state.clips.analysis = analysis || null;
+  state.clips.stale = Boolean(stale);
+
+  if (!analysis) {
+    els.candidatesDisclaimer.textContent = "";
+    return;
+  }
+
+  const source = analysis.generator === "llm" ? "an optional LLM pass" : "a transparent heuristic";
+  const parts = [
+    `Suggested by ${source}.`,
+    analysis.score_meaning || "",
+    ...(analysis.notes || []),
+  ];
+  if (stale) {
+    parts.push("These are stale: the transcript changed since they were suggested, so re-run it.");
+  }
+  els.candidatesDisclaimer.textContent = parts.filter(Boolean).join(" ");
+}
+
+/** Suggestions need a real project that already has a transcript. */
+function updateSuggestControls() {
+  const real = isRealProject();
+  const hasTranscript = real && Boolean(state.project.hasTranscript);
+
+  els.btnSuggestClips.disabled = !hasTranscript || state.clips.busy;
+  els.btnSuggestClips.title = !real
+    ? "Import a video first — suggestions come from its transcript."
+    : hasTranscript
+      ? "Detect candidate clips from the saved transcript."
+      : "Transcribe this project first — suggestions come from the transcript.";
+}
+
+async function suggestClips() {
+  const projectId = state.project.id;
+  if (!projectId || state.clips.busy) return;
+
+  state.clips.busy = true;
+  updateSuggestControls();
+  hideCandidateError();
+  els.candidatesStatus.textContent = "Analysing the transcript for strong moments…";
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/suggest-clips`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(payload, `Could not suggest clips (HTTP ${response.status}).`)
+      );
+    }
+
+    if (state.project.id !== projectId) return;
+
+    state.project.candidates = (payload.clips || []).map(candidateFromServer);
+    state.selectedId = null;
+    applyClipAnalysis(payload.analysis, false);
+    renderCandidates();
+    selectCandidate(null);
+    log(`Suggested ${state.project.candidates.length} candidate clips.`);
+  } catch (error) {
+    showCandidateError(error.message);
+    els.candidatesStatus.textContent = "Clip suggestion failed.";
+    log(`Error: ${error.message}`);
+  } finally {
+    state.clips.busy = false;
+    updateSuggestControls();
+  }
+}
+
+/** Save a clip's new in/out points. The backend owns the validation. */
+async function persistClipEdits(candidate) {
+  if (!isRealProject()) {
+    els.candidatesStatus.textContent = "Sample data — edits to the sample project are not saved.";
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(state.project.id)}/clips`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({
+        clips: [
+          { id: candidate.id, source_start: candidate.start, source_end: candidate.end },
+        ],
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(payload, `Could not save the clip (HTTP ${response.status}).`)
+      );
+    }
+
+    hideCandidateError();
+    // Adopt the values the backend validated rather than trusting local numbers.
+    const saved = (payload.clips || []).find((clip) => clip.id === candidate.id);
+    if (saved) Object.assign(candidate, candidateFromServer(saved));
+    renderCandidates();
+    log(`Saved clip ${candidate.id}: ${candidate.start.toFixed(1)}s – ${candidate.end.toFixed(1)}s`);
+  } catch (error) {
+    showCandidateError(error.message);
+    log(`Error: ${error.message}`);
+  }
+}
+
 /* -------------------------------------------------- projects from backend */
 
 function projectFromServer(payload) {
@@ -854,16 +1038,19 @@ function projectFromServer(payload) {
       fps: Number(metadata.fps) || 0,
       sizeBytes: Number(metadata.size_bytes) || 0,
     },
-    candidates: (payload.clips || []).map((clip, index) => ({
-      id: clip.id || `clip-${index + 1}`,
-      title: clip.title || `Clip ${index + 1}`,
-      reason: clip.reason || "",
-      start: Number(clip.source_start) || 0,
-      end: Number(clip.source_end) || 0,
-      score: Number(clip.score) || 0,
-    })),
+    candidates: (payload.clips || []).map(candidateFromServer),
+    hasTranscript: Boolean(payload.transcript),
   };
   state.selectedId = null;
+  applyClipAnalysis(payload.clip_analysis || null, clipAnalysisIsStale(payload));
+  if ((payload.clips || []).length === 0) {
+    els.candidatesStatus.textContent = payload.transcript
+      ? "Transcript ready — press Suggest clips to find candidate moments."
+      : "Transcribe this project to suggest clips.";
+  } else {
+    els.candidatesStatus.textContent = `${(payload.clips || []).length} saved candidate clip(s).`;
+  }
+  hideCandidateError();
 
   els.dataSourceBadge.textContent = "Imported";
   els.dataSourceBadge.className = "badge badge-demo";
@@ -906,7 +1093,11 @@ async function openProject(projectId) {
 
 function loadDemoProject() {
   state.project = structuredClone(DEMO_PROJECT);
+  state.project.hasTranscript = false;
   state.selectedId = state.project.candidates[0]?.id ?? null;
+  applyClipAnalysis(null, false);
+  els.candidatesStatus.textContent = "Sample candidates — illustrative, not generated from a transcript.";
+  hideCandidateError();
   els.dataSourceBadge.textContent = "Demo data";
   els.dataSourceBadge.className = "badge badge-demo";
   els.dropZoneHint.textContent =
@@ -1116,6 +1307,8 @@ els.dropZone.addEventListener("drop", (event) => {
 
 els.btnRunDemo.addEventListener("click", runProcessingDemo);
 
+els.btnSuggestClips.addEventListener("click", suggestClips);
+
 els.btnTranscribe.addEventListener("click", startTranscription);
 els.btnTranscribeRetry.addEventListener("click", startTranscription);
 els.btnTranscribeCancel.addEventListener("click", cancelTranscription);
@@ -1131,6 +1324,9 @@ function resetToEmptyProject() {
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();
   resetTranscript();
+  applyClipAnalysis(null, false);
+  els.candidatesStatus.textContent = "No candidates yet.";
+  hideCandidateError();
   renderProject();
   renderProjectList();
   selectCandidate(null);
