@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local application data
+workspace/projects/*
+workspace/uploads/*
+workspace/previews/*
+workspace/exports/*
+workspace/temp/*
+!workspace/projects/.gitkeep
+!workspace/uploads/.gitkeep
+!workspace/previews/.gitkeep
+!workspace/exports/.gitkeep
+!workspace/temp/.gitkeep
+logs/
+*.log
+
+# Media and generated output should never be committed.
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.flac
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

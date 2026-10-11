@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#11151b" />
+    <title>AI Video Production Studio</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="foundation-card" aria-labelledby="app-title">
+        <div class="eyebrow">LOCAL-FIRST VIDEO WORKSPACE</div>
+        <div class="title-row">
+          <div>
+            <h1 id="app-title">AI Video Production Studio</h1>
+            <p class="lede">
+              A focused local workspace for turning long-form video into polished
+              short clips.
+            </p>
+          </div>
+          <span id="health-status" class="status status-pending">Checking</span>
+        </div>
+
+        <div class="status-panel" aria-live="polite">
+          <div class="status-heading">
+            <span class="status-dot" aria-hidden="true"></span>
+            <h2>Workspace status</h2>
+          </div>
+          <p id="health-message">Connecting to the local backend…</p>
+        </div>
+
+        <div class="foundation-grid">
+          <div>
+            <span class="label">Current milestone</span>
+            <strong>Repository foundation</strong>
+          </div>
+          <div>
+            <span class="label">Media handling</span>
+            <strong>Local by default</strong>
+          </div>
+          <div>
+            <span class="label">Next step</span>
+            <strong>Import video</strong>
+          </div>
+        </div>
+
+        <p class="note">
+          The editing workspace will be added in the next milestone. No source
+          media is uploaded or processed by this foundation screen.
+        </p>
+      </section>
+    </main>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
