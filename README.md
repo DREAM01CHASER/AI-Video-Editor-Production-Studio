@@ -6,7 +6,7 @@ runs locally on the user's machine.
 
 ## Milestone status
 
-Milestone 0 establishes the repository and safe local foundation:
+Milestone 0 established the repository and safe local foundation:
 
 - FastAPI backend with a working `GET /api/health` endpoint.
 - Minimal static frontend served by the backend.
@@ -16,8 +16,22 @@ Milestone 0 establishes the repository and safe local foundation:
   generated filenames.
 - Temporary-file cleanup scoped to an individual project.
 
-Video ingest, transcription, clip suggestions, captions, and rendering are
-planned for later milestones and are not represented as working controls yet.
+Milestone 1 adds the frontend shell:
+
+- Dark, desktop-first three-zone workspace (projects/assets sidebar, preview and
+  clip candidates, settings inspector) with a bottom timeline.
+- Project header, backend status, and a source-metadata panel.
+- Video import drop zone and file picker that show a **local browser preview
+  only**; nothing is uploaded yet.
+- Processing panel with steps, progress, and plain-language error messages.
+- Clip-candidate list, caption controls, and export settings panels.
+- The shell loads with a clearly labelled sample project, so it works without
+  AI models or API keys.
+
+Import/upload, transcription, clip suggestions, captions, and rendering are
+planned for later milestones. Their controls are present for layout but
+**disabled or clearly marked as a demo** — no button pretends to process video
+or export a file.
 
 ## Windows setup
 
@@ -59,6 +73,10 @@ Stop the server with `Ctrl+C`.
 ```powershell
 python -m pytest
 ```
+
+The suite also asserts the frontend shell exposes the expected layout and keeps
+sample data clearly labelled. The interface can be opened without any API key,
+AI model, or uploaded media.
 
 ## System tools for later milestones
 

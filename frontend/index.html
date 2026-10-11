@@ -3,54 +3,269 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#11151b" />
+    <meta name="theme-color" content="#0b0e12" />
     <title>AI Video Production Studio</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="page-shell">
-      <section class="foundation-card" aria-labelledby="app-title">
-        <div class="eyebrow">LOCAL-FIRST VIDEO WORKSPACE</div>
-        <div class="title-row">
-          <div>
-            <h1 id="app-title">AI Video Production Studio</h1>
-            <p class="lede">
-              A focused local workspace for turning long-form video into polished
-              short clips.
-            </p>
-          </div>
-          <span id="health-status" class="status status-pending">Checking</span>
+    <header class="app-header">
+      <div class="app-header__brand">
+        <span class="brand-mark" aria-hidden="true">AV</span>
+        <div class="brand-text">
+          <span class="eyebrow">AI Video Production Studio</span>
+          <h1 id="project-name">No project open</h1>
         </div>
+      </div>
 
-        <div class="status-panel" aria-live="polite">
-          <div class="status-heading">
-            <span class="status-dot" aria-hidden="true"></span>
-            <h2>Workspace status</h2>
-          </div>
-          <p id="health-message">Connecting to the local backend…</p>
+      <div class="app-header__status">
+        <div class="project-meta">
+          <span class="project-meta__item">
+            Project <strong id="project-id-value">—</strong>
+          </span>
+          <span class="project-meta__item">
+            Status <strong id="project-status-value">Idle</strong>
+          </span>
         </div>
-
-        <div class="foundation-grid">
-          <div>
-            <span class="label">Current milestone</span>
-            <strong>Repository foundation</strong>
-          </div>
-          <div>
-            <span class="label">Media handling</span>
-            <strong>Local by default</strong>
-          </div>
-          <div>
-            <span class="label">Next step</span>
-            <strong>Import video</strong>
-          </div>
+        <span id="health-status" class="status status-pending" role="status">Checking backend</span>
+        <span id="data-source-badge" class="badge badge-demo">Demo data</span>
+        <div class="app-header__actions">
+          <button id="btn-import" class="btn btn-primary" type="button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <path d="M7 9l5-5 5 5" />
+              <path d="M12 4v12" />
+            </svg>
+            Import video
+          </button>
+          <button id="btn-new-project" class="btn btn-secondary" type="button">New project</button>
         </div>
+      </div>
+    </header>
 
-        <p class="note">
-          The editing workspace will be added in the next milestone. No source
-          media is uploaded or processed by this foundation screen.
-        </p>
-      </section>
-    </main>
+    <p id="health-message" class="health-message" role="status">
+      Connecting to the local backend…
+    </p>
+
+    <div class="workspace">
+      <!-- Left sidebar: projects and assets -->
+      <aside class="sidebar" aria-label="Projects and assets">
+        <section class="panel">
+          <div class="panel__heading">
+            <h2>Projects</h2>
+            <button id="btn-refresh-projects" class="icon-btn" type="button" title="Reload the demo project list" aria-label="Reload the demo project list">⟳</button>
+          </div>
+          <ul id="project-list" class="list"></ul>
+        </section>
+
+        <section class="panel">
+          <div class="panel__heading">
+            <h2>Local assets</h2>
+            <span class="badge badge-muted">Empty</span>
+          </div>
+          <ul id="asset-list" class="list list--muted"></ul>
+          <p class="panel__hint">
+            B-roll and sound effects become selectable in a later milestone.
+          </p>
+        </section>
+      </aside>
+
+      <!-- Center: preview, processing, and clip candidates -->
+      <main class="stage">
+        <section id="processing-panel" class="panel panel--processing is-hidden" aria-live="polite">
+          <div class="panel__heading">
+            <h2>Processing</h2>
+            <button id="btn-run-demo" class="btn btn-ghost" type="button">Run layout demo</button>
+          </div>
+          <p id="processing-message" class="processing-message">Waiting to start…</p>
+          <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <ol id="processing-steps" class="steps"></ol>
+          <p id="processing-error" class="processing-error is-hidden" role="alert"></p>
+          <p id="processing-log" class="processing-log" aria-label="Processing log"></p>
+          <p class="panel__hint">Layout demo only — nothing is analysed or rendered.</p>
+        </section>
+
+        <section class="panel panel--preview">
+          <div class="panel__heading">
+            <h2 id="preview-title">Preview</h2>
+            <span class="preview-time">
+              <span id="preview-current-time">00:00</span> / <span id="preview-duration">00:00</span>
+            </span>
+          </div>
+
+          <div class="preview-frame" id="preview-frame">
+            <video id="video-element" class="preview-video is-hidden" controls preload="metadata" playsinline></video>
+            <div id="preview-empty" class="preview-empty" role="note">
+              <span class="preview-empty__icon" aria-hidden="true">▢</span>
+              <p>No video loaded.</p>
+              <p id="preview-empty-hint" class="preview-empty__hint">Drop a file below or open the demo project to inspect the layout.</p>
+            </div>
+          </div>
+
+          <div class="preview-controls">
+            <button id="btn-preview-prev" class="btn btn-ghost" type="button" disabled title="Disabled until clip playback is wired up in a later milestone">◀ Previous clip</button>
+            <span id="preview-clip-label" class="preview-clip-label">No clip selected</span>
+            <button id="btn-preview-next" class="btn btn-ghost" type="button" disabled title="Disabled until clip playback is wired up in a later milestone">Next clip ▶</button>
+          </div>
+        </section>
+
+        <section id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Import a video by dropping it here or pressing Enter to browse">
+          <input id="file-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/x-msvideo,video/x-matroska,video/webm" hidden />
+          <p class="drop-zone__title">Drop a video here or click to browse</p>
+          <p id="drop-zone-hint" class="drop-zone__hint">
+            Supported: MP4, MOV, M4V, AVI, MKV, WebM. Files stay on this machine.
+          </p>
+        </section>
+
+        <section class="panel">
+          <div class="panel__heading">
+            <h2>Suggested clips</h2>
+            <span id="candidates-count" class="badge badge-muted">0</span>
+          </div>
+          <ul id="candidates-list" class="candidates"></ul>
+          <p id="candidates-empty" class="panel__hint">No candidates yet. Load the demo project to see the layout.</p>
+        </section>
+      </main>
+
+      <!-- Right inspector: selected item settings -->
+      <aside class="inspector" aria-label="Selected item settings">
+        <section class="panel">
+          <div class="panel__heading">
+            <h2>Source metadata</h2>
+          </div>
+          <dl class="metadata">
+            <div class="metadata__row"><dt>Duration</dt><dd id="metadata-duration">—</dd></div>
+            <div class="metadata__row"><dt>Resolution</dt><dd id="metadata-resolution">—</dd></div>
+            <div class="metadata__row"><dt>Frame rate</dt><dd id="metadata-fps">—</dd></div>
+            <div class="metadata__row"><dt>File size</dt><dd id="metadata-size">—</dd></div>
+          </dl>
+        </section>
+
+        <section class="panel">
+          <div class="panel__heading">
+            <h2>Selected clip</h2>
+            <span id="selected-clip-name" class="badge badge-muted">None</span>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span class="field__label">In (seconds)</span>
+              <input id="clip-start" class="input" type="number" min="0" step="0.1" value="0" />
+            </label>
+            <label class="field">
+              <span class="field__label">Out (seconds)</span>
+              <input id="clip-end" class="input" type="number" min="0" step="0.1" value="0" />
+            </label>
+            <label class="field field--full">
+              <span class="field__label">Clip duration</span>
+              <output id="clip-duration" class="input input--readonly">0.0s</output>
+            </label>
+          </div>
+          <p class="panel__hint">Edits update the demo layout only; saving to a project arrives with the timeline milestone.</p>
+        </section>
+
+        <section id="caption-controls" class="panel">
+          <div class="panel__heading">
+            <h2>Captions</h2>
+          </div>
+          <div class="field-grid">
+            <label class="field field--full">
+              <span class="field__label">Preset</span>
+              <select id="caption-style" class="input">
+                <option value="clean">Clean</option>
+                <option value="bold-highlight" selected>Bold Highlight</option>
+                <option value="minimal">Minimal</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Font size</span>
+              <select id="font-size" class="input">
+                <option value="small">Small</option>
+                <option value="medium" selected>Medium</option>
+                <option value="large">Large</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Placement</span>
+              <select id="caption-placement" class="input">
+                <option value="bottom" selected>Bottom safe area</option>
+                <option value="center">Center</option>
+                <option value="top">Top</option>
+              </select>
+            </label>
+            <label class="field field--full">
+              <span class="field__label">Highlight mode</span>
+              <select id="highlight-mode" class="input">
+                <option value="outline">Outline</option>
+                <option value="shadow" selected>Shadow</option>
+                <option value="none">None</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section id="export-panel" class="panel">
+          <div class="panel__heading">
+            <h2>Export</h2>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span class="field__label">Aspect ratio</span>
+              <select id="aspect-ratio" class="input">
+                <option value="9:16" selected>9:16 Vertical</option>
+                <option value="1:1">1:1 Square</option>
+                <option value="16:9">16:9 Horizontal</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Format</span>
+              <select id="export-format" class="input">
+                <option value="mp4" selected>MP4</option>
+              </select>
+            </label>
+            <label class="field field--full">
+              <span class="field__label">Output resolution</span>
+              <select id="output-resolution" class="input">
+                <option value="1080x1920" selected>1080 × 1920 (recommended)</option>
+                <option value="1440x2560">1440 × 2560 (2K, slower)</option>
+              </select>
+            </label>
+          </div>
+          <button id="btn-export" class="btn btn-primary btn--block" type="button" disabled
+            title="Rendering is not implemented yet; it arrives in the captions and export milestone.">
+            Export MP4
+          </button>
+          <p class="panel__hint">
+            Export is disabled until the rendering milestone. Settings here only shape the layout.
+          </p>
+        </section>
+      </aside>
+    </div>
+
+    <!-- Bottom: basic timeline -->
+    <section class="timeline" aria-label="Timeline">
+      <div class="panel__heading">
+        <h2>Timeline</h2>
+        <div class="timeline__legend">
+          <span class="legend legend--video">Video</span>
+          <span class="legend legend--caption">Captions</span>
+          <span class="legend legend--broll">B-roll</span>
+          <span class="legend legend--sfx">SFX</span>
+        </div>
+      </div>
+      <div class="timeline__body">
+        <div id="timeline-ruler" class="timeline__ruler"></div>
+        <div id="timeline-tracks" class="timeline__tracks"></div>
+      </div>
+    </section>
+
+    <footer class="app-footer">
+      <p>
+        Milestone 1 frontend shell. Sample data is illustrative; import, transcription,
+        clip suggestions, and export are implemented in later milestones.
+      </p>
+    </footer>
+
     <script type="module" src="/static/app.js"></script>
   </body>
 </html>
