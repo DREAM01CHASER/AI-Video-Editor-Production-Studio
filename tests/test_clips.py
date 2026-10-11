@@ -26,6 +26,7 @@ from app.clips import (
     hook_score,
     is_boundary_after,
     is_sentence_end,
+    latin_token_share,
     make_title,
     overlap_ratio,
     overlap_seconds,
@@ -36,6 +37,7 @@ from app.clips import (
     starts_new_thought,
     suggest_clips,
     text_similarity,
+    tokenize,
 )
 from app.config import Settings
 from app.errors import ApiError
@@ -795,6 +797,94 @@ def test_a_single_stray_mark_does_not_make_edges_look_exact() -> None:
 
 def test_title_min_words_is_a_small_readable_number() -> None:
     assert 3 <= TITLE_MIN_WORDS <= 8
+
+
+# ----------------------------------------------------- scripts other than Latin
+
+#: A Hindi transcript, which is what a real imported project actually contained.
+HINDI_ROWS = [
+    (0.0, 6.0, "जब हमारा टोपिक है इंशुरन्स फ्रॉड के बारेने"),
+    (6.0, 12.0, "आप कैसे बच सकते हैं इससे"),
+    (12.0, 19.0, "सबसे बड़ी गलती यह है कि लोग पॉलिसी ध्यान से नहीं पढ़ते"),
+    (19.0, 26.0, "हमेशा दस्तावेज की जांच करें और क्लेम ठीक से भरें"),
+    (26.0, 33.0, "इस वीडियो में मैं आपको तीन तरीके बताऊंगा आगे"),
+    (33.0, 40.0, "पहला तरीका है क्लेम से पहले सबूत इकट्ठा करना और फिर भेजना"),
+    (40.0, 47.0, "दूसरा तरीका है पॉलिसी की शर्तें ध्यान से पढ़ना हर बार"),
+    (47.0, 54.0, "तीसरा तरीका है समय पर शिकायत दर्ज कराना हमेशा"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Devanagari vowel signs are combining marks, so they must stay attached.
+        ("हमारा", ["हमारा"]),
+        ("जब हमारा टोपिक है", ["जब", "हमारा", "टोपिक", "है"]),
+        ("Привет мир", ["привет", "мир"]),
+        ("don't stop", ["don't", "stop"]),
+        ("90% of editors", ["90", "of", "editors"]),
+        ("", []),
+        ("...", []),
+    ],
+)
+def test_tokenize_handles_multiple_scripts(text: str, expected: list[str]) -> None:
+    assert tokenize(text) == expected
+
+
+def test_english_tokenizing_is_unchanged_by_the_script_fix() -> None:
+    assert tokenize("the five-minute editing rule") == [
+        "the",
+        "five",
+        "minute",
+        "editing",
+        "rule",
+    ]
+
+
+def test_latin_token_share_separates_scripts() -> None:
+    assert latin_token_share("the quick brown fox") == 1.0
+    assert latin_token_share("जब हमारा टोपिक है") == 0.0
+    assert latin_token_share("") == 0.0
+    assert 0.0 < latin_token_share("insurance फ्रॉड claim") < 1.0
+
+
+def test_a_devanagari_transcript_still_produces_usable_clips() -> None:
+    result = suggest_clips(transcript_document(HINDI_ROWS))
+    clips = result["clips"]
+
+    assert clips
+    for clip in clips:
+        # The bug this guards: an ASCII-only tokenizer made every count zero, so
+        # the density signal collapsed and the scores became meaningless.
+        assert clip["signals"]["density"] > 0.0
+        assert clip["score"] > 0.0
+        assert clip["title"].strip()
+        # Titles must be one clause, not the whole window run together.
+        assert len(clip["title"]) < 120
+
+
+def test_a_non_latin_transcript_says_the_english_cues_do_not_apply() -> None:
+    analysis = suggest_clips(transcript_document(HINDI_ROWS))["analysis"]
+
+    assert analysis["hook_cues_available"] is False
+    assert analysis["latin_token_share"] == 0.0
+    assert any("English-only" in note for note in analysis["notes"])
+
+
+def test_a_non_latin_transcript_does_not_claim_there_is_no_hook() -> None:
+    clips = suggest_clips(transcript_document(HINDI_ROWS))["clips"]
+
+    for clip in clips:
+        # It cannot know the opening is weak, so it must not say it is.
+        assert "No strong hook marker" not in clip["reason"]
+        assert "English-only" in clip["reason"]
+
+
+def test_a_latin_transcript_keeps_the_english_hook_wording() -> None:
+    result = suggest_clips(transcript_document())
+
+    assert result["analysis"]["hook_cues_available"] is True
+    assert all("English-only" not in clip["reason"] for clip in result["clips"])
 
 
 def test_score_candidate_marks_an_opening_that_starts_mid_thought() -> None:

@@ -24,8 +24,10 @@ reported on the candidates themselves rather than hidden.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from .errors import ApiError
 
@@ -69,7 +71,7 @@ SIGNAL_WEIGHTS = {
 #: perfect 1.00 for a guess.
 MAX_SCORE = 0.97
 
-SENTENCE_ENDINGS = (".", "!", "?", "…", "。", "！", "？")
+SENTENCE_ENDINGS = (".", "!", "?", "…", "。", "！", "？", "।", "॥")
 _TRAILING_QUOTES = "\"'”’)]}"
 
 #: (pattern, weight, plain-language label) for opening-hook markers.
@@ -82,6 +84,10 @@ HOOK_PATTERNS: tuple[tuple[re.Pattern[str], float, str], ...] = (
     (re.compile(r"\b(?:but|however|actually|instead|surprisingly|unfortunately)\b", re.I), 0.6, "a contrast word"),
     (re.compile(r"\b(?:because|so\s+that|which\s+means|that's\s+why|here's\s+why)\b", re.I), 0.5, "a causal link"),
 )
+
+#: Below this share of Latin-script words, the English-only hook and cue word
+#: lists are treated as unavailable rather than reporting "no hook".
+LATIN_CUES_MIN_SHARE = 0.5
 
 #: Below this share of punctuated segments, cut points are treated as estimates
 #: and the output says so instead of claiming complete sentences.
@@ -115,7 +121,14 @@ STRONG_HOOK_WEIGHT = round(
     sum(sorted((weight for _, weight, _ in HOOK_PATTERNS), reverse=True)[:2]), 4
 )
 
-_TOKEN = re.compile(r"[a-z0-9']+")
+#: Used to tell whether the English-only cue words can say anything at all.
+_LATIN_LETTER = re.compile(r"[A-Za-z]")
+
+#: Unicode mark categories. A regex character class cannot cover these for every
+#: script, and `\w` excludes them, which is why Devanagari vowel signs split
+#: "हमारा" into "हम" + "र" and inflated every word count.
+_COMBINING_MARKS = frozenset({"Mn", "Mc", "Me"})
+_APOSTROPHES = frozenset({"'", "\u2019"})
 _STOPWORDS = frozenset(
     "the a an and or but if then than that this these those of to in on at for with "
     "is are was were be been being it its as by from so we you your i my me not no".split()
@@ -150,8 +163,56 @@ def timecode(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
+def _scan_tokens(text: str) -> tuple[str, ...]:
+    """Split text into words, keeping combining marks attached to their base.
+
+    Works for any script because it uses Unicode categories rather than a fixed
+    character range: letters and digits start a word, and combining marks
+    (Devanagari matras, Arabic diacritics, Latin accents, …) continue it.
+    """
+
+    tokens: list[str] = []
+    current: list[str] = []
+
+    for char in text:
+        is_word_char = char.isalnum() or char == "_" or unicodedata.category(char) in _COMBINING_MARKS
+        if is_word_char:
+            current.append(char)
+        elif char in _APOSTROPHES and current:
+            current.append(char)
+        elif current:
+            tokens.append("".join(current).strip("'\u2019"))
+            current = []
+
+    if current:
+        tokens.append("".join(current).strip("'\u2019"))
+
+    return tuple(token for token in tokens if token)
+
+
+@lru_cache(maxsize=8192)
+def _cached_tokens(text: str) -> tuple[str, ...]:
+    return _scan_tokens(text)
+
+
 def tokenize(text: str) -> list[str]:
-    return _TOKEN.findall(_clean(text).lower())
+    """Lower-cased words in any script, with combining marks kept intact."""
+
+    return list(_cached_tokens(_clean(text).lower()))
+
+
+def latin_token_share(text: str) -> float:
+    """Share of words written in the Latin script.
+
+    The hook and discourse-cue word lists are English-only, so on a transcript in
+    another script those signals cannot fire. Reporting the share lets the output
+    say that instead of implying a clip has no hook.
+    """
+
+    tokens = tokenize(text)
+    if not tokens:
+        return 0.0
+    return round(sum(1 for token in tokens if _LATIN_LETTER.search(token)) / len(tokens), 4)
 
 
 def text_similarity(left: str, right: str) -> float:
@@ -376,6 +437,7 @@ def make_reason(
     duration: float,
     overlaps: bool,
     boundaries_certain: bool = True,
+    hook_cues_available: bool = True,
 ) -> str:
     """Explain the signals behind a score in plain language.
 
@@ -400,6 +462,11 @@ def make_reason(
 
     if hook_labels:
         hook = f"Early hook markers: {', '.join(hook_labels[:3])}."
+    elif not hook_cues_available:
+        hook = (
+            "Opening hook cues are English-only for now, so this score relies on "
+            "pace, length, and cut points."
+        )
     else:
         hook = "No strong hook marker early on, so it may need a tighter start."
 
@@ -423,6 +490,7 @@ def score_candidate(
     *,
     preceding_ends_sentence: bool,
     boundaries_certain: bool = True,
+    hook_cues_available: bool = True,
 ) -> dict[str, object]:
     """Score one unit range and describe it as a candidate clip."""
 
@@ -470,6 +538,7 @@ def score_candidate(
             duration=duration,
             overlaps=False,
             boundaries_certain=boundaries_certain,
+            hook_cues_available=hook_cues_available,
         ),
         "source_start": round(start, 3),
         "source_end": round(end, 3),
@@ -483,6 +552,7 @@ def score_candidate(
         "_starts_sentence": starts_sentence,
         "_ends_sentence": ends_sentence,
         "_boundaries_certain": boundaries_certain,
+        "_hook_cues_available": hook_cues_available,
     }
 
 
@@ -556,6 +626,7 @@ def public_candidate(candidate: dict) -> dict[str, object]:
             duration=float(candidate["duration"]),
             overlaps=bool(overlaps_with),
             boundaries_certain=bool(candidate.get("_boundaries_certain", True)),
+            hook_cues_available=bool(candidate.get("_hook_cues_available", True)),
         )
     )
     if overlaps_with:
@@ -607,6 +678,11 @@ def suggest_clips(
     punctuation = punctuation_ratio(units)
     boundaries_certain = punctuation >= SENTENCE_PUNCTUATION_MIN_RATIO
 
+    # The cue word lists are English-only, so on another script the score leans on
+    # pace and length, and the output says so rather than implying "no hook".
+    latin_share = latin_token_share(" ".join(unit.text for unit in units))
+    hook_cues_available = latin_share >= LATIN_CUES_MIN_SHARE
+
     scored = [
         score_candidate(
             units,
@@ -616,6 +692,7 @@ def suggest_clips(
                 is_boundary_after(units, first - 1) if first > 0 else True
             ),
             boundaries_certain=boundaries_certain,
+            hook_cues_available=hook_cues_available,
         )
         for first, last in windows
     ]
@@ -646,6 +723,11 @@ def suggest_clips(
             "This transcript has no sentence punctuation, so clip edges follow "
             "segment boundaries and may need a small manual trim."
         )
+    if not hook_cues_available:
+        notes.append(
+            "This transcript is not in Latin script, and the opening-hook word "
+            "lists are English-only for now, so scores lean on pace and length."
+        )
 
     clips = [public_candidate(candidate) for candidate in chosen]
 
@@ -658,6 +740,8 @@ def suggest_clips(
         "clip_count": len(clips),
         "sentence_punctuation": boundaries_certain,
         "sentence_punctuation_ratio": punctuation,
+        "hook_cues_available": hook_cues_available,
+        "latin_token_share": latin_share,
         "candidates_considered": len(scored),
         "candidates_dropped_for_overlap": dropped,
         "signals": sorted(SIGNAL_WEIGHTS),
