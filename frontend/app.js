@@ -1,10 +1,10 @@
 /**
- * Milestone 1 frontend shell.
+ * Frontend shell for the AI Video Production Studio.
  *
- * This module drives the layout with illustrative sample data only. It talks to
- * the backend for the health check and nothing else: importing a file creates a
- * local browser preview, and the processing panel is a layout demo. Real ingest,
- * transcription, clip suggestions, and rendering arrive in later milestones.
+ * Import and the project list talk to the local FastAPI backend (Milestone 2).
+ * Transcription, clip suggestions, captions, and rendering are still layout
+ * only: their controls are disabled or clearly marked as a demo, and the
+ * processing panel labels anything that is not real.
  */
 
 const DEMO_PROJECT = {
@@ -63,7 +63,11 @@ const EMPTY_PROJECT = {
   candidates: [],
 };
 
-const PROCESSING_STEPS = [
+/** Steps that genuinely happen during Milestone 2 ingest. */
+const INGEST_STEPS = ["Validate file", "Store in local workspace", "Read metadata"];
+
+/** Steps of the future pipeline, shown by the layout demo only. */
+const DEMO_STEPS = [
   "Import and validate file",
   "Read video metadata",
   "Transcribe audio",
@@ -83,18 +87,17 @@ const els = {
   btnImport: document.getElementById("btn-import"),
   btnNewProject: document.getElementById("btn-new-project"),
   btnRefreshProjects: document.getElementById("btn-refresh-projects"),
+  btnRunDemo: document.getElementById("btn-run-demo"),
   btnExport: document.getElementById("btn-export"),
   projectList: document.getElementById("project-list"),
   assetList: document.getElementById("asset-list"),
   processingPanel: document.getElementById("processing-panel"),
   processingMessage: document.getElementById("processing-message"),
-  btnRunDemo: document.getElementById("btn-run-demo"),
   progressBar: document.querySelector(".progress-bar"),
   progressFill: document.getElementById("progress-fill"),
   processingSteps: document.getElementById("processing-steps"),
   processingError: document.getElementById("processing-error"),
   processingLog: document.getElementById("processing-log"),
-  previewFrame: document.getElementById("preview-frame"),
   video: document.getElementById("video-element"),
   previewEmpty: document.getElementById("preview-empty"),
   previewEmptyHint: document.getElementById("preview-empty-hint"),
@@ -124,6 +127,8 @@ const state = {
   selectedId: null,
   objectUrl: null,
   demoRunning: false,
+  busy: false,
+  projects: [],
 };
 
 /* ----------------------------------------------------------- formatting */
@@ -149,6 +154,11 @@ function formatSize(bytes) {
   return `${value.toFixed(unit >= 2 ? 1 : 0)} ${units[unit]}`;
 }
 
+/** Read the backend's structured error envelope, falling back to a plain message. */
+function apiErrorMessage(payload, fallback) {
+  return payload?.error?.message || fallback;
+}
+
 /* ---------------------------------------------------------------- health */
 
 async function checkHealth() {
@@ -170,38 +180,69 @@ async function checkHealth() {
   }
 }
 
-/* ------------------------------------------------------- project + lists */
+/* --------------------------------------------------------- project list */
 
 function renderProjectList() {
   els.projectList.replaceChildren();
-  const projects = [
-    { id: DEMO_PROJECT.id, name: DEMO_PROJECT.name, meta: "Sample" },
-    { id: "—", name: "Your projects appear here", meta: "Milestone 2" },
-  ];
 
-  for (const project of projects) {
+  for (const project of state.projects) {
     const item = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
     button.className = "list__item";
-    if (project.id === state.project.id) button.classList.add("is-active");
+    if (project.project_id === state.project.id) button.classList.add("is-active");
 
     const name = document.createElement("span");
-    name.textContent = project.name;
+    name.textContent = project.name || project.project_id;
     const meta = document.createElement("span");
     meta.className = "list__meta";
-    meta.textContent = project.meta;
+    meta.textContent = project.duration
+      ? `${formatTimecode(project.duration)} · ${project.clip_count} clips`
+      : "Imported";
 
     button.append(name, meta);
-    if (project.id === DEMO_PROJECT.id) {
-      button.addEventListener("click", loadDemoProject);
-    } else {
-      button.disabled = true;
-      button.title = "Listing local projects is implemented in the ingest milestone.";
-    }
+    button.addEventListener("click", () => openProject(project.project_id));
     item.append(button);
     els.projectList.append(item);
   }
+
+  const demoItem = document.createElement("li");
+  const demoButton = document.createElement("button");
+  demoButton.type = "button";
+  demoButton.className = "list__item";
+  if (state.project.id === DEMO_PROJECT.id) demoButton.classList.add("is-active");
+  const demoName = document.createElement("span");
+  demoName.textContent = DEMO_PROJECT.name;
+  const demoMeta = document.createElement("span");
+  demoMeta.className = "list__meta";
+  demoMeta.textContent = "Sample";
+  demoButton.append(demoName, demoMeta);
+  demoButton.addEventListener("click", loadDemoProject);
+  demoItem.append(demoButton);
+  els.projectList.append(demoItem);
+
+  if (state.projects.length === 0) {
+    const emptyItem = document.createElement("li");
+    const hint = document.createElement("p");
+    hint.className = "panel__hint";
+    hint.textContent = "No imported projects yet. Use Import video or the drop zone.";
+    emptyItem.append(hint);
+    els.projectList.append(emptyItem);
+  }
+}
+
+async function fetchProjects() {
+  try {
+    const response = await fetch("/api/projects", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    state.projects = Array.isArray(data.projects) ? data.projects : [];
+  } catch (error) {
+    console.warn("Could not list projects:", error);
+    state.projects = [];
+  }
+  renderProjectList();
+  return state.projects;
 }
 
 function renderAssetList() {
@@ -244,7 +285,7 @@ function renderMetadata(source) {
   }
   els.metadataDuration.textContent = formatTimecode(source.duration);
   els.metadataResolution.textContent = `${source.width} × ${source.height}`;
-  els.metadataFps.textContent = `${source.fps} fps`;
+  els.metadataFps.textContent = source.fps ? `${source.fps} fps` : "unknown";
   els.metadataSize.textContent = formatSize(source.sizeBytes);
 }
 
@@ -405,7 +446,7 @@ function renderTimeline() {
   }
 }
 
-/* -------------------------------------------------------- import + preview */
+/* -------------------------------------------------------- preview handling */
 
 function resetPreview() {
   if (state.objectUrl) {
@@ -420,12 +461,85 @@ function resetPreview() {
   els.previewDuration.textContent = "00:00";
 }
 
+function setPreviewSource(url, { objectUrl = false } = {}) {
+  resetPreview();
+  if (objectUrl) state.objectUrl = url;
+  els.video.src = url;
+  els.video.classList.remove("is-hidden");
+  els.previewEmpty.classList.add("is-hidden");
+}
+
+els.video.addEventListener("timeupdate", () => {
+  els.previewCurrentTime.textContent = formatTimecode(els.video.currentTime);
+  els.previewDuration.textContent = formatTimecode(els.video.duration || 0);
+});
+
+els.video.addEventListener("error", () => {
+  if (!els.video.currentSrc) return;
+  showError("This browser could not play the source video. The file is still saved to the project.");
+});
+
+/* -------------------------------------------------- projects from backend */
+
+function projectFromServer(payload) {
+  const metadata = payload.source_metadata || {};
+  state.project = {
+    id: payload.project_id,
+    name: payload.name || payload.project_id,
+    status: "Imported",
+    source: {
+      duration: Number(metadata.duration) || 0,
+      width: Number(metadata.width) || 0,
+      height: Number(metadata.height) || 0,
+      fps: Number(metadata.fps) || 0,
+      sizeBytes: Number(metadata.size_bytes) || 0,
+    },
+    candidates: (payload.clips || []).map((clip, index) => ({
+      id: clip.id || `clip-${index + 1}`,
+      title: clip.title || `Clip ${index + 1}`,
+      reason: clip.reason || "",
+      start: Number(clip.source_start) || 0,
+      end: Number(clip.source_end) || 0,
+      score: Number(clip.score) || 0,
+    })),
+  };
+  state.selectedId = null;
+
+  els.dataSourceBadge.textContent = "Imported";
+  els.dataSourceBadge.className = "badge badge-demo";
+  els.dropZoneHint.textContent = `${state.project.name} · saved in the local workspace.`;
+  els.previewEmptyHint.textContent = "Source video loaded from the local workspace.";
+
+  renderProjectList();
+  renderProject();
+  setPreviewSource(`/api/projects/${payload.project_id}/source`);
+  selectCandidate(null);
+}
+
+async function openProject(projectId) {
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not open the project (HTTP ${response.status}).`));
+    }
+    hideError();
+    projectFromServer(payload);
+    log(`Opened project ${projectId}`);
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
 function loadDemoProject() {
   state.project = structuredClone(DEMO_PROJECT);
   state.selectedId = state.project.candidates[0]?.id ?? null;
   els.dataSourceBadge.textContent = "Demo data";
   els.dataSourceBadge.className = "badge badge-demo";
-  els.dropZoneHint.textContent = "Supported: MP4, MOV, M4V, AVI, MKV, WebM. Files stay on this machine.";
+  els.dropZoneHint.textContent =
+    "Supported: MP4, MOV, M4V, AVI, MKV, WebM. Files stay on this machine.";
   els.previewEmptyHint.textContent =
     "Sample project loaded — import a video to preview real footage.";
   resetPreview();
@@ -434,82 +548,62 @@ function loadDemoProject() {
   selectCandidate(state.selectedId);
 }
 
-function resetToEmptyProject() {
-  state.project = { ...EMPTY_PROJECT };
-  state.selectedId = null;
-  els.dataSourceBadge.textContent = "No project";
-  els.dataSourceBadge.className = "badge badge-muted";
-  resetPreview();
-  renderProjectList();
-  renderProject();
-  selectCandidate(null);
-}
-
-function showPreview(videoUrl) {
-  resetPreview();
-  state.objectUrl = videoUrl;
-  els.video.src = videoUrl;
-  els.video.classList.remove("is-hidden");
-  els.previewEmpty.classList.add("is-hidden");
-}
+/* --------------------------------------------------------------- import */
 
 function handleFile(file) {
-  if (!file) return;
+  if (!file || state.busy) return;
 
   const extension = `.${file.name.split(".").pop().toLowerCase()}`;
   if (!SUPPORTED_EXTENSIONS.includes(extension)) {
-    showProcessing("Import failed");
+    showProcessing("Import failed", INGEST_STEPS);
+    markSteps(INGEST_STEPS, "failed", 0);
     setProgress(0);
     showError(`Unsupported file type "${extension || file.name}". Use MP4, MOV, M4V, AVI, MKV, or WebM.`);
     log(`Rejected ${file.name}`);
     return;
   }
 
-  hideError();
-  showProcessing(`Loaded ${file.name} for local preview`);
-
-  state.project = {
-    id: "local-preview",
-    name: file.name,
-    status: "Local preview",
-    source: null,
-    candidates: [],
-  };
-  state.selectedId = null;
-  els.dataSourceBadge.textContent = "Local file (not uploaded)";
-  els.dataSourceBadge.className = "badge badge-muted";
-
-  showPreview(URL.createObjectURL(file));
-
-  els.video.onloadedmetadata = () => {
-    const source = {
-      duration: els.video.duration,
-      width: els.video.videoWidth,
-      height: els.video.videoHeight,
-      fps: 0,
-      sizeBytes: file.size,
-    };
-    state.project.source = source;
-    els.dataSourceBadge.textContent = "Local file";
-    renderMetadata(source);
-    els.dropZoneHint.textContent = `${file.name} · ${formatSize(file.size)} · preview only, not uploaded.`;
-    renderTimeline();
-    els.processingMessage.textContent = "Metadata read locally — upload arrives in the ingest milestone.";
-  };
-
-  els.video.onerror = () => {
-    showError("This browser could not decode the selected file for preview.");
-  };
-
-  renderProjectList();
-  renderProject();
-  selectCandidate(null);
+  uploadFile(file);
 }
 
-els.video.addEventListener("timeupdate", () => {
-  els.previewCurrentTime.textContent = formatTimecode(els.video.currentTime);
-  els.previewDuration.textContent = formatTimecode(els.video.duration || 0);
-});
+async function uploadFile(file) {
+  state.busy = true;
+  els.btnImport.disabled = true;
+  hideError();
+  showProcessing(`Uploading ${file.name}…`, INGEST_STEPS);
+  setProgress(10);
+  log(`Uploading ${file.name} (${formatSize(file.size)})`);
+
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("name", file.name.replace(/\.[^.]+$/, ""));
+
+  try {
+    const response = await fetch("/api/projects", { method: "POST", body: formData });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      markSteps(INGEST_STEPS, "failed", 2);
+      throw new Error(apiErrorMessage(payload, `Upload failed (HTTP ${response.status}).`));
+    }
+
+    markSteps(INGEST_STEPS, "done");
+    setProgress(100);
+    els.processingMessage.textContent = `Imported and read metadata for ${file.name}.`;
+    log(`Created project ${payload.project_id} in the local workspace.`);
+
+    projectFromServer(payload);
+    await fetchProjects();
+  } catch (error) {
+    setProgress(0);
+    showError(error.message);
+    log(`Error: ${error.message}`);
+  } finally {
+    state.busy = false;
+    els.btnImport.disabled = false;
+    els.fileInput.value = "";
+  }
+}
 
 /* ------------------------------------------------------------ processing */
 
@@ -535,12 +629,6 @@ function hideError() {
   els.processingError.classList.add("is-hidden");
 }
 
-function showProcessing(message) {
-  els.processingPanel.classList.remove("is-hidden");
-  els.processingMessage.textContent = message;
-  renderSteps(PROCESSING_STEPS.map((label) => ({ label, status: "waiting" })));
-}
-
 function renderSteps(steps) {
   els.processingSteps.replaceChildren();
   for (const step of steps) {
@@ -559,17 +647,33 @@ function renderSteps(steps) {
   }
 }
 
+function showProcessing(message, labels) {
+  els.processingPanel.classList.remove("is-hidden");
+  els.processingMessage.textContent = message;
+  renderSteps(labels.map((label) => ({ label, status: "waiting" })));
+}
+
+function markSteps(labels, status, runningIndex = -1) {
+  renderSteps(
+    labels.map((label, index) => ({
+      label,
+      status: index === runningIndex ? "running" : status,
+    }))
+  );
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Animate the future pipeline. Layout demonstration only — nothing is processed. */
 async function runProcessingDemo() {
   if (state.demoRunning) return;
   state.demoRunning = true;
   els.processingLog.textContent = "";
   hideError();
-  showProcessing("Layout demo running…");
+  showProcessing("Layout demo running…", DEMO_STEPS);
   log("Demo only — no media is analysed or rendered.");
 
-  const steps = PROCESSING_STEPS.map((label) => ({ label, status: "waiting" }));
+  const steps = DEMO_STEPS.map((label) => ({ label, status: "waiting" }));
 
   for (let index = 0; index < steps.length; index += 1) {
     steps[index].status = "running";
@@ -590,23 +694,31 @@ async function runProcessingDemo() {
 
 /* ------------------------------------------------------------ event wiring */
 
-els.btnImport.addEventListener("click", () => els.fileInput.click());
-els.fileInput.addEventListener("change", () => {
-  handleFile(els.fileInput.files?.[0]);
-  els.fileInput.value = "";
+els.btnImport.addEventListener("click", () => {
+  if (state.busy) return;
+  els.fileInput.click();
 });
 
-els.btnNewProject.addEventListener("click", resetToEmptyProject);
-els.btnRefreshProjects.addEventListener("click", () => {
-  renderProjectList();
-  log("Project list refreshed (demo data).");
+els.fileInput.addEventListener("change", () => handleFile(els.fileInput.files?.[0]));
+
+els.btnNewProject.addEventListener("click", async () => {
+  resetToEmptyProject();
+  await fetchProjects();
 });
 
-els.dropZone.addEventListener("click", () => els.fileInput.click());
+els.btnRefreshProjects.addEventListener("click", async () => {
+  await fetchProjects();
+  log("Project list refreshed.");
+});
+
+els.dropZone.addEventListener("click", () => {
+  if (!state.busy) els.fileInput.click();
+});
+
 els.dropZone.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
-    els.fileInput.click();
+    if (!state.busy) els.fileInput.click();
   }
 });
 
@@ -634,11 +746,27 @@ els.btnRunDemo.addEventListener("click", runProcessingDemo);
 els.btnExport.title =
   "Rendering is not implemented yet; it arrives in the captions and export milestone.";
 
+function resetToEmptyProject() {
+  state.project = { ...EMPTY_PROJECT };
+  state.selectedId = null;
+  els.dataSourceBadge.textContent = "No project";
+  els.dataSourceBadge.className = "badge badge-muted";
+  resetPreview();
+  renderProject();
+  renderProjectList();
+  selectCandidate(null);
+}
+
 /* ------------------------------------------------------------------ start */
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   renderAssetList();
   renderProjectList();
   loadDemoProject();
   checkHealth();
+
+  const projects = await fetchProjects();
+  if (projects.length > 0) {
+    await openProject(projects[0].project_id);
+  }
 });

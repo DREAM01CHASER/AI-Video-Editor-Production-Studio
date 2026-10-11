@@ -1,4 +1,4 @@
-"""FastAPI entry point for the Milestone 0 application foundation."""
+"""FastAPI entry point for the local AI Video Production Studio."""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api import router as api_router
 from .config import Settings
+from .errors import register_error_handlers
+from .projects import ProjectStore
 from .storage import Workspace
 
 
@@ -18,10 +21,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="AI Video Production Studio",
         description="Local-first video editing assistant API",
-        version="0.1.0",
+        version="0.2.0",
     )
     application.state.settings = runtime_settings
     application.state.workspace = workspace
+    application.state.projects = ProjectStore(workspace)
+
+    register_error_handlers(application)
+    application.include_router(api_router)
+
     application.mount(
         "/static", StaticFiles(directory=str(frontend_dir)), name="static"
     )

@@ -28,17 +28,18 @@ CONTENT_TYPES_BY_EXTENSION = {
 _PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 
+def is_valid_project_id(project_id: str | None) -> bool:
+    """Return True when an identifier is a safe single path segment."""
+
+    return bool(project_id) and bool(_PROJECT_ID_PATTERN.fullmatch(project_id))
+
+
 class UploadValidationError(ValueError):
     """Raised when upload metadata does not meet the local safety policy."""
 
 
-def validate_upload(
-    filename: str,
-    content_type: str | None,
-    size_bytes: int,
-    max_size_bytes: int,
-) -> str:
-    """Validate upload metadata and return its normalized extension.
+def validate_upload_metadata(filename: str, content_type: str | None) -> str:
+    """Validate name and declared type, returning the normalized extension.
 
     The original name is used only to determine the extension. It is never used as
     a destination filename, which prevents path traversal and filename collisions.
@@ -53,18 +54,35 @@ def validate_upload(
             "Unsupported video type. Use MP4, MOV, M4V, AVI, MKV, or WebM."
         )
 
+    normalized_content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_content_type and normalized_content_type not in CONTENT_TYPES_BY_EXTENSION[
+        extension
+    ]:
+        raise UploadValidationError("The file type does not match its filename extension.")
+
+    return extension
+
+
+def validate_upload(
+    filename: str,
+    content_type: str | None,
+    size_bytes: int,
+    max_size_bytes: int,
+) -> str:
+    """Validate upload metadata including its declared size.
+
+    The size check is separate from the name/content-type check so a streamed
+    upload can be validated up front and then bounded while it is written.
+    """
+
+    extension = validate_upload_metadata(filename, content_type)
+
     if size_bytes < 0:
         raise UploadValidationError("The upload size cannot be negative.")
     if size_bytes > max_size_bytes:
         raise UploadValidationError(
             f"The upload exceeds the {max_size_bytes // (1024 * 1024)} MB limit."
         )
-
-    normalized_content_type = (content_type or "").split(";", 1)[0].strip().lower()
-    if normalized_content_type and normalized_content_type not in CONTENT_TYPES_BY_EXTENSION[
-        extension
-    ]:
-        raise UploadValidationError("The file type does not match its filename extension.")
 
     return extension
 

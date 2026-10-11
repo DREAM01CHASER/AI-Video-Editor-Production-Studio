@@ -21,17 +21,29 @@ Milestone 1 adds the frontend shell:
 - Dark, desktop-first three-zone workspace (projects/assets sidebar, preview and
   clip candidates, settings inspector) with a bottom timeline.
 - Project header, backend status, and a source-metadata panel.
-- Video import drop zone and file picker that show a **local browser preview
-  only**; nothing is uploaded yet.
+- Video import drop zone and file picker.
 - Processing panel with steps, progress, and plain-language error messages.
 - Clip-candidate list, caption controls, and export settings panels.
 - The shell loads with a clearly labelled sample project, so it works without
   AI models or API keys.
 
-Import/upload, transcription, clip suggestions, captions, and rendering are
-planned for later milestones. Their controls are present for layout but
-**disabled or clearly marked as a demo** — no button pretends to process video
-or export a file.
+Milestone 2 makes video import real:
+
+- `POST /api/projects` accepts one uploaded video and returns a project id.
+- Uploads are **streamed to disk in bounded chunks**, so a large video is never
+  held in memory; the size limit is enforced while writing.
+- Metadata (duration, resolution, frame rate, size) is read locally with
+  **FFprobe** and a copy is saved alongside the source video.
+- Each project is a folder in the workspace holding `project.json` plus
+  `source/`, `transcripts/`, `assets/`, `temp/`, and `exports/`.
+- Failed ingests are cleaned up and never leave a half-written project behind.
+- All failures return one JSON shape: `{"error": {"code": "...", "message": "..."}}`.
+- The frontend import button, drop zone, project list, metadata panel, and
+  preview are wired to the live API.
+
+Transcription, clip suggestions, captions, and rendering are planned for later
+milestones. Their controls are present for layout but **disabled or clearly
+marked as a demo** — no button pretends to transcribe video or export a file.
 
 ## Windows setup
 
@@ -68,6 +80,20 @@ Open <http://127.0.0.1:8000/> in a browser. The health endpoint is available at
 
 Stop the server with `Ctrl+C`.
 
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/health` | Liveness and workspace status. |
+| `POST` | `/api/projects` | Upload one video and create a project (multipart `file`, optional `name`). |
+| `GET` | `/api/projects` | List saved projects for the sidebar. |
+| `GET` | `/api/projects/{project_id}` | Read the saved JSON project document. |
+| `GET` | `/api/projects/{project_id}/source` | Serve the source video for browser preview. |
+
+Upload limits and supported formats come from `.env`/`.env.example`
+(`MAX_UPLOAD_SIZE_MB`). Accepted containers are MP4, MOV, M4V, AVI, MKV, and
+WebM; the original filename is never used as the stored filename.
+
 ## Run tests
 
 ```powershell
@@ -78,11 +104,19 @@ The suite also asserts the frontend shell exposes the expected layout and keeps
 sample data clearly labelled. The interface can be opened without any API key,
 AI model, or uploaded media.
 
-## System tools for later milestones
+## System tools
 
-Later video inspection and rendering milestones require FFmpeg and FFprobe to
-be installed separately and available on `PATH`. They are intentionally not a
-dependency of this foundation milestone.
+**FFprobe and FFmpeg must be installed and available on `PATH`.** Video import
+reads metadata with FFprobe, so importing reports a clear error if the tools are
+missing. FFmpeg itself is used from the rendering milestone onward; both are
+system tools, not Python packages.
+
+Check the installation with:
+
+```powershell
+ffprobe -version
+ffmpeg -version
+```
 
 ## Local data and secrets
 
