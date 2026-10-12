@@ -35,6 +35,7 @@ from .assets import (
     used_in_timeline,
     validate_asset_metadata,
     validate_asset_size,
+    with_provenance,
 )
 from .captions import (
     build_cues,
@@ -58,6 +59,19 @@ from .render import (
     run_ffmpeg_render,
 )
 from .storage import CONTENT_TYPES_BY_EXTENSION, validate_upload_metadata
+from .stock import (
+    PROVIDER,
+    PexelsSettings,
+    describe_result,
+    fetch_video,
+    select_file,
+    provenance_for,
+    search_videos,
+    suggest_placement,
+    derive_keywords,
+    clip_window,
+    download_file,
+)
 from .timeline import (
     UNRENDERED_TRACKS,
     apply_timeline_patch,
@@ -846,6 +860,180 @@ def _clip_by_id(project: dict, clip_id: str | None) -> dict:
         f"This project has no candidate clip with id '{target}'.",
         404,
     )
+
+
+# ------------------------------------------------------- stock b-roll (M8)
+
+#: How many stock results are returned per search. Small enough to read, large
+#: enough to find something that fits the moment.
+STOCK_PER_PAGE = 12
+
+
+def _stock_settings(request: Request) -> PexelsSettings:
+    runtime = request.app.state.settings
+    return PexelsSettings(
+        api_key=runtime.pexels_api_key,
+        base_url=runtime.pexels_base_url,
+    )
+
+
+def _stock_status(settings: PexelsSettings) -> dict[str, object]:
+    """Whether stock search is usable, and why not when it is not."""
+
+    return {
+        "provider": PROVIDER,
+        "configured": settings.enabled,
+        "attribution": "Media provided by Pexels",
+        "terms_url": "https://www.pexels.com/license/",
+        "note": (
+            "Searching Pexels for stock B-roll. Choose a result to import it; "
+            "nothing is downloaded until you do."
+            if settings.enabled
+            else "Stock search is off: set PEXELS_API_KEY in .env to enable it. "
+            "Your own local B-roll and sound effects keep working without a key."
+        ),
+    }
+
+
+@router.get("/projects/{project_id}/stock")
+def get_stock_status(project_id: str, request: Request) -> dict[str, object]:
+    """Report whether stock search is configured, and on what terms."""
+
+    _store(request).load(project_id)
+    return _stock_status(_stock_settings(request))
+
+
+@router.get("/projects/{project_id}/stock/search")
+def search_stock(
+    project_id: str,
+    request: Request,
+    q: str | None = Query(default=None),
+    clip_id: str | None = Query(default=None),
+    per_page: int | None = Query(default=None),
+) -> dict[str, object]:
+    """Search for stock B-roll, optionally using the clip's own transcript.
+
+    With no explicit query, the keywords come from the transcript of the clip the
+    user is editing, so the search matches what is actually being said at that
+    moment rather than a generic topic.
+    """
+
+    settings = _stock_settings(request)
+    store = _store(request)
+    project = store.load(project_id)
+    segments = _transcript_segments(store, project)
+
+    clip = None
+    if clip_id:
+        clip = _clip_by_id(project, clip_id)
+
+    text = " ".join(str(q or "").split())
+    keywords: list[str] = []
+    if not text and clip is not None:
+        keywords = derive_keywords(
+            clip_window(
+                segments,
+                float(clip.get("source_start") or 0.0),
+                float(clip.get("source_end") or 0.0),
+            )
+        )
+        text = ", ".join(keywords)
+
+    results = search_videos(
+        settings,
+        text,
+        per_page=per_page or STOCK_PER_PAGE,
+    )
+
+    payload: dict[str, object] = {
+        **_stock_status(settings),
+        "query": text,
+        "keywords": keywords,
+        "results": [describe_result(video) for video in results],
+    }
+
+    if clip is not None:
+        payload["clip_id"] = str(clip.get("id"))
+        payload["suggested_placement"] = suggest_placement(
+            segments,
+            float(clip.get("source_start") or 0.0),
+            float(clip.get("source_end") or 0.0),
+        )
+
+    return payload
+
+
+@router.post("/projects/{project_id}/stock/import", status_code=201)
+def import_stock(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Import one chosen stock clip into the project's asset library.
+
+    Nothing is downloaded until this call, and the clip's metadata is re-read from
+    the provider rather than taken from the browser, so only a URL the provider
+    itself returned can ever be fetched. The file is streamed to disk under a
+    generated name and its credit is saved with it.
+    """
+
+    settings = _stock_settings(request)
+    store = _store(request)
+    workspace = store.project_workspace(project_id)
+    project = store.load(project_id)
+
+    body = payload or {}
+    if not isinstance(body, dict):
+        raise ApiError("invalid_stock_selection", "Send a JSON object.", 422)
+
+    video = fetch_video(settings, body.get("video_id"))
+    chosen = select_file(video, body.get("file_id"))
+
+    label = " ".join(str(body.get("label") or video.get("photographer") or "Stock clip").split())
+    tags = "stock, pexels"
+
+    part_path = workspace.temp / f"stock-{uuid.uuid4().hex}.part"
+    destination: Path | None = None
+
+    try:
+        download_file(
+            chosen["link"],
+            part_path,
+            max_bytes=settings_max_upload_bytes(request),
+        )
+        metadata = probe_media(part_path)
+        asset_id = f"broll-{uuid.uuid4().hex[:12]}"
+        asset = asset_from_import(
+            asset_id=asset_id,
+            kind="broll",
+            label=normalise_label(label, "Stock clip"),
+            stored_name="",
+            original_name=str(video.get("page_url") or "pexels-clip"),
+            tags=normalise_tags(tags),
+            metadata=metadata,
+        )
+
+        destination = allocate_asset_path(workspace.assets, "broll", ".mp4")
+        part_path.replace(destination)
+        asset["file"] = destination.name
+        asset = with_provenance(asset, provenance_for(video, chosen))
+
+        assets = [a for a in (project.get("assets") or []) if isinstance(a, dict)]
+        saved = store.save_assets(project_id, [asset, *assets])
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        raise
+
+    imported = next(
+        item for item in saved.get("assets") or [] if str(item.get("id")) == asset["id"]
+    )
+    return public_asset(imported, project_id)
+
+
+def settings_max_upload_bytes(request: Request) -> int:
+    """The size ceiling a downloaded clip must fit under."""
+
+    return request.app.state.settings.max_upload_size_bytes
 
 
 def _public_cues(cues: list[dict]) -> list[dict]:

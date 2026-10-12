@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .llm import DEFAULT_BASE_URL as DEFAULT_LLM_BASE_URL
 from .llm import DEFAULT_MODEL as DEFAULT_LLM_MODEL
+from .stock import DEFAULT_BASE_URL as DEFAULT_PEXELS_BASE_URL
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +94,11 @@ class Settings:
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_model: str = DEFAULT_LLM_MODEL
 
+    #: Optional Pexels key for stock B-roll search. With no key the local asset
+    #: library keeps working and the stock panel explains why search is off.
+    pexels_api_key: str | None = None
+    pexels_base_url: str = DEFAULT_PEXELS_BASE_URL
+
     @classmethod
     def from_environment(cls) -> "Settings":
         workspace_value = os.getenv("AI_VIDEO_WORKSPACE", "workspace").strip()
@@ -135,4 +141,6 @@ class Settings:
             llm_api_key=os.getenv("LLM_API_KEY", "").strip() or None,
             llm_base_url=_text(os.getenv("LLM_BASE_URL"), DEFAULT_LLM_BASE_URL),
             llm_model=_text(os.getenv("LLM_MODEL"), DEFAULT_LLM_MODEL),
+            pexels_api_key=os.getenv("PEXELS_API_KEY", "").strip() or None,
+            pexels_base_url=_text(os.getenv("PEXELS_BASE_URL"), DEFAULT_PEXELS_BASE_URL),
         )

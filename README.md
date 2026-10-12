@@ -148,8 +148,34 @@ Milestone 7 adds local B-roll and sound effects:
 - A source with no audio still gets its effects: the export then carries only the
   sound design, and the result says so.
 
-Milestones 8–10 (stock search, transitions and automatic sound design, and the
-release pass) are still to come.
+Milestone 8 adds optional stock B-roll search through Pexels:
+
+- `GET .../stock` reports whether a key is configured, and says plainly why not
+  when it is not; `GET .../stock/search` searches, and `POST .../stock/import`
+  downloads the clip you picked. Every route is scoped to one project.
+- **Off unless you turn it on.** Set `PEXELS_API_KEY` in `.env` to enable it.
+  With no key the panel explains what is missing and the local library keeps
+  working — nothing about editing changes.
+- **Search and preview first, download only when you choose.** A search returns
+  metadata only. A file enters the project when you press *Add as B-roll*, which
+  is the only path that ever downloads a byte.
+- **The search is semantic, not generic.** With the box empty, the keywords are
+  derived from the transcript of the clip you are editing, so the search matches
+  what is actually being said at that moment. A **placement draft** is suggested
+  from the transcript's own turns and applied through the same validated timeline
+  `PATCH` the editor uses — a refused placement leaves the edit untouched.
+- **Provenance is recorded, not just displayed.** Every imported clip keeps its
+  provider, page URL, photographer, and licence in the asset record, and the
+  result cards show the creator link and "Media provided by Pexels" credit
+  wherever the media appears.
+- **Only the provider's own hosts may be fetched**, over HTTPS, with the size
+  limit enforced while streaming, and the clip's metadata is re-read from the
+  provider rather than trusted from the browser. The interface was driven in a
+  real browser to confirm a non-Pexels address is refused inside the UI, not only
+  in a unit test.
+
+Milestones 9–10 (transitions and automatic sound design, and the release pass)
+are still to come.
 
 ## Working directory
 
@@ -232,6 +258,9 @@ Stop the server with `Ctrl+C`.
 | `DELETE` | `/api/projects/{project_id}/assets/{asset_id}` | Remove an asset that the timeline no longer uses. |
 | `GET` | `/api/projects/{project_id}/timeline` | Read the editable edit for one clip. |
 | `PATCH` | `/api/projects/{project_id}/timeline` | Save an edited timeline (clip, captions, render settings, tracks). |
+| `GET` | `/api/projects/{project_id}/stock` | Whether stock B-roll search is configured, and on what terms. |
+| `GET` | `/api/projects/{project_id}/stock/search` | Search stock B-roll; empty query uses the clip's own transcript words. |
+| `POST` | `/api/projects/{project_id}/stock/import` | Download one chosen stock clip into the project, with its credit. |
 | `POST` | `/api/projects/{project_id}/render` | Render the selected clip to a captioned MP4 (`202` + job). |
 | `GET` | `/api/projects/{project_id}/exports` | List finished renders, newest first. |
 | `GET` | `/api/projects/{project_id}/exports/{filename}` | Download a rendered MP4 or its `.srt` sidecar. |
@@ -277,6 +306,17 @@ sound effect through the API and exports them, then measures the exported file t
 show the insert is composited only inside its own window (frame luma jumps from
 the source's level to the insert's and back) and that the effect is audible only
 inside its window (loudness against a silent source floor).
+
+The stock tests are offline too: they cover keyword derivation from a clip's own
+transcript, result parsing, rendition selection, the download host policy (a
+non-Pexels address is refused, and an oversized download is cut off mid-write),
+the recorded provenance, and the placement draft. One acceptance test then walks
+the whole path through the real routes — search, import a real FFmpeg-written
+clip, place it on the timeline at the suggested point, and confirm the credit is
+still in the saved project. The interface itself was also driven in a real
+browser, with a stub standing in for the provider, to confirm the results render
+with their credit and that a non-Pexels download address is refused inside the
+UI rather than only in a test.
 
 The export tests include **real FFmpeg renders** of a synthesised source: they
 render a clip, measure the caption area of the output to show the captions really
@@ -325,6 +365,31 @@ The model may only rewrite titles, reasons, and scores. Clip **times always come
 from the transcript**, so a hallucinated time range can never reach the timeline or
 a render. If the call fails for any reason, the heuristic result is used and the
 analysis explains that the optional pass was unavailable.
+
+## Optional stock B-roll search (Pexels)
+
+Stock search is **off by default**. To enable it, create a free key at
+<https://www.pexels.com/api/> and put it in `.env`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PEXELS_API_KEY` | *(empty)* | Empty keeps stock search off. The key stays server-side. |
+| `PEXELS_BASE_URL` | `https://api.pexels.com` | Override only for a compatible endpoint. |
+
+With a key set, the **Stock B-roll** panel in the sidebar searches Pexels. Leave
+the search box empty to search using the selected clip's own transcript words.
+Nothing is downloaded until you press *Add as B-roll* on a result; the clip is
+then stored in the project's `assets/` folder under a generated name, with its
+creator, page URL, and licence saved alongside it and shown in the library.
+
+Clips may only be downloaded from Pexels's own HTTPS hosts, the size limit is
+enforced while streaming, and the clip's metadata is re-read from the provider
+rather than trusted from the browser. If the network, the key, or the provider
+fails, you get a clear message and your local library keeps working.
+
+Note that Pexels's licence has conditions of its own — check
+<https://www.pexels.com/license/> before publishing, especially where a clip
+identifies a person or a brand.
 
 ## System tools
 

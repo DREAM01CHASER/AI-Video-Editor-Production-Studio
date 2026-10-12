@@ -97,6 +97,53 @@
           </p>
           <p id="asset-error" class="processing-error is-hidden" role="alert"></p>
         </section>
+
+        <!-- Milestone 8: optional stock search. Nothing is downloaded until the
+             user picks a result, and every result carries its credit. -->
+        <section class="panel" id="stock-panel">
+          <div class="panel__heading">
+            <h2>Stock B-roll</h2>
+            <span id="stock-count" class="badge badge-muted">0</span>
+          </div>
+
+          <div class="field-grid">
+            <label class="field field--full">
+              <span class="field__label">Search</span>
+              <input id="stock-query" class="input" type="search"
+                placeholder="Leave empty to search the clip's own words" />
+            </label>
+            <label class="field">
+              <span class="field__label">Orientation</span>
+              <select id="stock-orientation" class="input">
+                <option value="all" selected>Any</option>
+                <option value="portrait">Portrait (9:16)</option>
+                <option value="landscape">Landscape (16:9)</option>
+                <option value="square">Square (1:1)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Results</span>
+              <select id="stock-count-select" class="input">
+                <option value="6">6</option>
+                <option value="12" selected>12</option>
+              </select>
+            </label>
+          </div>
+
+          <button id="btn-stock-search" class="btn btn-secondary btn--block" type="button" disabled
+            title="Import a video first — stock search needs a project and a selected clip.">
+            Search stock B-roll
+          </button>
+
+          <p id="stock-status" class="panel__hint"></p>
+          <p id="stock-error" class="processing-error is-hidden" role="alert"></p>
+          <ul id="stock-results" class="list stock"></ul>
+
+          <p class="panel__hint">
+            Nothing is downloaded until you press <em>Add as B-roll</em>. The clip is
+            stored in this project with its creator and licence recorded.
+          </p>
+        </section>
       </aside>
 
       <!-- Center: preview, processing, and clip candidates -->
@@ -487,10 +534,11 @@
       </p>
     </section>      <footer class="app-footer">
         <p>
-          Milestone 7. Import, local transcription, clip suggestions, the editable
-          timeline, local B-roll and sound effects, captions, and a real captioned MP4
-          export all run on this machine. Sample data is illustrative; stock search and
-          transitions land in later milestones and say so rather than pretending to work.
+          Milestone 8. Import, local transcription, clip suggestions, the editable
+          timeline, local B-roll and sound effects, captions, a real captioned MP4
+          export, and optional Pexels stock search all run on this machine.
+          Sample data is illustrative. Transitions arrive with the next milestone and
+          say so rather than pretending to work.
         </p>
       </footer>
 

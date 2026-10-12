@@ -166,6 +166,29 @@ def test_the_asset_library_and_item_inspector_are_present(tmp_path: Path) -> Non
     assert 'id="btn-add-sfx" class="btn btn-ghost" type="button" disabled' in body
 
 
+def test_the_stock_search_panel_is_present_and_off_by_default(tmp_path: Path) -> None:
+    """Milestone 8: stock search is optional and must say so when unconfigured."""
+
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "stock-panel",
+        "stock-query",
+        "stock-orientation",
+        "stock-count-select",
+        "btn-stock-search",
+        "stock-status",
+        "stock-error",
+        "stock-results",
+        "stock-count",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
+
+    # The search button ships disabled with a reason, never as a dead control.
+    assert "disabled" in body.split('id="btn-stock-search"', 1)[1][:140]
+    # Nothing is downloaded before the user picks a result.
+    assert "Nothing is downloaded until you press" in body
+
+
 def test_static_assets_are_served(tmp_path: Path) -> None:
     client = _client(tmp_path)
     css = client.get("/static/styles.css")

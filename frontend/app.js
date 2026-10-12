@@ -114,6 +114,15 @@ const els = {
   btnImportSfx: document.getElementById("btn-import-sfx"),
   btnAddBroll: document.getElementById("btn-add-broll"),
   btnAddSfx: document.getElementById("btn-add-sfx"),
+  stockPanel: document.getElementById("stock-panel"),
+  stockQuery: document.getElementById("stock-query"),
+  stockOrientation: document.getElementById("stock-orientation"),
+  stockCountSelect: document.getElementById("stock-count-select"),
+  btnStockSearch: document.getElementById("btn-stock-search"),
+  stockStatus: document.getElementById("stock-status"),
+  stockError: document.getElementById("stock-error"),
+  stockResults: document.getElementById("stock-results"),
+  stockCount: document.getElementById("stock-count"),
   timelinePlacement: document.getElementById("timeline-placement"),
   itemPanel: document.getElementById("item-panel"),
   itemName: document.getElementById("item-name"),
@@ -262,6 +271,14 @@ const state = {
   assets: [],
   activeAssetId: null,
   assetBusy: false,
+  //: Optional stock search: whether it is configured, and the last results.
+  stock: {
+    status: null,
+    results: [],
+    keywords: [],
+    placement: null,
+    busy: false,
+  },
   //: The timeline item being edited in the inspector, as {track, id}.
   selectedItem: null,
   export: {
@@ -632,6 +649,282 @@ async function deleteAsset(asset) {
   }
 }
 
+/* --------------------------------------------------------- stock search */
+
+function showStockError(message) {
+  els.stockError.textContent = message;
+  els.stockError.classList.remove("is-hidden");
+}
+
+function hideStockError() {
+  els.stockError.textContent = "";
+  els.stockError.classList.add("is-hidden");
+}
+
+/** The clip whose transcript should drive an empty search box. */
+function activeClipId() {
+  return state.selectedId || null;
+}
+
+function updateStockControls() {
+  const real = isRealProject();
+  const configured = state.stock.status?.configured !== false;
+  const busy = state.stock.busy;
+
+  els.btnStockSearch.disabled = !real || !configured || busy;
+  els.btnStockSearch.title = !real
+    ? "Import a video first — stock search attaches to a project."
+    : !configured
+      ? "Set PEXELS_API_KEY in .env to enable stock search."
+      : busy
+        ? "A search is already running."
+        : "Search Pexels for stock B-roll to overlay on the selected clip.";
+
+  els.stockQuery.disabled = !real || !configured || busy;
+  els.stockOrientation.disabled = !real || !configured || busy;
+  els.stockCountSelect.disabled = !real || !configured || busy;
+}
+
+/** Ask the backend whether stock search is configured, and show why not if not. */
+async function loadStockStatus(projectId) {
+  if (!isRealProject()) return;
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/stock`,
+      { headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (state.project.id !== projectId) return;
+    if (!response.ok) throw new Error(apiErrorMessage(payload, `HTTP ${response.status}`));
+
+    state.stock.status = payload;
+    els.stockStatus.textContent = payload.note || "";
+  } catch (error) {
+    state.stock.status = { configured: false, note: error.message };
+    els.stockStatus.textContent = error.message;
+  }
+
+  updateStockControls();
+}
+
+/** Reset the stock panel when a different project is open. */
+function resetStock(note) {
+  state.stock.results = [];
+  state.stock.keywords = [];
+  state.stock.placement = null;
+  state.stock.busy = false;
+  state.stock.status = null;
+  els.stockResults.replaceChildren();
+  els.stockCount.textContent = "0";
+  els.stockQuery.value = "";
+  hideStockError();
+  els.stockStatus.textContent = note || "";
+  updateStockControls();
+}
+
+function renderStockResults() {
+  els.stockResults.replaceChildren();
+  const results = state.stock.results;
+  els.stockCount.textContent = String(results.length);
+
+  for (const result of results) {
+    const item = document.createElement("li");
+    const card = document.createElement("div");
+    card.className = "stock-card";
+
+    if (result.preview_url) {
+      const thumb = document.createElement("img");
+      thumb.className = "stock-card__thumb";
+      thumb.src = result.preview_url;
+      thumb.alt = "";
+      thumb.loading = "lazy";
+      card.append(thumb);
+    }
+
+    const body = document.createElement("div");
+    body.className = "stock-card__body";
+
+    const title = document.createElement("span");
+    title.className = "stock-card__title";
+    title.textContent = `${result.width || "?"}×${result.height || "?"} · ${formatAssetDuration(result.duration)}`;
+
+    const credit = document.createElement("span");
+    credit.className = "stock-card__credit";
+    if (result.page_url) {
+      const link = document.createElement("a");
+      link.href = result.page_url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = result.photographer || "View on Pexels";
+      credit.append(link, document.createTextNode(" · Media provided by Pexels"));
+    } else {
+      credit.textContent = "Media provided by Pexels";
+    }
+
+    body.append(title, credit);
+    card.append(body);
+
+    const actions = document.createElement("div");
+    actions.className = "stock-card__actions";
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn btn-ghost";
+    add.textContent = "Add as B-roll";
+    add.title = "Download this clip into the project and place it on the timeline.";
+    add.addEventListener("click", (event) => {
+      event.stopPropagation();
+      importStockResult(result);
+    });
+    actions.append(add);
+    card.append(actions);
+
+    item.append(card);
+    els.stockResults.append(item);
+  }
+
+  if (results.length === 0) {
+    const item = document.createElement("li");
+    const hint = document.createElement("p");
+    hint.className = "panel__hint";
+    hint.textContent = state.stock.status?.configured
+      ? "Search Pexels for stock B-roll. Leave the box empty to use the clip's own words."
+      : "Stock search is off. Set PEXELS_API_KEY in .env to enable it — your local " +
+        "library keeps working either way.";
+    item.append(hint);
+    els.stockResults.append(item);
+  }
+
+  updateStockControls();
+}
+
+async function searchStock() {
+  if (!isRealProject() || state.stock.busy) return;
+
+  state.stock.busy = true;
+  hideStockError();
+  els.stockStatus.textContent = "Searching Pexels…";
+  updateStockControls();
+
+  const parameters = new URLSearchParams({
+    per_page: els.stockCountSelect.value || "12",
+  });
+  const query = els.stockQuery.value.trim();
+  if (query) parameters.set("q", query);
+  else if (activeClipId()) parameters.set("clip_id", activeClipId());
+  const orientation = els.stockOrientation.value;
+  if (orientation && orientation !== "all") parameters.set("orientation", orientation);
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/stock/search?${parameters}`,
+      { headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `The search failed (HTTP ${response.status}).`));
+    }
+
+    state.stock.results = Array.isArray(payload.results) ? payload.results : [];
+    state.stock.keywords = Array.isArray(payload.keywords) ? payload.keywords : [];
+    state.stock.placement = payload.suggested_placement || null;
+    els.stockStatus.textContent = payload.query
+      ? `“${payload.query}” — ${state.stock.results.length} result(s). Preview first; nothing is downloaded until you add one.`
+      : "No results.";
+    renderStockResults();
+    log(`Stock search “${payload.query}” returned ${state.stock.results.length} result(s).`);
+  } catch (error) {
+    showStockError(error.message);
+    els.stockStatus.textContent = "The search did not finish.";
+    state.stock.results = [];
+    renderStockResults();
+  } finally {
+    state.stock.busy = false;
+    updateStockControls();
+  }
+}
+
+async function importStockResult(result) {
+  if (!isRealProject() || state.assetBusy) return;
+
+  state.assetBusy = true;
+  hideStockError();
+  els.stockStatus.textContent = "Downloading the chosen clip into the project…";
+  updateAssetControls();
+  updateStockControls();
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/stock/import`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ video_id: result.id }),
+      }
+    );
+    const asset = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(asset, `Could not import it (HTTP ${response.status}).`));
+    }
+
+    state.activeAssetId = asset.id;
+    els.stockStatus.textContent = `Added ${asset.label} to the library — media provided by Pexels.`;
+    log(`Imported stock clip ${asset.id} from Pexels.`);
+    await fetchAssets(state.project.id);
+
+    // Place it on the timeline so the search leads to a real edit, not just a file.
+    await placeStockAssetOnTimeline(asset, result);
+  } catch (error) {
+    showStockError(error.message);
+    els.stockStatus.textContent = "The clip was not imported.";
+  } finally {
+    state.assetBusy = false;
+    updateAssetControls();
+    updateStockControls();
+  }
+}
+
+/** Draft a B-roll placement for a freshly imported stock clip.
+ *
+ * The placement is only a suggestion taken from the transcript, so it is applied
+ * through the same validated PATCH the timeline uses — the backend may refuse it
+ * and the timeline stays exactly as it was.
+ */
+async function placeStockAssetOnTimeline(asset, result) {
+  if (!state.timeline || !state.timeline.clip_id) {
+    els.stockStatus.textContent =
+      `Added ${asset.label} to the library. Select a clip to place it on the timeline.`;
+    return;
+  }
+
+  const placement = state.stock.placement;
+  const clipDuration = Number(state.timeline.duration) || 0;
+  if (!clipDuration) return;
+
+  const start = Math.min(Math.max(0, Number(placement?.start) || 0), clipDuration - 0.5);
+  const end = Math.min(
+    Math.max(start + 0.5, Number(placement?.end) || start + 2.0),
+    clipDuration
+  );
+
+  await sendTimelinePatch({
+    broll: [
+      ...(state.timeline.broll || []),
+      {
+        source: asset.id,
+        start: round3(start),
+        end: round3(end),
+        placement: "full",
+        fit: "contain",
+      },
+    ],
+  });
+
+  els.stockStatus.textContent = `Added ${asset.label} and placed it at ${start.toFixed(1)}s — ` +
+    "adjust or remove it on the timeline.";
+}
+
 /* ------------------------------------------------------------- rendering */
 
 function renderProject() {
@@ -646,6 +939,7 @@ function renderProject() {
   updateTranscribeControls();
   updateSuggestControls();
   updateExportControls();
+  updateStockControls();
 }
 
 function renderMetadata(source) {
@@ -2578,6 +2872,7 @@ function projectFromServer(payload) {
   state.selectedItem = null;
   state.activeAssetId = null;
   fetchAssets(payload.project_id);
+  loadStockStatus(payload.project_id);
   renderProjectList();
   renderProject();
   setPreviewSource(`/api/projects/${payload.project_id}/source`);
@@ -2621,6 +2916,7 @@ function loadDemoProject() {
   state.assets = [];
   state.activeAssetId = null;
   renderAssetList();
+  resetStock("Open or import a project to search stock B-roll.");
   state.selectedId = state.project.candidates[0]?.id ?? null;
   applyClipAnalysis(null, false);
   els.candidatesStatus.textContent = "Sample candidates — illustrative, not generated from a transcript.";
@@ -2904,6 +3200,10 @@ els.assetFileInput.addEventListener("change", () => {
 
 els.assetSearch.addEventListener("input", renderAssetList);
 els.assetKindFilter.addEventListener("change", renderAssetList);
+els.btnStockSearch.addEventListener("click", searchStock);
+els.stockQuery.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") searchStock();
+});
 els.timelineRuler.addEventListener("click", seekFromRuler);
 els.timelineRuler.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") seekFromRuler(event);
@@ -2943,6 +3243,7 @@ function resetToEmptyProject() {
   state.assets = [];
   state.activeAssetId = null;
   renderAssetList();
+  resetStock("Import a video first — stock search needs a project.");
   els.dataSourceBadge.textContent = "No project";
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();

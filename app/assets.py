@@ -198,8 +198,13 @@ def asset_from_import(
     original_name: str,
     tags: Iterable[str],
     metadata: MediaMetadata,
+    provenance: dict | None = None,
 ) -> dict[str, object]:
-    """Build the asset record that is saved in ``project.json``."""
+    """Build the asset record that is saved in ``project.json``.
+
+    ``provenance`` is filled for stock clips so the credit the provider requires
+    is kept next to the file rather than being lost in a downloaded copy.
+    """
 
     if kind == BROLL and not metadata.has_video:
         raise ApiError(
@@ -246,6 +251,18 @@ def asset_from_import(
         "size_bytes": metadata.size_bytes,
         "created_at": _utcnow(),
     }
+
+
+def with_provenance(record: dict, provenance: dict | None) -> dict[str, object]:
+    """Attach a stock clip's credit to its asset record.
+
+    ``TECH_STACK.md`` requires the provider and creator to be recorded, so this is
+    part of the record rather than a display-only string.
+    """
+
+    if not isinstance(provenance, dict) or not provenance:
+        return record
+    return {**record, "provenance": provenance}
 
 
 def find_asset(project: dict, asset_id: str | None) -> dict:
