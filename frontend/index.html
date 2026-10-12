@@ -107,9 +107,23 @@
           </div>
 
           <div class="preview-controls">
-            <button id="btn-preview-prev" class="btn btn-ghost" type="button" disabled title="Disabled until clip playback is wired up in a later milestone">◀ Previous clip</button>
+            <button id="btn-preview-prev" class="btn btn-ghost" type="button" disabled title="Clip-to-clip navigation arrives with the timeline milestone">◀ Previous clip</button>
             <span id="preview-clip-label" class="preview-clip-label">No clip selected</span>
-            <button id="btn-preview-next" class="btn btn-ghost" type="button" disabled title="Disabled until clip playback is wired up in a later milestone">Next clip ▶</button>
+            <button id="btn-preview-next" class="btn btn-ghost" type="button" disabled title="Clip-to-clip navigation arrives with the timeline milestone">Next clip ▶</button>
+          </div>
+
+          <div id="export-result" class="render-result is-hidden">
+            <div class="panel__heading">
+              <h3>Exported clip</h3>
+              <span id="export-result-badge" class="badge status-ready">Ready</span>
+            </div>
+            <video id="export-video" class="render-result__video" controls preload="metadata" playsinline></video>
+            <p id="export-result-summary" class="render-result__summary"></p>
+            <p id="export-result-notes" class="render-result__notes"></p>
+            <div class="render-result__actions">
+              <a id="export-download" class="btn btn-primary" href="#" download>Download MP4</a>
+              <a id="export-srt-link" class="btn btn-secondary is-hidden" href="#" download>Download .srt</a>
+            </div>
           </div>
         </section>
 
@@ -239,7 +253,7 @@
                 <option value="top">Top</option>
               </select>
             </label>
-            <label class="field field--full">
+            <label class="field">
               <span class="field__label">Highlight mode</span>
               <select id="highlight-mode" class="input">
                 <option value="outline">Outline</option>
@@ -247,7 +261,29 @@
                 <option value="none">None</option>
               </select>
             </label>
+            <label class="field">
+              <span class="field__label">Line length</span>
+              <select id="line-length" class="input">
+                <option value="auto" selected>Auto (fit the frame)</option>
+                <option value="short">Short</option>
+                <option value="medium">Medium</option>
+                <option value="long">Long</option>
+              </select>
+            </label>
+            <label class="field field--full field--check">
+              <input id="high-contrast" type="checkbox" />
+              <span class="field__label">High contrast (opaque caption box)</span>
+            </label>
           </div>
+
+          <p id="caption-preview-status" class="processing-message">
+            Select a clip to preview its captions.
+          </p>
+          <ol id="caption-preview" class="caption-preview"></ol>
+          <p class="panel__hint">
+            Captions come from the saved transcript with timestamps shifted to the
+            clip, so line 1 starts at 0s. The preview is exactly what the export burns in.
+          </p>
         </section>
 
         <section id="export-panel" class="panel">
@@ -272,18 +308,40 @@
             <label class="field field--full">
               <span class="field__label">Output resolution</span>
               <select id="output-resolution" class="input">
-                <option value="1080x1920" selected>1080 × 1920 (recommended)</option>
-                <option value="1440x2560">1440 × 2560 (2K, slower)</option>
+                <option value="1080x1920" data-aspect="9:16" selected>1080 × 1920 (recommended)</option>
+                <option value="1440x2560" data-aspect="9:16">1440 × 2560 (2K, upscaled)</option>
+                <option value="1080x1080" data-aspect="1:1">1080 × 1080</option>
+                <option value="1920x1080" data-aspect="16:9">1920 × 1080</option>
               </select>
             </label>
+            <label class="field">
+              <span class="field__label">Captions</span>
+              <select id="export-caption-mode" class="input">
+                <option value="burn" selected>Burn into video</option>
+                <option value="none">Off</option>
+              </select>
+            </label>
+            <label class="field field--check">
+              <input id="export-write-srt" type="checkbox" checked />
+              <span class="field__label">Also save .srt</span>
+            </label>
           </div>
+
           <button id="btn-export" class="btn btn-primary btn--block" type="button" disabled
-            title="Rendering is not implemented yet; it arrives in the captions and export milestone.">
-            Export MP4
+            title="Select a clip first — the export renders the selected clip and its captions.">
+            Export selected clip
           </button>
-          <p class="panel__hint">
-            Export is disabled until the rendering milestone. Settings here only shape the layout.
+          <button id="btn-export-cancel" class="btn btn-ghost btn--block is-hidden" type="button">Cancel export</button>
+
+          <div id="export-progress" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="export-progress-fill" class="progress-fill"></div>
+          </div>
+          <p id="export-status" class="processing-message">
+            Nothing rendered yet. Rendering runs FFmpeg on this machine and writes an MP4
+            into the project's exports folder.
           </p>
+          <p id="export-error" class="processing-error is-hidden" role="alert"></p>
+          <p id="export-notes" class="panel__hint"></p>
         </section>
       </aside>
     </div>
@@ -307,8 +365,9 @@
 
     <footer class="app-footer">
       <p>
-        Milestone 4. Import, local transcription, and transcript-based clip suggestions are
-        real. Sample data is illustrative: captions and export are not implemented yet.
+        Milestone 5. Import, local transcription, clip suggestions, captions, and a real
+        captioned vertical MP4 export all run on this machine. Sample data is illustrative;
+        B-roll, sound effects, transitions, and the timeline editor come later.
       </p>
     </footer>
 

@@ -7,9 +7,11 @@
  * from /api/projects/{id}/transcript so a reload restores it without re-running
  * the model.
  *
- * Clip suggestions, captions, and rendering are still layout only: their controls
- * are disabled or clearly marked as a demo, and the processing panel labels
- * anything that is not real.
+ * Milestone 4 added transcript-based clip suggestions, and Milestone 5 added
+ * captions and a real export: the page asks the backend for the caption cues of
+ * the selected clip, then starts a render job and polls it exactly like
+ * transcription. Anything that is not implemented yet stays disabled with a
+ * reason in its title, and the processing panel labels anything that is a demo.
  */
 
 const DEMO_PROJECT = {
@@ -85,6 +87,9 @@ const SUPPORTED_EXTENSIONS = [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"];
 /** How often the page asks the backend for transcription progress. */
 const TRANSCRIBE_POLL_MS = 800;
 
+/** Rendering reports progress far more often, so it is polled a little slower. */
+const RENDER_POLL_MS = 700;
+
 const els = {
   projectName: document.getElementById("project-name"),
   projectId: document.getElementById("project-id-value"),
@@ -143,7 +148,48 @@ const els = {
   clipDuration: document.getElementById("clip-duration"),
   timelineRuler: document.getElementById("timeline-ruler"),
   timelineTracks: document.getElementById("timeline-tracks"),
+  captionStyle: document.getElementById("caption-style"),
+  fontSize: document.getElementById("font-size"),
+  captionPlacement: document.getElementById("caption-placement"),
+  highlightMode: document.getElementById("highlight-mode"),
+  lineLength: document.getElementById("line-length"),
+  highContrast: document.getElementById("high-contrast"),
+  captionPreview: document.getElementById("caption-preview"),
+  captionPreviewStatus: document.getElementById("caption-preview-status"),
+  aspectRatio: document.getElementById("aspect-ratio"),
+  outputResolution: document.getElementById("output-resolution"),
+  exportFormat: document.getElementById("export-format"),
+  exportCaptionMode: document.getElementById("export-caption-mode"),
+  exportWriteSrt: document.getElementById("export-write-srt"),
+  btnExportCancel: document.getElementById("btn-export-cancel"),
+  exportProgress: document.getElementById("export-progress"),
+  exportProgressFill: document.getElementById("export-progress-fill"),
+  exportStatus: document.getElementById("export-status"),
+  exportError: document.getElementById("export-error"),
+  exportNotes: document.getElementById("export-notes"),
+  exportResult: document.getElementById("export-result"),
+  exportResultBadge: document.getElementById("export-result-badge"),
+  exportVideo: document.getElementById("export-video"),
+  exportResultSummary: document.getElementById("export-result-summary"),
+  exportResultNotes: document.getElementById("export-result-notes"),
+  exportDownload: document.getElementById("export-download"),
+  exportSrtLink: document.getElementById("export-srt-link"),
 };
+
+/** Every control that shapes a render, so one loop can disable them together. */
+const RENDER_CONTROLS = [
+  "aspectRatio",
+  "outputResolution",
+  "exportFormat",
+  "exportCaptionMode",
+  "exportWriteSrt",
+  "captionStyle",
+  "fontSize",
+  "captionPlacement",
+  "highlightMode",
+  "lineLength",
+  "highContrast",
+];
 
 const state = {
   project: { ...EMPTY_PROJECT },
@@ -164,6 +210,16 @@ const state = {
     analysis: null,
     stale: false,
     busy: false,
+  },
+  captions: {
+    clipId: null,
+    busy: false,
+  },
+  export: {
+    jobId: null,
+    timer: null,
+    busy: false,
+    result: null,
   },
 };
 
@@ -317,6 +373,7 @@ function renderProject() {
   renderTimeline();
   updateTranscribeControls();
   updateSuggestControls();
+  updateExportControls();
 }
 
 function renderMetadata(source) {
@@ -428,6 +485,9 @@ function selectCandidate(id) {
 
   updateClipDuration();
   renderTimeline();
+  updateExportControls();
+  // Captions belong to the selected clip, so they follow the selection.
+  loadCaptionPreview();
 }
 
 /* --------------------------------------------------------- clip inspector */
@@ -1023,6 +1083,481 @@ async function persistClipEdits(candidate) {
   }
 }
 
+/* --------------------------------------------------- captions and export */
+
+/** The caption choices currently in the inspector. */
+function captionStyleFromControls() {
+  return {
+    preset: els.captionStyle.value,
+    font_size: els.fontSize.value,
+    placement: els.captionPlacement.value,
+    highlight_mode: els.highlightMode.value,
+    line_length: els.lineLength.value,
+    high_contrast: els.highContrast.checked,
+  };
+}
+
+/** The export choices currently in the inspector. */
+function exportSettingsFromControls() {
+  return {
+    aspect_ratio: els.aspectRatio.value,
+    resolution: els.outputResolution.value,
+    format: els.exportFormat.value,
+    caption_mode: els.exportCaptionMode.value,
+    write_srt: els.exportWriteSrt.checked,
+  };
+}
+
+function applyStyleToControls(style) {
+  const value = style || {};
+  if (value.preset) els.captionStyle.value = value.preset;
+  if (value.font_size) els.fontSize.value = value.font_size;
+  if (value.placement) els.captionPlacement.value = value.placement;
+  if (value.highlight_mode) els.highlightMode.value = value.highlight_mode;
+  if (value.line_length) els.lineLength.value = value.line_length;
+  els.highContrast.checked = Boolean(value.high_contrast);
+}
+
+function applyExportSettingsToControls(settings) {
+  const value = settings || {};
+  if (value.aspect_ratio) els.aspectRatio.value = value.aspect_ratio;
+  if (value.format) els.exportFormat.value = value.format;
+  if (value.caption_mode) els.exportCaptionMode.value = value.caption_mode;
+  if (typeof value.write_srt === "boolean") els.exportWriteSrt.checked = value.write_srt;
+  syncResolutionOptions(value.resolution);
+}
+
+/**
+ * Only offer resolutions that belong to the chosen aspect ratio.
+ *
+ * A 1920 × 1080 size on a 9:16 export would be stretched, which is never what
+ * anyone means, so the mismatch is prevented here and rejected by the backend.
+ */
+function syncResolutionOptions(preferred) {
+  const aspect = els.aspectRatio.value;
+  let firstMatch = null;
+
+  for (const option of els.outputResolution.options) {
+    const matches = !option.dataset.aspect || option.dataset.aspect === aspect;
+    option.disabled = !matches;
+    option.hidden = !matches;
+    if (matches && !firstMatch) firstMatch = option;
+  }
+
+  if (preferred) {
+    const wanted = Array.from(els.outputResolution.options).find(
+      (option) => option.value === preferred && !option.disabled
+    );
+    if (wanted) {
+      els.outputResolution.value = wanted.value;
+      return;
+    }
+  }
+
+  const current = els.outputResolution.selectedOptions[0];
+  if ((!current || current.disabled) && firstMatch) {
+    els.outputResolution.value = firstMatch.value;
+  }
+}
+
+function showExportError(message) {
+  els.exportError.textContent = message;
+  els.exportError.classList.remove("is-hidden");
+}
+
+function hideExportError() {
+  els.exportError.textContent = "";
+  els.exportError.classList.add("is-hidden");
+}
+
+function setExportProgress(percent) {
+  const value = Math.min(100, Math.max(0, Number(percent) || 0));
+  els.exportProgressFill.style.width = `${value}%`;
+  els.exportProgress.setAttribute("aria-valuenow", String(Math.round(value)));
+}
+
+/** Render the caption cues of the selected clip, which is what the export burns in. */
+function renderCaptionPreview(payload, message) {
+  els.captionPreview.replaceChildren();
+
+  if (!payload) {
+    els.captionPreviewStatus.textContent = message || "Select a clip to preview its captions.";
+    return;
+  }
+
+  const cues = Array.isArray(payload.cues) ? payload.cues : [];
+  if (cues.length === 0) {
+    els.captionPreviewStatus.textContent =
+      payload.summary?.note ||
+      "This clip has no transcribed speech, so a captioned export would show no captions.";
+    return;
+  }
+
+  const geometry = payload.geometry || {};
+  const bits = [`${cues.length} caption(s)`];
+  if (geometry.max_line_chars) bits.push(`up to ${geometry.max_line_chars} characters per line`);
+  if (geometry.font_size) bits.push(`${geometry.font_size}px text`);
+  els.captionPreviewStatus.textContent = `${bits.join(" · ")}.`;
+
+  for (const cue of cues) {
+    const item = document.createElement("li");
+    item.className = "caption-preview__item";
+
+    const time = document.createElement("span");
+    time.className = "caption-preview__time";
+    // Clip-relative seconds, so the first cue visibly starts at 0.0s.
+    time.textContent = `${Number(cue.start).toFixed(1)}s → ${Number(cue.end).toFixed(1)}s`;
+
+    const lines = document.createElement("span");
+    lines.className = "caption-preview__lines";
+    for (const line of cue.lines || [cue.text]) {
+      const span = document.createElement("span");
+      span.textContent = line;
+      lines.append(span);
+    }
+
+    item.append(time, lines);
+    els.captionPreview.append(item);
+  }
+}
+
+async function loadCaptionPreview() {
+  const clipId = state.selectedId;
+
+  if (!isRealProject()) {
+    renderCaptionPreview(
+      null,
+      "Import a video, transcribe it, and suggest clips to preview captions."
+    );
+    return;
+  }
+
+  if (!clipId) {
+    renderCaptionPreview(null, "Select a clip to preview its captions.");
+    return;
+  }
+
+  if (state.captions.busy) return;
+  state.captions.busy = true;
+  els.captionPreviewStatus.textContent = "Building captions from the saved transcript…";
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/captions` +
+        `?clip_id=${encodeURIComponent(clipId)}`,
+      { headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(payload, `Could not build captions (HTTP ${response.status}).`)
+      );
+    }
+    if (state.selectedId !== clipId) return;
+    state.captions.clipId = clipId;
+    renderCaptionPreview(payload);
+  } catch (error) {
+    renderCaptionPreview(null, error.message);
+  } finally {
+    state.captions.busy = false;
+  }
+}
+
+/**
+ * Save the caption and export settings the next render will use.
+ *
+ * The backend validates both halves and returns the plan, so the upscale and
+ * 2K warnings shown here come from the same code that builds the FFmpeg command.
+ */
+async function saveProjectSettings({ reloadCaptions = false } = {}) {
+  if (!isRealProject()) {
+    if (reloadCaptions) renderCaptionPreview(null, "Sample project — settings are not saved.");
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/settings`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          caption_style: captionStyleFromControls(),
+          export: exportSettingsFromControls(),
+        }),
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(payload, `Could not save the settings (HTTP ${response.status}).`)
+      );
+    }
+
+    hideExportError();
+    const notes = payload.plan?.notes || [];
+    els.exportNotes.textContent = notes.join(" ");
+    log(`Saved settings: ${els.captionStyle.value} captions, ${els.outputResolution.value}.`);
+
+    if (reloadCaptions) await loadCaptionPreview();
+  } catch (error) {
+    showExportError(error.message);
+  }
+}
+
+/** Export needs a real project and a selected clip; every disabled state is explained. */
+function updateExportControls() {
+  const real = isRealProject();
+  const clip = state.project.candidates.find((item) => item.id === state.selectedId) || null;
+  const running = Boolean(state.export.jobId);
+
+  els.btnExport.disabled = !real || !clip || running || state.export.busy;
+  els.btnExport.title = !real
+    ? "Import a video first — the export renders an imported project's clip."
+    : !clip
+      ? "Select a clip first — the export renders the selected clip and its captions."
+      : running
+        ? "An export is already running for this project."
+        : "Render the selected clip with captions into an MP4 file.";
+
+  els.btnExportCancel.classList.toggle("is-hidden", !running);
+
+  for (const name of RENDER_CONTROLS) {
+    els[name].disabled = !real || running;
+  }
+}
+
+function showExportResult(result, available = true) {
+  if (!result) {
+    els.exportResult.classList.add("is-hidden");
+    return;
+  }
+
+  els.exportResult.classList.remove("is-hidden");
+  els.exportResultBadge.textContent = available ? "Ready" : "File missing";
+  els.exportResultBadge.className = available ? "badge status-ready" : "badge status-error";
+
+  els.exportVideo.src = result.url;
+  els.exportDownload.href = result.url;
+  els.exportDownload.setAttribute("download", result.file || "export.mp4");
+  els.exportDownload.textContent = available ? "Download MP4" : "Download MP4 (file missing)";
+
+  if (result.srt_url) {
+    els.exportSrtLink.href = result.srt_url;
+    els.exportSrtLink.setAttribute("download", result.srt_file || "captions.srt");
+    els.exportSrtLink.classList.remove("is-hidden");
+  } else {
+    els.exportSrtLink.classList.add("is-hidden");
+  }
+
+  const captions =
+    result.caption_mode === "none"
+      ? "captions off"
+      : `${result.cue_count} caption(s), ${result.caption_preset} preset`;
+  els.exportResultSummary.textContent = [
+    result.clip_title ? `Clip: ${result.clip_title}` : null,
+    `${result.width} × ${result.height}`,
+    `${Number(result.duration).toFixed(1)}s`,
+    formatSize(result.size_bytes),
+    captions,
+    result.render_seconds ? `rendered in ${Number(result.render_seconds).toFixed(1)}s` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const notes = [...(result.notes || [])];
+  if ((result.font_warnings || []).length > 0) {
+    notes.push(
+      "This machine was missing a font for some characters, so they may not appear " +
+        "in the burned-in captions."
+    );
+  }
+  els.exportResultNotes.textContent = notes.join(" ");
+}
+
+/** Show the newest render already saved for this project, if there is one. */
+async function loadExports(projectId) {
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/exports`,
+      { headers: { Accept: "application/json" } }
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (state.project.id !== projectId) return;
+
+    const latest = payload.latest;
+    if (payload.export_settings) applyExportSettingsToControls(payload.export_settings);
+    if (payload.caption_style) applyStyleToControls(payload.caption_style);
+
+    if (payload.exports?.length) {
+      const available = latest?.available !== false;
+      els.exportStatus.textContent = available
+        ? `${payload.exports.length} saved export(s) for this project.`
+        : "The newest export's file is missing from the exports folder.";
+      showExportResult(latest, available);
+    } else {
+      showExportResult(null);
+      els.exportStatus.textContent =
+        "Nothing rendered yet for this project. Select a clip, then export.";
+    }
+  } catch (error) {
+    console.warn("Could not list exports:", error);
+  }
+}
+
+async function startExport() {
+  const projectId = state.project.id;
+  const clipId = state.selectedId;
+  if (!isRealProject() || !clipId || state.export.jobId) return;
+
+  hideExportError();
+  state.export.busy = true;
+  setExportProgress(0);
+  els.processingLog.textContent = "";
+  els.exportStatus.textContent = "Starting the export…";
+  log(
+    `Exporting ${clipId} at ${els.outputResolution.value} with ` +
+      `${els.exportCaptionMode.value === "burn" ? els.captionStyle.value + " captions" : "no captions"}.`
+  );
+  updateExportControls();
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/render`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          clip_id: clipId,
+          caption_style: captionStyleFromControls(),
+          export: exportSettingsFromControls(),
+        }),
+      }
+    );
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(job, `Could not start the export (HTTP ${response.status}).`));
+    }
+
+    state.export.jobId = job.job_id;
+    updateExportControls();
+    pollRender(job.job_id, projectId);
+  } catch (error) {
+    state.export.busy = false;
+    showExportError(error.message);
+    els.exportStatus.textContent = "The export could not start.";
+    log(`Error: ${error.message}`);
+    updateExportControls();
+  }
+}
+
+async function pollRender(jobId, projectId) {
+  const stillOpen = state.project.id === projectId;
+
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(job, `Lost track of the export (HTTP ${response.status}).`));
+    }
+
+    if (stillOpen) {
+      setExportProgress(job.progress);
+      els.exportStatus.textContent = job.message || job.status;
+    }
+
+    if (job.status === "succeeded") {
+      onRenderSucceeded(job, stillOpen);
+      return;
+    }
+    if (job.status === "failed") {
+      onRenderFinished("failed", job.error?.message || "The export failed.", stillOpen);
+      return;
+    }
+    if (job.status === "cancelled") {
+      onRenderFinished("cancelled", "Export cancelled. No file was kept.", stillOpen);
+      return;
+    }
+
+    state.export.timer = setTimeout(() => pollRender(jobId, projectId), RENDER_POLL_MS);
+  } catch (error) {
+    onRenderFinished("failed", error.message, stillOpen);
+  }
+}
+
+function onRenderSucceeded(job, stillOpen) {
+  state.export.jobId = null;
+  state.export.busy = false;
+  clearTimeout(state.export.timer);
+  state.export.timer = null;
+
+  if (!stillOpen) {
+    updateExportControls();
+    return;
+  }
+
+  const result = job.result || null;
+  state.export.result = result;
+  setExportProgress(100);
+
+  if (!result) {
+    els.exportStatus.textContent =
+      "The render finished but returned no details, so nothing is shown here.";
+    updateExportControls();
+    return;
+  }
+
+  els.exportStatus.textContent = `Exported ${result.file} (${formatSize(result.size_bytes)}).`;
+  showExportResult(result, true);
+  log(
+    `Exported ${result.file}: ${result.width}×${result.height}, ${result.cue_count} caption(s), ` +
+      `${Number(result.render_seconds || 0).toFixed(1)}s to render.`
+  );
+  updateExportControls();
+}
+
+function onRenderFinished(status, message, stillOpen) {
+  state.export.jobId = null;
+  state.export.busy = false;
+  clearTimeout(state.export.timer);
+  state.export.timer = null;
+  if (!stillOpen) return;
+
+  if (status === "cancelled") {
+    els.exportStatus.textContent = message;
+    setExportProgress(0);
+  } else {
+    showExportError(message);
+    els.exportStatus.textContent = "The export did not finish.";
+  }
+  log(`Error: ${message}`);
+  updateExportControls();
+}
+
+async function cancelExport() {
+  const jobId = state.export.jobId;
+  if (!jobId) return;
+
+  els.btnExportCancel.disabled = true;
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(job, `Could not cancel (HTTP ${response.status}).`));
+    }
+    els.exportStatus.textContent = "Cancelling…";
+  } catch (error) {
+    showExportError(error.message);
+  } finally {
+    els.btnExportCancel.disabled = false;
+  }
+}
+
 /* -------------------------------------------------- projects from backend */
 
 function projectFromServer(payload) {
@@ -1051,6 +1586,12 @@ function projectFromServer(payload) {
     els.candidatesStatus.textContent = `${(payload.clips || []).length} saved candidate clip(s).`;
   }
   hideCandidateError();
+  // Settings saved with the project are the ones the next render uses.
+  applyStyleToControls(payload.caption_style);
+  applyExportSettingsToControls(payload.export);
+  showExportResult(null);
+  els.exportNotes.textContent = "";
+  els.exportStatus.textContent = "Loading saved exports…";
 
   els.dataSourceBadge.textContent = "Imported";
   els.dataSourceBadge.className = "badge badge-demo";
@@ -1072,6 +1613,8 @@ function projectFromServer(payload) {
       }
     });
   }
+
+  loadExports(payload.project_id);
 }
 
 async function openProject(projectId) {
@@ -1106,6 +1649,14 @@ function loadDemoProject() {
     "Sample project loaded — import a video to preview real footage.";
   resetPreview();
   resetTranscript("Import a video to transcribe it — the sample project has no media.");
+  showExportResult(null);
+  els.exportNotes.textContent = "";
+  els.exportStatus.textContent =
+    "Nothing rendered yet. Rendering runs FFmpeg on this machine and writes an MP4 " +
+    "into the project's exports folder.";
+  renderCaptionPreview(null, "Sample project — import a video to preview real captions.");
+  setExportProgress(0);
+  hideExportError();
   renderProjectList();
   renderProject();
   selectCandidate(state.selectedId);
@@ -1313,9 +1864,34 @@ els.btnTranscribe.addEventListener("click", startTranscription);
 els.btnTranscribeRetry.addEventListener("click", startTranscription);
 els.btnTranscribeCancel.addEventListener("click", cancelTranscription);
 
-// Export stays disabled until the render milestone; the title explains why.
-els.btnExport.title =
-  "Rendering is not implemented yet; it arrives in the captions and export milestone.";
+els.btnExport.addEventListener("click", startExport);
+els.btnExportCancel.addEventListener("click", cancelExport);
+
+// Caption controls change the burned-in text, so the preview is rebuilt from the
+// backend-validated cues instead of guessing locally what will be rendered.
+for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "highContrast"]) {
+  els[name].addEventListener("change", async () => {
+    if (!isRealProject()) {
+      renderCaptionPreview(null, "Sample project — settings are not saved.");
+      return;
+    }
+    await saveProjectSettings({ reloadCaptions: true });
+  });
+}
+
+els.aspectRatio.addEventListener("change", async () => {
+  // Keep the resolution list consistent with the chosen ratio before saving.
+  syncResolutionOptions();
+  await saveProjectSettings();
+  updateExportControls();
+});
+
+for (const name of ["outputResolution", "exportFormat", "exportCaptionMode", "exportWriteSrt"]) {
+  els[name].addEventListener("change", async () => {
+    await saveProjectSettings();
+    updateExportControls();
+  });
+}
 
 function resetToEmptyProject() {
   state.project = { ...EMPTY_PROJECT };
@@ -1327,6 +1903,10 @@ function resetToEmptyProject() {
   applyClipAnalysis(null, false);
   els.candidatesStatus.textContent = "No candidates yet.";
   hideCandidateError();
+  showExportResult(null);
+  setExportProgress(0);
+  hideExportError();
+  renderCaptionPreview(null, "Import a video to preview captions.");
   renderProject();
   renderProjectList();
   selectCandidate(null);

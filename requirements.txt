@@ -8,3 +8,8 @@ python-multipart==0.0.20
 # weights are downloaded on first use into the normal Hugging Face cache and are
 # never committed to the repository.
 faster-whisper==1.2.1
+
+# Subtitle serialisation (Milestone 5), the library named in TECH_STACK.md: style
+# definitions, timestamp formatting, and the ASS and SRT dialects for burned-in
+# captions and the optional sidecar file. Pure Python, no other runtime deps.
+pysubs2==1.8.0

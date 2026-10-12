@@ -12,18 +12,34 @@ transcript so the UI can restore it without re-running the model.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Body, File, Form, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from .captions import (
+    build_cues,
+    caption_summary,
+    default_style,
+    normalise_style,
+    resolve_geometry,
+    to_ass,
+    to_srt,
+)
 from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
 from .llm import LlmSettings, make_ranker
 from .jobs import JobRegistry
 from .media import probe_video
 from .projects import ProjectStore
+from .render import (
+    build_ffmpeg_command,
+    ffmpeg_available,
+    normalise_export,
+    run_ffmpeg_render,
+)
 from .storage import CONTENT_TYPES_BY_EXTENSION, validate_upload_metadata
 from .transcription import TranscriptionService
 
@@ -31,6 +47,11 @@ router = APIRouter(prefix="/api", tags=["projects"])
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 TRANSCRIBE_JOB_KIND = "transcribe"
+RENDER_JOB_KIND = "render"
+
+#: Exported subtitles are plain text; the browser downloads rather than plays them.
+SUBTITLE_MEDIA_TYPE = "application/x-subrip"
+_MEDIA_TYPES_BY_EXPORT_SUFFIX = {".mp4": "video/mp4", ".srt": SUBTITLE_MEDIA_TYPE}
 
 
 def _store(request: Request) -> ProjectStore:
@@ -50,6 +71,10 @@ def _media_type(path: Path) -> str:
     if not content_types:
         return "application/octet-stream"
     return sorted(content_types)[0]
+
+
+def _export_media_type(path: Path) -> str:
+    return _MEDIA_TYPES_BY_EXPORT_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
 
 
 async def _stream_to_disk(upload: UploadFile, target: Path, max_bytes: int) -> int:
@@ -419,3 +444,393 @@ def update_project_clips(
 
     saved = store.replace_clips(project_id, existing)
     return {"clips": saved.get("clips") or []}
+
+
+# ------------------------------------------------------- captions and export
+
+
+#: Characters kept when a clip id becomes part of a filename.
+_UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_name(value: object, fallback: str) -> str:
+    cleaned = _UNSAFE_FILENAME.sub("-", str(value or "")).strip("-")
+    return cleaned[:48] or fallback
+
+
+def _allocate_export_path(directory: Path, stem: str, suffix: str) -> Path:
+    """Pick a free filename so an earlier export is never overwritten."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    candidate = directory / f"{stem}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def _transcript_segments(store: ProjectStore, project: dict) -> list[dict]:
+    """Read saved transcript segments, or an empty list when there are none."""
+
+    if not project.get("transcript"):
+        return []
+
+    try:
+        document = store.load_transcript(str(project.get("project_id")))
+    except ApiError:
+        # An unreadable transcript must not stop a video-only export.
+        return []
+
+    segments = document.get("segments")
+    return [segment for segment in segments or [] if isinstance(segment, dict)]
+
+
+def _clip_by_id(project: dict, clip_id: str | None) -> dict:
+    """Find one candidate clip, saying clearly when it is missing."""
+
+    clips = [clip for clip in (project.get("clips") or []) if isinstance(clip, dict)]
+    if not clips:
+        raise ApiError(
+            "no_clips", "This project has no candidate clips to export yet.", 409
+        )
+
+    target = str(clip_id or "").strip()
+    if not target:
+        raise ApiError(
+            "invalid_clip_id", "Send a 'clip_id' naming the clip to export.", 422
+        )
+
+    for clip in clips:
+        if str(clip.get("id")) == target:
+            return clip
+
+    raise ApiError(
+        "clip_not_found",
+        f"This project has no candidate clip with id '{target}'.",
+        404,
+    )
+
+
+def _public_cues(cues: list[dict]) -> list[dict]:
+    """The cue fields the interface needs, without the internal word details."""
+
+    return [
+        {
+            "index": cue["index"],
+            "start": cue["start"],
+            "end": cue["end"],
+            "text": cue["text"],
+            "lines": cue["lines"],
+        }
+        for cue in cues
+    ]
+
+
+def _caption_plan(
+    segments: list[dict], clip: dict, style: dict, export: dict
+) -> dict[str, object]:
+    """Build clip-relative cues and the geometry that will draw them."""
+
+    geometry = resolve_geometry(style, width=int(export["width"]), height=int(export["height"]))
+    cues = build_cues(
+        segments,
+        clip_start=float(clip.get("source_start") or 0.0),
+        clip_end=float(clip.get("source_end") or 0.0),
+        geometry=geometry,
+    )
+    return {"geometry": geometry, "cues": cues, "summary": caption_summary(cues)}
+
+
+@router.get("/projects/{project_id}/captions")
+def get_project_captions(
+    project_id: str, request: Request, clip_id: str = Query(...)
+) -> dict[str, object]:
+    """Preview the captions for one clip, before spending time on a render.
+
+    The cues are the same ones the render will burn in, so what the user reads
+    here is exactly what appears in the exported file.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    style = normalise_style(project.get("caption_style"))
+    export = normalise_export(
+        project.get("export"),
+        source_width=int((project.get("source_metadata") or {}).get("width") or 0),
+        source_height=int((project.get("source_metadata") or {}).get("height") or 0),
+    )
+
+    clip = _clip_by_id(project, clip_id)
+    plan = _caption_plan(_transcript_segments(store, project), clip, style, export)
+
+    return {
+        "clip_id": str(clip.get("id")),
+        "clip_title": clip.get("title"),
+        "style": style,
+        "geometry": plan["geometry"].as_dict(),
+        "cues": _public_cues(plan["cues"]),
+        "srt": to_srt(plan["cues"]),
+        "summary": plan["summary"],
+        "based_on_transcript_generated_at": (project.get("transcript") or {}).get(
+            "generated_at"
+        ),
+    }
+
+
+@router.patch("/projects/{project_id}/settings")
+def update_project_settings(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Save caption and export settings for the next render.
+
+    Both halves are validated before anything is written, so the project can
+    never hold a setting the renderer would refuse.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    body = payload or {}
+    metadata = project.get("source_metadata") or {}
+
+    style: dict | None = None
+    if "caption_style" in body:
+        incoming = body.get("caption_style")
+        if incoming is not None and not isinstance(incoming, dict):
+            raise ApiError(
+                "invalid_caption_style", "caption_style must be a JSON object.", 422
+            )
+        current = project.get("caption_style") or default_style()
+        style = normalise_style({**current, **(incoming or {})})
+
+    incoming_export = body.get("export")
+    if incoming_export is not None and not isinstance(incoming_export, dict):
+        raise ApiError("invalid_export_settings", "export must be a JSON object.", 422)
+
+    plan = normalise_export(
+        {**(project.get("export") or {}), **(incoming_export or {})},
+        source_width=int(metadata.get("width") or 0),
+        source_height=int(metadata.get("height") or 0),
+    )
+    export_document = {
+        key: plan[key]
+        for key in ("aspect_ratio", "resolution", "format", "caption_mode", "write_srt")
+    }
+
+    saved = store.save_settings(
+        project_id, caption_style=style, export=export_document
+    )
+
+    return {
+        "caption_style": saved.get("caption_style"),
+        "export": saved.get("export"),
+        "plan": plan,
+    }
+
+
+@router.get("/projects/{project_id}/exports")
+def list_project_exports(project_id: str, request: Request) -> dict[str, object]:
+    """List finished renders, newest first, noting any file that is gone."""
+
+    store = _store(request)
+    payload = store.load_exports(project_id)
+    exports_dir = store.project_workspace(project_id).exports
+
+    exports: list[dict] = []
+    for entry in payload["exports"]:
+        name = str(entry.get("file") or "")
+        # A render whose file was deleted by hand must not be offered as a link.
+        exports.append({**entry, "available": bool(name) and (exports_dir / name).is_file()})
+
+    latest = exports[0] if exports else None
+    return {
+        "exports": exports,
+        "latest": latest,
+        "caption_style": payload["caption_style"],
+        "export_settings": payload["export_settings"],
+    }
+
+
+@router.get("/projects/{project_id}/exports/{filename}")
+def get_project_export(
+    project_id: str, filename: str, request: Request
+) -> FileResponse:
+    """Serve a rendered MP4 or its subtitle sidecar to the browser."""
+
+    path = _store(request).resolve_export_path(project_id, filename)
+    return FileResponse(
+        path,
+        media_type=_export_media_type(path),
+        filename=path.name,
+    )
+
+
+@router.post("/projects/{project_id}/render", status_code=202)
+def start_render(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Render one clip to a captioned vertical MP4 and return the job to poll.
+
+    The rendered file is written into the project's own ``exports/`` folder, so a
+    cancelled or failed render can be cleaned up without touching anything else.
+    """
+
+    store = _store(request)
+    registry = _jobs(request)
+    body = payload or {}
+
+    project = store.load(project_id)
+    metadata = project.get("source_metadata") or {}
+    clip = _clip_by_id(project, body.get("clip_id"))
+
+    style = normalise_style({**(project.get("caption_style") or default_style()), **(body.get("caption_style") or {})})
+    plan = normalise_export(
+        {**(project.get("export") or {}), **(body.get("export") or {})},
+        source_width=int(metadata.get("width") or 0),
+        source_height=int(metadata.get("height") or 0),
+    )
+
+    if not ffmpeg_available():
+        raise ApiError(
+            "ffmpeg_unavailable",
+            "FFmpeg was not found on PATH, so clips cannot be rendered. Install "
+            "FFmpeg and restart the app.",
+            503,
+        )
+
+    existing = registry.running_for(RENDER_JOB_KIND, project_id)
+    if existing is not None:
+        raise ApiError(
+            "render_in_progress",
+            f"An export is already running for this project (job "
+            f"{existing.id[:8]}). Wait for it to finish or cancel it first.",
+            409,
+        )
+
+    # Keeping the validated values means the saved project always describes the
+    # render that actually ran, and the panel shows the same settings after reload.
+    store.save_settings(
+        project_id,
+        caption_style=style,
+        export={
+            key: plan[key]
+            for key in ("aspect_ratio", "resolution", "format", "caption_mode", "write_srt")
+        },
+    )
+
+    source_path = store.source_path(project)
+    workspace = store.project_workspace(project_id)
+    segments = _transcript_segments(store, project)
+
+    clip_id = str(clip.get("id"))
+    clip_start = float(clip.get("source_start") or 0.0)
+    clip_end = float(clip.get("source_end") or 0.0)
+    caption_plan = _caption_plan(segments, clip, style, plan)
+    cues = caption_plan["cues"]
+    geometry = caption_plan["geometry"]
+
+    # Captions are burned in with ASS; a relative filename lets FFmpeg run from
+    # the temp folder, which avoids escaping Windows drive-letter paths.
+    burning = plan["caption_mode"] == "burn" and bool(cues)
+    subtitle_name = f"captions-{_safe_name(clip_id, 'clip')}.ass"
+    subtitle_path = workspace.temp / subtitle_name
+
+    output_path = _allocate_export_path(
+        workspace.exports,
+        stem=f"{_safe_name(clip_id, 'clip')}-{plan['resolution']}",
+        suffix=f".{plan['format']}",
+    )
+    subtitle_sidecar = output_path.with_suffix(".srt")
+
+    notes = list(plan["notes"])
+    if plan["caption_mode"] == "burn" and not cues:
+        notes.append(str(caption_plan["summary"]["note"]))
+
+    job = registry.create(RENDER_JOB_KIND, subject=project_id)
+
+    def work() -> dict[str, object]:
+        registry.update(job, progress=1.0, message="Preparing captions…")
+
+        if burning:
+            subtitle_path.write_text(to_ass(cues, style, geometry), encoding="utf-8")
+
+        command = build_ffmpeg_command(
+            source_path=source_path,
+            output_path=output_path,
+            start=clip_start,
+            end=clip_end,
+            width=int(plan["width"]),
+            height=int(plan["height"]),
+            subtitle_name=subtitle_name if burning else None,
+        )
+
+        try:
+            outcome = run_ffmpeg_render(
+                command=command,
+                clip_seconds=max(0.001, clip_end - clip_start),
+                work_dir=workspace.temp,
+                progress=lambda value, message: registry.update(
+                    job, progress=value, message=message
+                ),
+                should_cancel=lambda: registry.is_cancel_requested(job.id),
+            )
+        except BaseException:
+            # Neither a failed nor a cancelled render may leave a broken MP4
+            # behind; the .ass file is kept so a failure can be inspected.
+            output_path.unlink(missing_ok=True)
+            raise
+
+        if burning:
+            subtitle_path.unlink(missing_ok=True)
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise ApiError(
+                "render_failed",
+                "FFmpeg reported success but wrote no video file. Check that the "
+                "source video is readable.",
+                500,
+            )
+
+        if outcome["font_warnings"]:
+            notes.append(
+                "Some characters had no matching font on this machine, so they may "
+                "be missing in the export. FFmpeg logged: "
+                f"{outcome['font_warnings'][0]}"
+            )
+
+        srt_name = None
+        if plan["write_srt"]:
+            subtitle_sidecar.write_text(to_srt(cues), encoding="utf-8")
+            srt_name = subtitle_sidecar.name
+
+        registry.update(job, progress=99.0, message="Saving the export…")
+
+        entry = {
+            "file": output_path.name,
+            "url": f"/api/projects/{project_id}/exports/{output_path.name}",
+            "srt_file": srt_name,
+            "srt_url": (
+                f"/api/projects/{project_id}/exports/{srt_name}" if srt_name else None
+            ),
+            "clip_id": clip_id,
+            "clip_title": clip.get("title"),
+            "duration": round(clip_end - clip_start, 3),
+            "size_bytes": output_path.stat().st_size,
+            "resolution": plan["resolution"],
+            "width": plan["width"],
+            "height": plan["height"],
+            "aspect_ratio": plan["aspect_ratio"],
+            "caption_mode": plan["caption_mode"],
+            "caption_preset": style["preset"],
+            "caption_style": style,
+            "cue_count": len(cues),
+            "language": (project.get("transcript") or {}).get("language"),
+            "upscaled": plan["upscaled"],
+            "notes": notes,
+            "font_warnings": outcome["font_warnings"],
+            "render_seconds": outcome["elapsed_seconds"],
+        }
+        return store.record_export(project_id, entry).get("exports", [entry])[0]
+
+    registry.start(job, work)
+    return job.as_dict()

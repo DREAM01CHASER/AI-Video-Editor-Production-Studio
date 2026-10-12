@@ -31,7 +31,14 @@ DEFAULT_EXPORT = {
     "aspect_ratio": "9:16",
     "resolution": "1080x1920",
     "format": "mp4",
+    "caption_mode": "burn",
+    "write_srt": True,
 }
+
+#: Renders are kept as a short history so reopening a project shows the file that
+#: was actually produced, not just the newest one. Older entries stop being
+#: listed after this many; their files are left on disk for the user to delete.
+MAX_RECORDED_EXPORTS = 30
 
 
 def _utcnow() -> str:
@@ -179,6 +186,78 @@ class ProjectStore:
                 f"The saved transcript for project '{project_id}' could not be read.",
                 500,
             ) from exc
+
+    def project_workspace(self, project_id: str) -> ProjectWorkspace:
+        """Return this project's on-disk layout, creating any missing folders."""
+
+        return ProjectWorkspace(self._project_root(project_id)).ensure_layout()
+
+    def save_settings(
+        self,
+        project_id: str,
+        *,
+        caption_style: dict | None = None,
+        export: dict | None = None,
+    ) -> dict:
+        """Save caption and export settings, leaving the rest of the project alone.
+
+        These live in ``project.json`` because the project document is the source
+        of truth for the edit, and the next render must use the saved choices.
+        """
+
+        project = self.load(project_id)
+        if caption_style is not None:
+            project["caption_style"] = caption_style
+        if export is not None:
+            project["export"] = export
+        return self.save(project)
+
+    def record_export(self, project_id: str, entry: dict) -> dict:
+        """Add a finished render to the project's export history."""
+
+        project = self.load(project_id)
+        history = [item for item in (project.get("exports") or []) if isinstance(item, dict)]
+        # The timestamp is stamped here so every recorded render has one, whatever
+        # the caller remembered to include.
+        stamped = {"created_at": _utcnow(), **entry}
+        project["exports"] = [stamped, *history][:MAX_RECORDED_EXPORTS]
+        return self.save(project)
+
+    def load_exports(self, project_id: str) -> dict:
+        """Return saved renders plus the settings that produced them."""
+
+        project = self.load(project_id)
+        exports = [item for item in (project.get("exports") or []) if isinstance(item, dict)]
+        return {
+            "exports": exports,
+            "latest": exports[0] if exports else None,
+            "caption_style": project.get("caption_style") or dict(DEFAULT_CAPTION_STYLE),
+            "export_settings": project.get("export") or dict(DEFAULT_EXPORT),
+        }
+
+    def resolve_export_path(self, project_id: str, filename: str) -> Path:
+        """Resolve a file inside the project's ``exports/`` folder safely.
+
+        The name is treated as a single segment, so ``../project.json`` and any
+        other escape attempt is rejected before the filesystem is touched.
+        """
+
+        candidate = Path(str(filename or ""))
+        if (
+            not candidate.name
+            or candidate.name != str(filename)
+            or candidate.suffix.lower() not in {".mp4", ".srt"}
+        ):
+            raise ApiError(
+                "invalid_export_name", "That export file name is not valid.", 400
+            )
+
+        return self._resolve_inside(
+            project_id,
+            f"exports/{candidate.name}",
+            code="export_not_found",
+            message=f"No export named '{candidate.name}' exists for this project.",
+        )
 
     def save_clips(self, project_id: str, clips: list[dict], analysis: dict) -> dict:
         """Store suggested clips and the analysis that produced them.

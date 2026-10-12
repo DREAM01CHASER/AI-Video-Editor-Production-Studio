@@ -31,7 +31,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="AI Video Production Studio",
         description="Local-first video editing assistant API",
-        version="0.3.0",
+        version="0.5.0",
     )
     application.state.settings = runtime_settings
     application.state.workspace = workspace

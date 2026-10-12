@@ -71,12 +71,38 @@ def test_shell_exposes_required_layout(tmp_path: Path) -> None:
         assert f'id="{element_id}"' in response.text, element_id
 
 
-def test_shell_labels_sample_data_and_keeps_export_disabled(tmp_path: Path) -> None:
+def test_shell_labels_sample_data_and_explains_export_requirements(tmp_path: Path) -> None:
     body = _client(tmp_path).get("/").text
     assert "Demo data" in body
     assert "Sample data is illustrative" in body
-    # Export must not look functional before the render milestone.
+    # Rendering is real now, but it renders a *selected clip*, so the button ships
+    # disabled and its title says why rather than leaving a dead control.
     assert 'id="btn-export" class="btn btn-primary btn--block" type="button" disabled' in body
+    assert "Select a clip first" in body
+    assert "Rendering is not implemented yet" not in body
+
+
+def test_render_controls_and_result_player_are_present(tmp_path: Path) -> None:
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "line-length",
+        "high-contrast",
+        "caption-preview",
+        "caption-preview-status",
+        "export-caption-mode",
+        "export-write-srt",
+        "export-progress",
+        "export-progress-fill",
+        "export-status",
+        "export-error",
+        "export-notes",
+        "btn-export-cancel",
+        "export-result",
+        "export-video",
+        "export-download",
+        "export-srt-link",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
 
 
 def test_static_assets_are_served(tmp_path: Path) -> None:

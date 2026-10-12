@@ -75,9 +75,32 @@ Milestone 4 makes clip suggestion real:
   configured. It is off by default, it can never change clip times, and if it is
   unavailable the heuristic result is used and the analysis says why.
 
-Captions and rendering are planned for later milestones. Their controls are
-present for layout but **disabled or clearly marked as a demo** — no button
-pretends to caption video or export a file.
+Milestone 5 makes captions and the first real export:
+
+- `GET /api/projects/{project_id}/captions?clip_id=...` builds the caption cues
+  for one clip, and `POST /api/projects/{project_id}/render` renders it to MP4 in
+  the background, reporting **real FFmpeg progress** and supporting cancel.
+- Caption timings are **shifted to clip-relative time** from the saved transcript,
+  so the first cue starts at `0.0s` in the exported file. Speech is never
+  invented: a segment that only partly overlaps the clip is trimmed to the clip.
+- Three presets (**Clean**, **Bold Highlight**, **Minimal**) plus font size,
+  placement, line length, highlight mode, and a high-contrast box. The preview in
+  the inspector is built from the same cues the render burns in.
+- Styled captions are written as **ASS** and burned in by FFmpeg; the optional
+  sidecar is a real **SRT**. Subtitle serialisation uses `pysubs2` (the library
+  named in `TECH_STACK.md`) and the resulting file is read back by the tests.
+- Output defaults to **1080 × 1920 vertical**, with the source aspect preserved by
+  scaling to cover and cropping the centre. 1440 × 2560 is offered only as an
+  explicit choice and is described as an upscale; nothing is silently enlarged.
+- Every render reports its file name, size, caption count, and render time, and
+  the exported MP4 plays in the app with a download link. A failed or cancelled
+  render deletes its partial file instead of leaving a broken video behind.
+
+The controls are all wired to the live API — no button in the interface is a demo
+anymore. The sample project stays clearly labelled as sample data.
+
+Milestones 6–10 (editable timeline, local B-roll and SFX, stock search,
+transitions, and the release pass) are still to come.
 
 ## Working directory
 
@@ -152,6 +175,11 @@ Stop the server with `Ctrl+C`.
 | `POST` | `/api/projects/{project_id}/suggest-clips` | Detect candidate clips from the transcript (`409` until transcribed). |
 | `GET` | `/api/projects/{project_id}/clips` | Read saved candidates, plus whether they are stale. |
 | `PATCH` | `/api/projects/{project_id}/clips` | Save edited in/out points, titles, and scores. |
+| `GET` | `/api/projects/{project_id}/captions` | Build the clip-relative caption cues for one clip. |
+| `PATCH` | `/api/projects/{project_id}/settings` | Save caption and export settings for the next render. |
+| `POST` | `/api/projects/{project_id}/render` | Render the selected clip to a captioned MP4 (`202` + job). |
+| `GET` | `/api/projects/{project_id}/exports` | List finished renders, newest first. |
+| `GET` | `/api/projects/{project_id}/exports/{filename}` | Download a rendered MP4 or its `.srt` sidecar. |
 
 Upload limits and supported formats come from `.env`/`.env.example`
 (`MAX_UPLOAD_SIZE_MB`). Accepted containers are MP4, MOV, M4V, AVI, MKV, and
@@ -175,6 +203,18 @@ The clip tests are fully offline: they cover the heuristic signals, the boundary
 and title handling for transcripts without punctuation, overlap and near-duplicate
 flagging, edit validation, and the optional LLM pass through an injected transport
 so no request is ever made.
+
+The caption tests are offline too: they cover clip-relative timing, wrapping,
+preset geometry, safe-area margins, characters that would otherwise inject ASS
+override tags, and they read the written ASS/SRT back to confirm the style and
+timings that FFmpeg receives.
+
+The export tests include **real FFmpeg renders** of a synthesised source: they
+render a clip, measure the caption area of the output to show the captions really
+were burned in, compare it against the same clip rendered with captions off, check
+the MP4 is 1080 × 1920 with audio and the requested duration, download it through
+the API, and confirm a failed or cancelled render leaves no partial file. They are
+skipped with an explicit reason when FFmpeg is unavailable.
 
 The interface can be opened without any API key or uploaded media, but
 transcription needs `faster-whisper` and a model. Clip suggestion needs neither.
@@ -220,8 +260,9 @@ analysis explains that the optional pass was unavailable.
 **FFprobe and FFmpeg must be installed and available on `PATH`.** Video import
 reads metadata with FFprobe, so importing reports a clear error if the tools are
 missing. Transcription itself does not need FFmpeg because `faster-whisper`
-decodes audio through PyAV; FFmpeg is required from the rendering milestone
-onward. Both are system tools, not Python packages.
+decodes audio through PyAV, but **exporting a clip does**: the app reports a clear
+message instead of failing if FFmpeg is not installed. Both are system tools, not
+Python packages.
 
 Check the installation with:
 
