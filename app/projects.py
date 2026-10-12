@@ -31,6 +31,7 @@ DEFAULT_EXPORT = {
     "aspect_ratio": "9:16",
     "resolution": "1080x1920",
     "format": "mp4",
+    "fps": 30,
     "caption_mode": "burn",
     "write_srt": True,
 }
@@ -84,6 +85,15 @@ class ProjectStore:
             "caption_style": dict(DEFAULT_CAPTION_STYLE),
             "export": dict(DEFAULT_EXPORT),
             "assets": [],
+            # The item tracks start empty but present, so the timeline can show
+            # every track without inventing data for old projects.
+            "timeline": {
+                "version": 1,
+                "broll": [],
+                "sfx": [],
+                "transitions": [],
+                "updated_at": None,
+            },
         }
         return self.save(project)
 
@@ -210,6 +220,52 @@ class ProjectStore:
             project["caption_style"] = caption_style
         if export is not None:
             project["export"] = export
+        return self.save(project)
+
+    def save_timeline(
+        self,
+        project_id: str,
+        *,
+        source_start: float,
+        source_end: float,
+        clip_id: str,
+        caption_style: dict,
+        export: dict,
+        tracks: dict[str, list],
+    ) -> dict:
+        """Write one validated timeline edit into the project document.
+
+        The whole edit is saved in a single write: the clip's in/out points, the
+        caption style, the render settings, and the item tracks. Nothing is
+        half-applied, so the next render always matches the timeline the user saw.
+        """
+
+        project = self.load(project_id)
+        found = False
+        for clip in project.get("clips") or []:
+            if str(clip.get("id")) != clip_id:
+                continue
+            clip["source_start"] = source_start
+            clip["source_end"] = source_end
+            clip["duration"] = round(max(0.0, source_end - source_start), 3)
+            clip["edited"] = True
+            found = True
+            break
+
+        if not found:
+            raise ApiError(
+                "clip_not_found", f"No clip with id '{clip_id}' exists in this project.", 404
+            )
+
+        project["caption_style"] = caption_style
+        project["export"] = export
+        timeline = dict(project.get("timeline") or {})
+        timeline.update(tracks)
+        # The timeline is stamped here so every saved edit is dated, whatever the
+        # caller remembered to include.
+        timeline["updated_at"] = _utcnow()
+        timeline["version"] = int(timeline.get("version") or 1)
+        project["timeline"] = timeline
         return self.save(project)
 
     def record_export(self, project_id: str, entry: dict) -> dict:

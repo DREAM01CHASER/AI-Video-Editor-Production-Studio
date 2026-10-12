@@ -148,6 +148,13 @@ const els = {
   clipDuration: document.getElementById("clip-duration"),
   timelineRuler: document.getElementById("timeline-ruler"),
   timelineTracks: document.getElementById("timeline-tracks"),
+  timelineSummary: document.getElementById("timeline-summary"),
+  timelineStatus: document.getElementById("timeline-status"),
+  timelineError: document.getElementById("timeline-error"),
+  timelineSaveState: document.getElementById("timeline-save-state"),
+  btnTimelineIn: document.getElementById("btn-timeline-in"),
+  btnTimelineOut: document.getElementById("btn-timeline-out"),
+  outputFps: document.getElementById("output-fps"),
   captionStyle: document.getElementById("caption-style"),
   fontSize: document.getElementById("font-size"),
   captionPlacement: document.getElementById("caption-placement"),
@@ -180,6 +187,7 @@ const els = {
 const RENDER_CONTROLS = [
   "aspectRatio",
   "outputResolution",
+  "outputFps",
   "exportFormat",
   "exportCaptionMode",
   "exportWriteSrt",
@@ -215,6 +223,12 @@ const state = {
     clipId: null,
     busy: false,
   },
+  //: The composed edit for the selected clip: in/out points, captions, render
+  //: settings, and the item tracks. The project JSON stays the source of truth.
+  timeline: null,
+  timelineSaving: false,
+  //: Timeline saves run in order, so a slow response cannot overwrite a newer edit.
+  timelineQueue: Promise.resolve(),
   export: {
     jobId: null,
     timer: null,
@@ -486,8 +500,9 @@ function selectCandidate(id) {
   updateClipDuration();
   renderTimeline();
   updateExportControls();
-  // Captions belong to the selected clip, so they follow the selection.
+  // Captions and the timeline both belong to the selected clip.
   loadCaptionPreview();
+  loadTimeline(state.project.id, id);
 }
 
 /* --------------------------------------------------------- clip inspector */
@@ -499,15 +514,27 @@ function updateClipDuration() {
   els.clipDuration.textContent = `${duration.toFixed(1)}s`;
 }
 
+/**
+ * Save the in/out fields typed into the inspector.
+ *
+ * They go through the same timeline endpoint the drag handles use, so there is
+ * one write path for a clip's times and one place that validates them.
+ */
 async function applyClipEdit() {
   const candidate = state.project.candidates.find((item) => item.id === state.selectedId);
   if (!candidate) return;
-  candidate.start = Math.max(0, Number.parseFloat(els.clipStart.value) || 0);
-  candidate.end = Math.max(candidate.start, Number.parseFloat(els.clipEnd.value) || 0);
-  updateClipDuration();
-  renderCandidates();
-  renderTimeline();
-  await persistClipEdits(candidate);
+
+  if (!isRealProject() || !state.timeline) {
+    els.candidatesStatus.textContent =
+      "Sample data — edits to the sample project are not saved.";
+    return;
+  }
+
+  const start = Math.max(0, Number.parseFloat(els.clipStart.value) || 0);
+  const end = Math.max(start, Number.parseFloat(els.clipEnd.value) || 0);
+  await saveTimeline({ video: { source_start: round3(start), source_end: round3(end) } }, {
+    reloadCaptions: true,
+  });
 }
 
 els.clipStart.addEventListener("input", updateClipDuration);
@@ -517,59 +544,506 @@ els.clipEnd.addEventListener("change", applyClipEdit);
 
 /* ------------------------------------------------------------- timeline */
 
+/** The shortest clip that is still worth exporting, in seconds. */
+const MIN_CLIP_SECONDS = 1.0;
+
+function setTimelineSaveState(text, className) {
+  els.timelineSaveState.textContent = text;
+  els.timelineSaveState.className = className;
+}
+
+function showTimelineError(message) {
+  els.timelineError.textContent = message;
+  els.timelineError.classList.remove("is-hidden");
+}
+
+function hideTimelineError() {
+  els.timelineError.textContent = "";
+  els.timelineError.classList.add("is-hidden");
+}
+
+/** The edit currently loaded from the backend, or null for sample data. */
+function currentTimeline() {
+  return isRealProject() ? state.timeline : null;
+}
+
+function round3(value) {
+  return Math.round(Number(value) * 1000) / 1000;
+}
+
+/**
+ * Paint the timeline from the loaded edit.
+ *
+ * Every block is positioned from the project data rather than from a local
+ * guess, so an edit that the backend rejected cannot leave the picture showing
+ * something that was never saved.
+ */
 function renderTimeline() {
   const source = state.project.source;
-  if (!source) {
-    els.timelineRuler.replaceChildren();
-    els.timelineTracks.replaceChildren();
+  const timeline = currentTimeline();
+
+  els.timelineRuler.replaceChildren();
+  els.timelineTracks.replaceChildren();
+
+  if (!source || !source.duration) {
+    els.timelineSummary.textContent = "No clip selected.";
+    els.timelineStatus.textContent = "Import a video to edit a timeline.";
+    updateTimelineControls();
     return;
   }
 
   const duration = source.duration;
-  const pct = (seconds) => `${(seconds / duration) * 100}%`;
+  const pct = (seconds) => `${Math.min(100, (seconds / duration) * 100)}%`;
 
-  els.timelineRuler.replaceChildren();
-  const tickCount = 6;
-  for (let i = 0; i <= tickCount; i += 1) {
+  for (let i = 0; i <= 6; i += 1) {
     const tick = document.createElement("span");
     tick.className = "timeline__tick";
-    tick.style.left = `${(i / tickCount) * 100}%`;
-    tick.textContent = formatTimecode((i / tickCount) * duration);
+    tick.style.left = `${(i / 6) * 100}%`;
+    tick.textContent = formatTimecode((i / 6) * duration);
     els.timelineRuler.append(tick);
   }
 
-  const selected = state.project.candidates.find((item) => item.id === state.selectedId) || null;
-
-  const tracks = [
-    { kind: "video", block: { start: 0, end: duration } },
-    { kind: "caption", block: selected ? { start: selected.start, end: selected.end } : null },
-    { kind: "broll", block: null },
-    { kind: "sfx", block: null },
+  const lanes = [
+    { kind: "video", label: "Video", title: "Selected clip on the source timeline" },
+    { kind: "caption", label: "Captions", title: "Burned-in caption track" },
+    { kind: "broll", label: "B-roll", title: "B-roll overlays" },
+    { kind: "sfx", label: "SFX", title: "Sound effects and transitions" },
   ];
 
-  els.timelineTracks.replaceChildren();
-  for (const track of tracks) {
-    const row = document.createElement("div");
-    row.className = "timeline__track";
-    row.title = `${track.kind[0].toUpperCase()}${track.kind.slice(1)} track`;
+  for (const lane of lanes) {
+    const label = document.createElement("div");
+    label.className = "timeline__track-label";
+    label.textContent = lane.label;
 
-    if (track.block) {
-      const clip = document.createElement("div");
-      clip.className = `timeline__clip timeline__clip--${track.kind}`;
-      clip.style.left = pct(track.block.start);
-      clip.style.width = pct(track.block.end - track.block.start);
-      row.append(clip);
+    const track = document.createElement("div");
+    track.className = "timeline__lane";
+    track.dataset.kind = lane.kind;
+    track.title = lane.title;
+
+    if (lane.kind === "video") {
+      paintVideoTrack(track, timeline, duration, pct);
+    } else if (lane.kind === "caption") {
+      paintCaptionTrack(track, timeline, pct);
+    } else if (lane.kind === "broll") {
+      paintItems(track, timeline?.broll, "broll", pct, {
+        empty: timeline ? "No B-roll — arrives in Milestone 7" : "Select a real clip to edit this track",
+      });
+    } else {
+      // Sound effects and transitions share one audio/effects lane, so they get
+      // one empty hint between them rather than one each.
+      const sfxCount = paintItems(track, timeline?.sfx, "sfx", pct);
+      const transitionCount = paintItems(track, timeline?.transitions, "transition", pct, {
+        marker: true,
+      });
+      if (timeline && sfxCount + transitionCount === 0) {
+        appendTimelineHint(
+          track,
+          "No sound effects or transitions — arrive in Milestones 7 and 9"
+        );
+      } else if (!timeline) {
+        appendTimelineHint(track, "Select a real clip to edit this track");
+      }
     }
 
-    if (track.kind === "video" && selected) {
-      const playhead = document.createElement("div");
-      playhead.className = "timeline__playhead";
-      playhead.style.left = pct(selected.start);
-      row.append(playhead);
+    if (!timeline && lane.kind !== "video" && lane.kind !== "sfx") {
+      appendTimelineHint(track, "Select a real clip to edit this track");
     }
 
-    els.timelineTracks.append(row);
+    els.timelineTracks.append(label, track);
   }
+
+  paintTimelineStatus(timeline, duration);
+  updateTimelineControls();
+}
+
+function paintVideoTrack(track, timeline, duration, pct) {
+  if (!timeline) {
+    appendTimelineHint(track, "No clip selected");
+    return;
+  }
+
+  const { source_start: start, source_end: end } = timeline.video;
+  const block = document.createElement("div");
+  block.className = "timeline__clip timeline__clip--video";
+  block.dataset.role = "clip-block";
+  block.style.left = pct(start);
+  block.style.width = pct(Math.max(0, end - start));
+  block.title = `${formatTimecode(start)} → ${formatTimecode(end)} — drag to move, drag the edges to trim`;
+
+  const label = document.createElement("span");
+  label.className = "timeline__clip-label";
+  label.textContent = `${(end - start).toFixed(1)}s`;
+  block.append(label);
+
+  for (const [mode, side] of [["in", "--in"], ["out", "--out"]]) {
+    const handle = document.createElement("span");
+    handle.className = `timeline__handle timeline__handle${side}`;
+    handle.dataset.role = `handle-${mode}`;
+    handle.title = mode === "in" ? "Drag to change the in point" : "Drag to change the out point";
+    block.append(handle);
+  }
+
+  // Which edge is being grabbed is decided from the pointer's position rather
+  // than from which element was hit: on a short clip the two handles overlap, and
+  // then the whole block has to stay draggable.
+  block.addEventListener("pointerdown", (event) => {
+    const rect = block.getBoundingClientRect();
+    const offset = event.clientX - rect.left;
+    const edge = Math.min(12, Math.max(4, rect.width * 0.25));
+
+    if (rect.width < 28) {
+      beginClipDrag(event, "move");
+    } else if (offset <= edge) {
+      beginClipDrag(event, "in");
+    } else if (offset >= rect.width - edge) {
+      beginClipDrag(event, "out");
+    } else {
+      beginClipDrag(event, "move");
+    }
+  });
+
+  track.append(block, playheadElement(duration, pct));
+}
+
+function paintCaptionTrack(track, timeline, pct) {
+  if (!timeline) return;
+  if (!timeline.captions?.enabled) {
+    appendTimelineHint(track, "Captions off for this export");
+    return;
+  }
+
+  const block = document.createElement("div");
+  block.className = "timeline__clip timeline__clip--caption";
+  block.style.left = pct(timeline.video.source_start);
+  block.style.width = pct(Math.max(0, timeline.video.source_end - timeline.video.source_start));
+  block.title = `${timeline.captions.preset} captions, drawn from the saved transcript`;
+  track.append(block, playheadElement(state.project.source.duration, pct));
+}
+
+function appendTimelineHint(track, text) {
+  const hint = document.createElement("span");
+  hint.className = "timeline__hint";
+  hint.textContent = text;
+  track.append(hint);
+}
+
+/**
+ * Draw a track's items and return how many were drawn.
+ *
+ * Returning the count lets a caller decide whether an empty hint is needed, so
+ * lanes that hold two kinds of item cannot end up with two hints.
+ */
+function paintItems(track, items, kind, pct, { marker = false, empty = null } = {}) {
+  const list = items || [];
+
+  for (const item of list) {
+    const start = Number(item.start) || 0;
+    const end = Number(item.end) || start;
+    const element = document.createElement("div");
+    if (marker) {
+      element.className = "timeline__marker";
+      element.style.left = pct(start);
+      element.title = `${item.kind} transition at ${formatTimecode(start)}`;
+    } else {
+      element.className = `timeline__clip timeline__clip--${kind}`;
+      element.style.left = pct(start);
+      element.style.width = pct(Math.max(0.2, end - start));
+      element.title = `${kind} item ${item.id}`;
+    }
+    track.append(element);
+  }
+
+  if (list.length === 0 && empty) appendTimelineHint(track, empty);
+  return list.length;
+}
+
+function playheadElement(duration, pct) {
+  const playhead = document.createElement("div");
+  playhead.className = "timeline__playhead";
+  playhead.dataset.role = "playhead";
+  const seconds = Number(els.video.currentTime) || 0;
+  playhead.style.left = pct(Math.min(seconds, duration));
+  return playhead;
+}
+
+function paintTimelineStatus(timeline, duration) {
+  if (!timeline) {
+    els.timelineSummary.textContent = "No clip selected.";
+    els.timelineStatus.textContent = isRealProject()
+      ? "Select a clip above to load its edit."
+      : "Sample project — the timeline shows layout only.";
+    return;
+  }
+
+  els.timelineSummary.textContent =
+    `${formatTimecode(timeline.video.source_start)} → ${formatTimecode(timeline.video.source_end)} ` +
+    `(${timeline.duration.toFixed(1)}s of ${formatTimecode(duration)}) · ${timeline.render.fps} fps · ` +
+    `${timeline.render.width} × ${timeline.render.height}`;
+
+  const notes = [];
+  if (timeline.captions?.enabled) notes.push(`${timeline.captions.preset} captions`);
+  else notes.push("captions off");
+  notes.push(`${timeline.broll.length} B-roll item(s)`);
+  els.timelineStatus.textContent = `Editing ${timeline.clip_title || timeline.clip_id}: ${notes.join(", ")}.`;
+}
+
+/** Move the playhead markers to match the preview video. */
+function paintPlayheads() {
+  const source = state.project.source;
+  if (!source?.duration) return;
+  const ratio = Math.min(1, Math.max(0, (Number(els.video.currentTime) || 0) / source.duration));
+  for (const playhead of els.timelineTracks.querySelectorAll('[data-role="playhead"]')) {
+    playhead.style.left = `${ratio * 100}%`;
+  }
+}
+
+function updateTimelineControls() {
+  const editable = Boolean(currentTimeline()) && !state.timelineSaving && !state.export.jobId;
+  const reason = !isRealProject()
+    ? "Import a video and select a clip first — the timeline edits a real project."
+    : !state.selectedId
+      ? "Select a clip first — the in point sits inside the selected clip."
+      : "Move the selected clip's in point to the current playhead position.";
+
+  for (const [button, title] of [
+    [els.btnTimelineIn, reason],
+    [els.btnTimelineOut, reason.replace("in point", "out point")],
+  ]) {
+    button.disabled = !editable;
+    button.title = editable ? title : reason;
+  }
+}
+
+/* --------------------------------------------------------- timeline edits */
+
+async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
+  if (!isRealProject() || !clipId) {
+    state.timeline = null;
+    renderTimeline();
+    return null;
+  }
+
+  if (!quiet) {
+    els.timelineStatus.textContent = "Loading the saved edit…";
+    hideTimelineError();
+  }
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/timeline?clip_id=${encodeURIComponent(clipId)}`,
+      { headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not load the timeline (HTTP ${response.status}).`));
+    }
+    if (state.project.id !== projectId || state.selectedId !== clipId) return null;
+
+    state.timeline = payload;
+    renderTimeline();
+    setTimelineSaveState("Saved edit", "badge status-ready");
+    return payload;
+  } catch (error) {
+    state.timeline = null;
+    renderTimeline();
+    showTimelineError(error.message);
+    setTimelineSaveState("Unavailable", "badge status-error");
+    return null;
+  }
+}
+
+/**
+ * Save an edit, one at a time.
+ *
+ * Drag, the inspector fields, and the caption controls can all fire quickly, and
+ * two overlapping requests could otherwise be applied out of order — which would
+ * leave the picture showing an edit that was not the most recent one. Chaining
+ * them keeps the saved edit and the interface in the same order.
+ */
+function saveTimeline(patch, options) {
+  const next = state.timelineQueue.then(
+    () => sendTimelinePatch(patch, options),
+    () => sendTimelinePatch(patch, options)
+  );
+  state.timelineQueue = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
+}
+
+/**
+ * Send one edit and adopt what the backend stored.
+ *
+ * The response is the same document the next render reads, so the interface
+ * shows the saved edit rather than the attempt.
+ */
+async function sendTimelinePatch(patch, { reloadCaptions = false } = {}) {
+  const projectId = state.project.id;
+  if (!isRealProject() || !state.timeline) return null;
+
+  state.timelineSaving = true;
+  setTimelineSaveState("Saving…", "badge badge-demo");
+  updateTimelineControls();
+
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/timeline`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ clip_id: state.timeline.clip_id, ...patch }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not save the edit (HTTP ${response.status}).`));
+    }
+    if (state.project.id !== projectId) return null;
+
+    state.timeline = payload;
+    hideTimelineError();
+    setTimelineSaveState("Saved edit", "badge status-ready");
+
+    // The edit changed the clip, so the clip list and inspector follow it.
+    const candidate = state.project.candidates.find((item) => item.id === payload.clip_id);
+    if (candidate) {
+      candidate.start = payload.video.source_start;
+      candidate.end = payload.video.source_end;
+      candidate.edited = true;
+      renderCandidates();
+    }
+
+    els.clipStart.value = payload.video.source_start.toFixed(1);
+    els.clipEnd.value = payload.video.source_end.toFixed(1);
+    updateClipDuration();
+    applyExportSettingsToControls(payload.render);
+    if (payload.captions) applyStyleToControls(payload.captions);
+    els.exportNotes.textContent = (payload.notes || []).join(" ");
+
+    renderTimeline();
+    updateExportControls();
+    log(
+      `Saved timeline: ${payload.video.source_start.toFixed(1)}s → ` +
+        `${payload.video.source_end.toFixed(1)}s at ${payload.render.fps} fps.`
+    );
+
+    if (reloadCaptions) await loadCaptionPreview();
+    return payload;
+  } catch (error) {
+    log(`Error: ${error.message}`);
+    setTimelineSaveState("Not saved", "badge status-error");
+    // Re-read the stored edit so the timeline never shows a rejected change, but
+    // quietly: the explanation of what was refused has to stay on screen.
+    const clipId = state.timeline?.clip_id;
+    if (clipId) await loadTimeline(projectId, clipId, { quiet: true });
+    showTimelineError(error.message);
+    return null;
+  } finally {
+    state.timelineSaving = false;
+    updateTimelineControls();
+  }
+}
+
+/** Trim or move the clip block by dragging it on the timeline. */
+function beginClipDrag(event, mode) {
+  const timeline = currentTimeline();  
+  const source = state.project.source;
+  if (!timeline || !source?.duration) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const lane = event.currentTarget.closest(".timeline__lane");
+  const secondsPerPixel = source.duration / Math.max(1, lane.getBoundingClientRect().width);
+  const startX = event.clientX;
+  const original = { in: timeline.video.source_start, out: timeline.video.source_end };
+  let pending = { ...original };
+
+  const apply = (clientX) => {
+    const delta = (clientX - startX) * secondsPerPixel;
+    let inPoint = original.in;
+    let outPoint = original.out;
+
+    if (mode === "in") {
+      inPoint = Math.min(Math.max(0, original.in + delta), original.out - MIN_CLIP_SECONDS);
+    } else if (mode === "out") {
+      outPoint = Math.max(Math.min(source.duration, original.out + delta), original.in + MIN_CLIP_SECONDS);
+    } else {
+      const width = original.out - original.in;
+      inPoint = Math.min(Math.max(0, original.in + delta), Math.max(0, source.duration - width));
+      outPoint = inPoint + width;
+    }
+
+    pending = { in: round3(inPoint), out: round3(outPoint) };
+    timeline.video.source_start = pending.in;
+    timeline.video.source_end = pending.out;
+    timeline.duration = round3(pending.out - pending.in);
+    els.clipStart.value = pending.in.toFixed(1);
+    els.clipEnd.value = pending.out.toFixed(1);
+    updateClipDuration();
+    renderTimeline();
+    setTimelineSaveState("Dragging…", "badge badge-demo");
+  };
+
+  const move = (moveEvent) => apply(moveEvent.clientX);
+  const finish = async () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", finish);
+
+    if (pending.in === original.in && pending.out === original.out) {
+      setTimelineSaveState("Saved edit", "badge status-ready");
+      return;
+    }
+
+    await saveTimeline(
+      { video: { source_start: pending.in, source_end: pending.out } },
+      { reloadCaptions: true }
+    );
+  };
+
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", finish);
+  window.addEventListener("pointercancel", finish);
+}
+
+/** Seek the preview by clicking the ruler. */
+async function seekFromRuler(event) {
+  const source = state.project.source;
+  if (!source?.duration || !els.video.src) return;
+
+  const rect = els.timelineRuler.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(1, rect.width)));
+  els.video.currentTime = ratio * source.duration;
+  paintPlayheads();
+}
+
+/** Move one edge of the clip to wherever the playhead is. */
+async function setClipEdgeFromPlayhead(edge) {
+  const timeline = currentTimeline();
+  const source = state.project.source;
+  if (!timeline || !source?.duration) return;
+
+  const playhead = Math.min(source.duration, Math.max(0, Number(els.video.currentTime) || 0));
+  const patch = {};
+
+  if (edge === "in") {
+    if (playhead >= timeline.video.source_end - MIN_CLIP_SECONDS) {
+      showTimelineError(
+        `The in point must stay ${MIN_CLIP_SECONDS}s before the out point. Move the playhead earlier.`
+      );
+      return;
+    }
+    patch.video = { source_start: round3(playhead) };
+  } else {
+    if (playhead <= timeline.video.source_start + MIN_CLIP_SECONDS) {
+      showTimelineError(
+        `The out point must stay ${MIN_CLIP_SECONDS}s after the in point. Move the playhead later.`
+      );
+      return;
+    }
+    patch.video = { source_end: round3(playhead) };
+  }
+
+  await saveTimeline(patch, { reloadCaptions: true });
 }
 
 /* -------------------------------------------------------- preview handling */
@@ -598,6 +1072,9 @@ function setPreviewSource(url, { objectUrl = false } = {}) {
 els.video.addEventListener("timeupdate", () => {
   els.previewCurrentTime.textContent = formatTimecode(els.video.currentTime);
   els.previewDuration.textContent = formatTimecode(els.video.duration || 0);
+  // The timeline playhead follows the preview, so trimming happens where the
+  // user is actually looking.
+  paintPlayheads();
 });
 
 els.video.addEventListener("error", () => {
@@ -1047,42 +1524,6 @@ async function suggestClips() {
   }
 }
 
-/** Save a clip's new in/out points. The backend owns the validation. */
-async function persistClipEdits(candidate) {
-  if (!isRealProject()) {
-    els.candidatesStatus.textContent = "Sample data — edits to the sample project are not saved.";
-    return;
-  }
-
-  try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(state.project.id)}/clips`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({
-        clips: [
-          { id: candidate.id, source_start: candidate.start, source_end: candidate.end },
-        ],
-      }),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(
-        apiErrorMessage(payload, `Could not save the clip (HTTP ${response.status}).`)
-      );
-    }
-
-    hideCandidateError();
-    // Adopt the values the backend validated rather than trusting local numbers.
-    const saved = (payload.clips || []).find((clip) => clip.id === candidate.id);
-    if (saved) Object.assign(candidate, candidateFromServer(saved));
-    renderCandidates();
-    log(`Saved clip ${candidate.id}: ${candidate.start.toFixed(1)}s – ${candidate.end.toFixed(1)}s`);
-  } catch (error) {
-    showCandidateError(error.message);
-    log(`Error: ${error.message}`);
-  }
-}
-
 /* --------------------------------------------------- captions and export */
 
 /** The caption choices currently in the inspector. */
@@ -1103,6 +1544,7 @@ function exportSettingsFromControls() {
     aspect_ratio: els.aspectRatio.value,
     resolution: els.outputResolution.value,
     format: els.exportFormat.value,
+    fps: Number(els.outputFps.value) || 30,
     caption_mode: els.exportCaptionMode.value,
     write_srt: els.exportWriteSrt.checked,
   };
@@ -1122,6 +1564,7 @@ function applyExportSettingsToControls(settings) {
   const value = settings || {};
   if (value.aspect_ratio) els.aspectRatio.value = value.aspect_ratio;
   if (value.format) els.exportFormat.value = value.format;
+  if (value.fps) els.outputFps.value = String(value.fps);
   if (value.caption_mode) els.exportCaptionMode.value = value.caption_mode;
   if (typeof value.write_srt === "boolean") els.exportWriteSrt.checked = value.write_srt;
   syncResolutionOptions(value.resolution);
@@ -1275,6 +1718,19 @@ async function saveProjectSettings({ reloadCaptions = false } = {}) {
     return;
   }
 
+  // With a clip selected these settings are part of that clip's timeline, so one
+  // save keeps the timeline, the inspector, and the next render in agreement.
+  if (state.timeline) {
+    await saveTimeline(
+      {
+        captions: captionStyleFromControls(),
+        render: exportSettingsFromControls(),
+      },
+      { reloadCaptions }
+    );
+    return;
+  }
+
   try {
     const response = await fetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/settings`,
@@ -1325,6 +1781,9 @@ function updateExportControls() {
   for (const name of RENDER_CONTROLS) {
     els[name].disabled = !real || running;
   }
+
+  // A running render also locks the timeline, so the edit cannot change under it.
+  updateTimelineControls();
 }
 
 function showExportResult(result, available = true) {
@@ -1599,6 +2058,7 @@ function projectFromServer(payload) {
   els.previewEmptyHint.textContent = "Source video loaded from the local workspace.";
 
   resetTranscript("This project has not been transcribed yet.");
+  state.timeline = null;
   renderProjectList();
   renderProject();
   setPreviewSource(`/api/projects/${payload.project_id}/source`);
@@ -1637,6 +2097,7 @@ async function openProject(projectId) {
 function loadDemoProject() {
   state.project = structuredClone(DEMO_PROJECT);
   state.project.hasTranscript = false;
+  state.timeline = null;
   state.selectedId = state.project.candidates[0]?.id ?? null;
   applyClipAnalysis(null, false);
   els.candidatesStatus.textContent = "Sample candidates — illustrative, not generated from a transcript.";
@@ -1657,6 +2118,7 @@ function loadDemoProject() {
   renderCaptionPreview(null, "Sample project — import a video to preview real captions.");
   setExportProgress(0);
   hideExportError();
+  setTimelineSaveState("Sample data", "badge badge-demo");
   renderProjectList();
   renderProject();
   selectCandidate(state.selectedId);
@@ -1867,6 +2329,13 @@ els.btnTranscribeCancel.addEventListener("click", cancelTranscription);
 els.btnExport.addEventListener("click", startExport);
 els.btnExportCancel.addEventListener("click", cancelExport);
 
+els.btnTimelineIn.addEventListener("click", () => setClipEdgeFromPlayhead("in"));
+els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"));
+els.timelineRuler.addEventListener("click", seekFromRuler);
+els.timelineRuler.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") seekFromRuler(event);
+});
+
 // Caption controls change the burned-in text, so the preview is rebuilt from the
 // backend-validated cues instead of guessing locally what will be rendered.
 for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "highContrast"]) {
@@ -1886,7 +2355,7 @@ els.aspectRatio.addEventListener("change", async () => {
   updateExportControls();
 });
 
-for (const name of ["outputResolution", "exportFormat", "exportCaptionMode", "exportWriteSrt"]) {
+for (const name of ["outputResolution", "outputFps", "exportFormat", "exportCaptionMode", "exportWriteSrt"]) {
   els[name].addEventListener("change", async () => {
     await saveProjectSettings();
     updateExportControls();
@@ -1896,6 +2365,7 @@ for (const name of ["outputResolution", "exportFormat", "exportCaptionMode", "ex
 function resetToEmptyProject() {
   state.project = { ...EMPTY_PROJECT };
   state.selectedId = null;
+  state.timeline = null;
   els.dataSourceBadge.textContent = "No project";
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();
@@ -1907,6 +2377,7 @@ function resetToEmptyProject() {
   setExportProgress(0);
   hideExportError();
   renderCaptionPreview(null, "Import a video to preview captions.");
+  setTimelineSaveState("No edit", "badge badge-muted");
   renderProject();
   renderProjectList();
   selectCandidate(null);
@@ -1919,6 +2390,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   renderProjectList();
   loadDemoProject();
   checkHealth();
+
 
   const projects = await fetchProjects();
   if (projects.length > 0) {

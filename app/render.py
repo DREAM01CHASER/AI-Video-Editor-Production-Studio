@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable
 
 from .errors import ApiError
+from .timeline import DEFAULT_FPS, normalise_fps
 
 FFMPEG_BINARY = "ffmpeg"
 
@@ -47,6 +48,7 @@ DEFAULT_EXPORT = {
     "aspect_ratio": "9:16",
     "resolution": "1080x1920",
     "format": "mp4",
+    "fps": DEFAULT_FPS,
     "caption_mode": "burn",
     "write_srt": True,
 }
@@ -87,6 +89,7 @@ def normalise_export(
     *,
     source_width: int = 0,
     source_height: int = 0,
+    source_fps: float = 0.0,
 ) -> dict[str, object]:
     """Validate export settings and describe what the render will do.
 
@@ -132,6 +135,14 @@ def normalise_export(
             422,
         )
 
+    # The frame rate is part of the edit, so the export reshapes the source to the
+    # rate the timeline asked for instead of silently keeping the source's.
+    fps = normalise_fps(
+        source.get("fps"),
+        int(DEFAULT_EXPORT["fps"]),
+        code="invalid_export_settings",
+    )
+
     caption_mode = str(source.get("caption_mode") or DEFAULT_EXPORT["caption_mode"]).strip().lower()
     if caption_mode not in CAPTION_MODES:
         raise ApiError(
@@ -163,6 +174,12 @@ def normalise_export(
     elif resolution == HIGH_RESOLUTION:
         notes.append("2K output was chosen explicitly; 1080 × 1920 is the faster default.")
 
+    if source_fps and abs(float(source_fps) - fps) > 0.01:
+        notes.append(
+            f"The source runs at {float(source_fps):g} fps and this export is {fps} fps, "
+            "so frames are resampled and fast movement may look slightly different."
+        )
+
     if caption_mode == "none":
         notes.append("Captions are switched off for this export.")
 
@@ -172,6 +189,7 @@ def normalise_export(
         "width": width,
         "height": height,
         "format": export_format,
+        "fps": fps,
         "caption_mode": caption_mode,
         "write_srt": bool(write_srt),
         "upscaled": upscaled,
@@ -230,6 +248,7 @@ def build_ffmpeg_command(
     end: float,
     width: int,
     height: int,
+    fps: int | None = None,
     subtitle_name: str | None = None,
 ) -> list[str]:
     """Return the exact FFmpeg argument list used to render one clip.
@@ -242,7 +261,7 @@ def build_ffmpeg_command(
     duration = max(0.001, float(end) - float(start))
     chain = build_filter_chain(width, height, subtitle_name)
 
-    return [
+    command = [
         FFMPEG_BINARY,
         "-hide_banner",
         "-nostdin",
@@ -259,6 +278,13 @@ def build_ffmpeg_command(
         "0:a:0?",
         "-vf",
         chain,
+    ]
+
+    if fps:
+        # The requested rate is the timeline's, not the source's.
+        command += ["-r", str(int(fps))]
+
+    command += [
         "-c:v",
         VIDEO_ENCODER,
         "-preset",
@@ -278,6 +304,7 @@ def build_ffmpeg_command(
         "-nostats",
         str(output_path),
     ]
+    return command
 
 
 # --------------------------------------------------------------- progress

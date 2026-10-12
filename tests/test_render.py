@@ -477,8 +477,8 @@ def _black_source(path: Path, seconds: int = 12) -> None:
     )
 
 
-def _caption_area_luma(video: Path, at: float) -> float:
-    """Average luma of the bottom caption area, measured by FFmpeg itself."""
+def _caption_area_luma(video: Path, at: float, crop: str = CAPTION_CROP) -> float:
+    """Average luma of the caption area, measured by FFmpeg itself."""
 
     completed = subprocess.run(
         [
@@ -493,7 +493,7 @@ def _caption_area_luma(video: Path, at: float) -> float:
             "-frames:v",
             "1",
             "-vf",
-            f"crop={CAPTION_CROP},signalstats,metadata=print",
+            f"crop={crop},signalstats,metadata=print",
             "-f",
             "null",
             "-",
@@ -642,6 +642,56 @@ def test_a_devanagari_transcript_reports_caption_fonts_honestly(tmp_path: Path) 
     assert isinstance(result["font_warnings"], list)
     output = tmp_path / "workspace" / "projects" / "abc123" / "exports" / result["file"]
     assert _caption_area_luma(output, at=3.0) > 18.0
+
+
+@requires_ffmpeg
+def test_the_next_render_follows_the_edited_timeline(tmp_path: Path) -> None:
+    """The export must use the timeline the user saved, not the defaults."""
+
+    client = _project(tmp_path)
+    source = tmp_path / "workspace" / "projects" / "abc123" / "source" / "source-x.mp4"
+    _black_source(source)
+
+    edited = client.patch(
+        "/api/projects/abc123/timeline",
+        json={
+            "clip_id": "clip-1",
+            "video": {"source_start": 1.0, "source_end": 5.0, "fps": 25},
+            "captions": {"enabled": False},
+            "render": {
+                "resolution": "1080x1080",
+                "aspect_ratio": "1:1",
+                "format": "mp4",
+                "write_srt": False,
+            },
+        },
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["video"]["fps"] == 25
+
+    started = client.post("/api/projects/abc123/render", json={"clip_id": "clip-1"})
+    assert started.status_code == 202
+    job = _run_job(client, started.json()["job_id"])
+    assert job["status"] == "succeeded", job.get("error")
+    result = job["result"]
+
+    assert result["resolution"] == "1080x1080"
+    assert result["fps"] == 25
+    assert result["caption_mode"] == "none"
+    assert result["srt_file"] is None
+    assert result["duration"] == pytest.approx(4.0, abs=0.15)
+
+    output = tmp_path / "workspace" / "projects" / "abc123" / "exports" / result["file"]
+    probed = _probe(output)
+    video = next(s for s in probed["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (1080, 1080)
+    assert video["r_frame_rate"] == "25/1"
+    assert not output.with_suffix(".srt").exists()
+
+    # Captions were switched off in the timeline, so nothing was burned in. A
+    # black frame sits at luma 16 in limited-range video, so anything bright in
+    # this band would have to be drawn text.
+    assert _caption_area_luma(output, at=2.0, crop="1080:300:0:700") < 17.5
 
 
 @requires_ffmpeg

@@ -315,6 +315,15 @@
               </select>
             </label>
             <label class="field">
+              <span class="field__label">Frame rate</span>
+              <select id="output-fps" class="input">
+                <option value="24">24 fps</option>
+                <option value="25">25 fps</option>
+                <option value="30" selected>30 fps (recommended)</option>
+                <option value="60">60 fps</option>
+              </select>
+            </label>
+            <label class="field">
               <span class="field__label">Captions</span>
               <select id="export-caption-mode" class="input">
                 <option value="burn" selected>Burn into video</option>
@@ -346,7 +355,7 @@
       </aside>
     </div>
 
-    <!-- Bottom: basic timeline -->
+    <!-- Bottom: editable timeline. The project JSON is the edit; this edits it. -->
     <section class="timeline" aria-label="Timeline">
       <div class="panel__heading">
         <h2>Timeline</h2>
@@ -355,21 +364,44 @@
           <span class="legend legend--caption">Captions</span>
           <span class="legend legend--broll">B-roll</span>
           <span class="legend legend--sfx">SFX</span>
+          <span id="timeline-save-state" class="badge badge-muted">No edit</span>
         </div>
       </div>
+
+      <div class="timeline__toolbar">
+        <button id="btn-timeline-in" class="btn btn-ghost" type="button" disabled
+          title="Select a clip first — the in point is inside the selected clip.">
+          ⟦ Set in at playhead
+        </button>
+        <button id="btn-timeline-out" class="btn btn-ghost" type="button" disabled
+          title="Select a clip first — the out point is inside the selected clip.">
+          Set out at playhead ⟧
+        </button>
+        <span id="timeline-summary" class="timeline__summary">No clip selected.</span>
+      </div>
+
+      <p id="timeline-status" class="processing-message">
+        Select a clip to load its edit from the saved project.
+      </p>
+      <p id="timeline-error" class="processing-error is-hidden" role="alert"></p>
+
       <div class="timeline__body">
         <div id="timeline-ruler" class="timeline__ruler"></div>
         <div id="timeline-tracks" class="timeline__tracks"></div>
       </div>
-    </section>
-
-    <footer class="app-footer">
-      <p>
-        Milestone 5. Import, local transcription, clip suggestions, captions, and a real
-        captioned vertical MP4 export all run on this machine. Sample data is illustrative;
-        B-roll, sound effects, transitions, and the timeline editor come later.
+      <p class="panel__hint">
+        Drag the clip block to trim or move it, or use the in/out fields and the
+        playhead buttons. Every change is saved to the project JSON and is what the
+        next render uses.
       </p>
-    </footer>
+    </section>      <footer class="app-footer">
+        <p>
+          Milestone 6. Import, local transcription, clip suggestions, the editable
+          timeline, captions, and a real captioned MP4 export all run on this machine.
+          Sample data is illustrative; B-roll, sound effects, and transitions land in
+          later milestones and their tracks say so rather than pretending to work.
+        </p>
+      </footer>
 
     <script type="module" src="/static/app.js"></script>
   </body>

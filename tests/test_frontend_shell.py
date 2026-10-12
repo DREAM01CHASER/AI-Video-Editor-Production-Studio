@@ -105,6 +105,29 @@ def test_render_controls_and_result_player_are_present(tmp_path: Path) -> None:
         assert f'id="{element_id}"' in body, element_id
 
 
+def test_the_timeline_editor_controls_are_present(tmp_path: Path) -> None:
+    """Milestone 6: the timeline is editable, so it needs its own controls."""
+
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "timeline-summary",
+        "timeline-status",
+        "timeline-error",
+        "timeline-save-state",
+        "btn-timeline-in",
+        "btn-timeline-out",
+        "output-fps",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
+
+    # The playhead buttons ship disabled with a reason instead of doing nothing.
+    assert 'id="btn-timeline-in" class="btn btn-ghost" type="button" disabled' in body
+    assert "Select a clip first" in body
+    # Frame rates are offered from the timeline's own list.
+    for fps in ('value="24"', 'value="25"', 'value="30"', 'value="60"'):
+        assert fps in body
+
+
 def test_static_assets_are_served(tmp_path: Path) -> None:
     client = _client(tmp_path)
     css = client.get("/static/styles.css")

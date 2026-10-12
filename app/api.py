@@ -41,6 +41,12 @@ from .render import (
     run_ffmpeg_render,
 )
 from .storage import CONTENT_TYPES_BY_EXTENSION, validate_upload_metadata
+from .timeline import (
+    UNRENDERED_TRACKS,
+    apply_timeline_patch,
+    build_timeline,
+    stored_timeline,
+)
 from .transcription import TranscriptionService
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -48,6 +54,17 @@ router = APIRouter(prefix="/api", tags=["projects"])
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 TRANSCRIBE_JOB_KIND = "transcribe"
 RENDER_JOB_KIND = "render"
+
+#: The render settings stored in ``project.json``. One list keeps the settings
+#: route, the render route, and the timeline in agreement.
+EXPORT_DOCUMENT_KEYS = (
+    "aspect_ratio",
+    "resolution",
+    "format",
+    "fps",
+    "caption_mode",
+    "write_srt",
+)
 
 #: Exported subtitles are plain text; the browser downloads rather than plays them.
 SUBTITLE_MEDIA_TYPE = "application/x-subrip"
@@ -278,6 +295,32 @@ def _source_duration(project: dict) -> float:
         return 0.0
 
 
+def _source_fps(project: dict) -> float:
+    metadata = project.get("source_metadata") or {}
+    try:
+        return float(metadata.get("fps") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _export_plan(project: dict, patch: dict | None = None) -> dict[str, object]:
+    """Validate the project's render settings (optionally with edits applied)."""
+
+    metadata = project.get("source_metadata") or {}
+    return normalise_export(
+        {**(project.get("export") or {}), **(patch or {})},
+        source_width=int(metadata.get("width") or 0),
+        source_height=int(metadata.get("height") or 0),
+        source_fps=_source_fps(project),
+    )
+
+
+def _export_document(plan: dict) -> dict[str, object]:
+    """The subset of a validated plan that is stored in the project."""
+
+    return {key: plan[key] for key in EXPORT_DOCUMENT_KEYS}
+
+
 def _clip_title(value: object, fallback: str) -> str:
     text = " ".join(str(value or "").split())
     return text[:120] or fallback
@@ -446,6 +489,109 @@ def update_project_clips(
     return {"clips": saved.get("clips") or []}
 
 
+# ----------------------------------------------------------------- timeline
+
+
+def _unsupported_tracks(timeline: dict) -> str | None:
+    """Report the first non-empty track the renderer cannot honour yet.
+
+    Storing an item and dropping it from the export would make the timeline and
+    the finished file disagree, so the render refuses instead.
+    """
+
+    for track, message in UNRENDERED_TRACKS.items():
+        if timeline.get(track):
+            return message
+    return None
+
+
+def _timeline_document(project: dict, clip: dict) -> dict[str, object]:
+    """Compose the editable timeline for one clip from the saved project."""
+
+    style = normalise_style(project.get("caption_style"))
+    plan = _export_plan(project)
+    return build_timeline(project, clip, caption_style=style, export=plan, plan=plan)
+
+
+@router.get("/projects/{project_id}/timeline")
+def get_project_timeline(
+    project_id: str, request: Request, clip_id: str | None = Query(default=None)
+) -> dict[str, object]:
+    """Return the edit for one clip: in/out points, captions, render settings, tracks.
+
+    ``clip_id`` is optional so opening a project shows its first candidate clip
+    straight away; an unknown id is a clear 404 rather than an empty timeline.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    clips = [clip for clip in (project.get("clips") or []) if isinstance(clip, dict)]
+
+    if not clips:
+        raise ApiError(
+            "no_clips",
+            "This project has no candidate clips yet, so there is no timeline to edit. "
+            "Transcribe the video and suggest clips first.",
+            409,
+        )
+
+    clip = clips[0] if not clip_id else _clip_by_id(project, clip_id)
+    return _timeline_document(project, clip)
+
+
+@router.patch("/projects/{project_id}/timeline")
+def update_project_timeline(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Validate an edited timeline and save it as the project's edit.
+
+    The whole edit is validated before anything is written, so a rejected edit
+    leaves the project exactly as it was. Timelines live in the project JSON, not
+    in FFmpeg arguments, and the next render reads them from there.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    body = payload or {}
+
+    if not isinstance(body, dict):
+        raise ApiError("invalid_timeline", "Send a JSON object.", 422)
+
+    clip = _clip_by_id(project, body.get("clip_id"))
+    current = stored_timeline(project)
+
+    patch = apply_timeline_patch(
+        project,
+        clip,
+        body,
+        current_style=normalise_style(project.get("caption_style")),
+        current_export=project.get("export") or {},
+    )
+
+    # Validate the render settings against the *edited* clip so a smaller clip
+    # cannot be described with settings the renderer would reject.
+    plan = _export_plan(project, patch["export"])
+
+    saved = store.save_timeline(
+        project_id,
+        source_start=float(patch["source_start"]),
+        source_end=float(patch["source_end"]),
+        clip_id=str(clip.get("id")),
+        caption_style=patch["caption_style"],
+        export=_export_document(plan),
+        tracks={**current, **patch["tracks"]},
+    )
+
+    edited_clip = next(
+        item for item in saved.get("clips") or [] if str(item.get("id")) == str(clip.get("id"))
+    )
+
+    return {
+        **_timeline_document(saved, edited_clip),
+        "plan": plan,
+    }
+
+
 # ------------------------------------------------------- captions and export
 
 
@@ -555,11 +701,7 @@ def get_project_captions(
     store = _store(request)
     project = store.load(project_id)
     style = normalise_style(project.get("caption_style"))
-    export = normalise_export(
-        project.get("export"),
-        source_width=int((project.get("source_metadata") or {}).get("width") or 0),
-        source_height=int((project.get("source_metadata") or {}).get("height") or 0),
-    )
+    export = _export_plan(project)
 
     clip = _clip_by_id(project, clip_id)
     plan = _caption_plan(_transcript_segments(store, project), clip, style, export)
@@ -591,7 +733,6 @@ def update_project_settings(
     store = _store(request)
     project = store.load(project_id)
     body = payload or {}
-    metadata = project.get("source_metadata") or {}
 
     style: dict | None = None
     if "caption_style" in body:
@@ -607,15 +748,8 @@ def update_project_settings(
     if incoming_export is not None and not isinstance(incoming_export, dict):
         raise ApiError("invalid_export_settings", "export must be a JSON object.", 422)
 
-    plan = normalise_export(
-        {**(project.get("export") or {}), **(incoming_export or {})},
-        source_width=int(metadata.get("width") or 0),
-        source_height=int(metadata.get("height") or 0),
-    )
-    export_document = {
-        key: plan[key]
-        for key in ("aspect_ratio", "resolution", "format", "caption_mode", "write_srt")
-    }
+    plan = _export_plan(project, incoming_export)
+    export_document = _export_document(plan)
 
     saved = store.save_settings(
         project_id, caption_style=style, export=export_document
@@ -680,15 +814,17 @@ def start_render(
     body = payload or {}
 
     project = store.load(project_id)
-    metadata = project.get("source_metadata") or {}
     clip = _clip_by_id(project, body.get("clip_id"))
 
     style = normalise_style({**(project.get("caption_style") or default_style()), **(body.get("caption_style") or {})})
-    plan = normalise_export(
-        {**(project.get("export") or {}), **(body.get("export") or {})},
-        source_width=int(metadata.get("width") or 0),
-        source_height=int(metadata.get("height") or 0),
-    )
+    plan = _export_plan(project, body.get("export"))
+
+    # An export sits inside the clip's timeline, so items on tracks the renderer
+    # cannot honour yet must be refused here rather than silently dropped.
+    timeline = stored_timeline(project)
+    unsupported = _unsupported_tracks(timeline)
+    if unsupported:
+        raise ApiError("unsupported_track", unsupported, 422)
 
     if not ffmpeg_available():
         raise ApiError(
@@ -709,14 +845,7 @@ def start_render(
 
     # Keeping the validated values means the saved project always describes the
     # render that actually ran, and the panel shows the same settings after reload.
-    store.save_settings(
-        project_id,
-        caption_style=style,
-        export={
-            key: plan[key]
-            for key in ("aspect_ratio", "resolution", "format", "caption_mode", "write_srt")
-        },
-    )
+    store.save_settings(project_id, caption_style=style, export=_export_document(plan))
 
     source_path = store.source_path(project)
     workspace = store.project_workspace(project_id)
@@ -761,6 +890,7 @@ def start_render(
             end=clip_end,
             width=int(plan["width"]),
             height=int(plan["height"]),
+            fps=int(plan["fps"]),
             subtitle_name=subtitle_name if burning else None,
         )
 
@@ -821,6 +951,7 @@ def start_render(
             "height": plan["height"],
             "aspect_ratio": plan["aspect_ratio"],
             "caption_mode": plan["caption_mode"],
+            "fps": plan["fps"],
             "caption_preset": style["preset"],
             "caption_style": style,
             "cue_count": len(cues),

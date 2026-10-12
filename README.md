@@ -99,8 +99,32 @@ Milestone 5 makes captions and the first real export:
 The controls are all wired to the live API — no button in the interface is a demo
 anymore. The sample project stays clearly labelled as sample data.
 
-Milestones 6–10 (editable timeline, local B-roll and SFX, stock search,
-transitions, and the release pass) are still to come.
+Milestone 6 makes the edit real and editable:
+
+- `GET /api/projects/{project_id}/timeline` returns the edit for one clip and
+  `PATCH .../timeline` saves it. The **project JSON is the edit** — clip in/out
+  points, caption track, render settings, and the item tracks all live in
+  `project.json`, never in a hidden FFmpeg command.
+- The timeline is editable from the bottom panel: **drag the clip block to move
+  it, drag its edges to trim it**, click the ruler to move the playhead, or use
+  the in/out fields and the *set in/out at playhead* buttons. Every change is
+  saved and immediately visible, and the panel shows a *Saved edit* state.
+- **One write path, one copy of every setting.** A timeline edit is validated as
+  a whole and then written in a single save, so the inspector, the timeline, and
+  the next render can never disagree. An edit that does not fit the source video
+  is refused with an explanation and leaves the stored edit untouched.
+- The frame rate (**24/25/30/60 fps**) is now part of the edit, so the export
+  reshapes the source to the rate the timeline asked for and says so when that
+  differs from the source.
+- B-roll, sound-effect, and transition tracks are shown with their own lanes, and
+  their items are **validated but refused until the renderer can draw them** (see
+  Milestones 7 and 9). Both the timeline and the render say which milestone
+  brings each one rather than storing an item the export would silently ignore.
+- Changes are re-read from the backend after every save, so the interface always
+  shows the saved edit rather than the attempted one.
+
+Milestones 7–10 (local B-roll and SFX, stock search, transitions, and the
+release pass) are still to come.
 
 ## Working directory
 
@@ -177,6 +201,8 @@ Stop the server with `Ctrl+C`.
 | `PATCH` | `/api/projects/{project_id}/clips` | Save edited in/out points, titles, and scores. |
 | `GET` | `/api/projects/{project_id}/captions` | Build the clip-relative caption cues for one clip. |
 | `PATCH` | `/api/projects/{project_id}/settings` | Save caption and export settings for the next render. |
+| `GET` | `/api/projects/{project_id}/timeline` | Read the editable edit for one clip. |
+| `PATCH` | `/api/projects/{project_id}/timeline` | Save an edited timeline (clip, captions, render settings, tracks). |
 | `POST` | `/api/projects/{project_id}/render` | Render the selected clip to a captioned MP4 (`202` + job). |
 | `GET` | `/api/projects/{project_id}/exports` | List finished renders, newest first. |
 | `GET` | `/api/projects/{project_id}/exports/{filename}` | Download a rendered MP4 or its `.srt` sidecar. |
@@ -209,11 +235,19 @@ preset geometry, safe-area margins, characters that would otherwise inject ASS
 override tags, and they read the written ASS/SRT back to confirm the style and
 timings that FFmpeg receives.
 
+The timeline tests are offline: they cover the composed document, frame-rate
+validation, item and track validation, and then read the saved `project.json`
+from disk to prove an edit really was written, that a refused edit changed
+nothing, and that a project hand-edited with an item the renderer cannot draw is
+refused at render time instead of exporting something different.
+
 The export tests include **real FFmpeg renders** of a synthesised source: they
 render a clip, measure the caption area of the output to show the captions really
 were burned in, compare it against the same clip rendered with captions off, check
 the MP4 is 1080 × 1920 with audio and the requested duration, download it through
-the API, and confirm a failed or cancelled render leaves no partial file. They are
+the API, and confirm a failed or cancelled render leaves no partial file. One of
+them edits the timeline first (square output, 25 fps, captions off) and then
+measures the rendered file to show the **export followed the edit**. They are
 skipped with an explicit reason when FFmpeg is unavailable.
 
 The interface can be opened without any API key or uploaded media, but
