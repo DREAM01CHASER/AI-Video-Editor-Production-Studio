@@ -917,6 +917,11 @@ select.input {
   color: #ead4f3;
 }
 
+.tag--transition {
+  background: rgb(216 180 106 / 30%);
+  color: #f3e2c2;
+}
+
 .timeline__clip--item {
   cursor: pointer;
 }
@@ -1075,6 +1080,28 @@ select.input {
   border-radius: 50%;
   background: #d8b46a;
   border: 1px solid #0d1116;
+}
+
+/*
+ * A transition is drawn as a short bar at the clip edge it belongs to, with the
+ * bar's width showing the transition's own length, so the size of the effect is
+ * readable without opening the item. The left and right caps keep a very short
+ * transition from collapsing into an unreadable dot.
+ */
+.timeline__marker--transition {
+  top: 50%;
+  height: 12px;
+  margin-top: -6px;
+  min-width: 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.timeline__marker--transition:hover,
+.timeline__marker--transition.is-active {
+  background: #f0cd85;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .timeline__hint {

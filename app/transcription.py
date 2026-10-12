@@ -198,6 +198,35 @@ class _LoadedModel:
     notes: list[str] = field(default_factory=list)
 
 
+class _CudaRuntimeMissing(RuntimeError):
+    """Raised when CTranslate2 fails because a CUDA runtime DLL is unavailable."""
+
+
+#: Substrings that identify a missing CUDA runtime rather than a real bug. CTranslate2
+#: loads a CUDA model successfully and only fails on the first inference, so these
+#: have to be recognised at inference time as well as at load time.
+_CUDA_RUNTIME_ERRORS = (
+    "cublas",
+    "cudnn",
+    "cudart",
+    "cufft",
+    "cannot load library",
+    "d3d11",
+)
+
+
+def _is_cuda_runtime_failure(exc: BaseException) -> bool:
+    """Whether an exception is a missing CUDA runtime rather than anything else."""
+
+    if isinstance(exc, _CudaRuntimeMissing):
+        return True
+    text = str(exc).lower()
+    if not any(marker in text for marker in _CUDA_RUNTIME_ERRORS):
+        return False
+    # Only treat it as a runtime problem when a CUDA device was actually in use.
+    return "cuda" in text or "cublas" in text or "cudnn" in text
+
+
 class TranscriptionService:
     """Owns the faster-whisper model and turns a video into a transcript."""
 
@@ -364,28 +393,63 @@ class TranscriptionService:
             report(_LOAD_SHARE, "Model ready. Decoding audio…")
 
             module = self._load_module()
-            segments_iter, info = loaded.instance.transcribe(
-                str(source_path),
-                word_timestamps=self.settings.whisper_word_timestamps,
-                beam_size=self.settings.whisper_beam_size,
-                language=self.settings.whisper_language,
-                vad_filter=True,
-            )
+
+            def start_inference(instance) -> tuple:
+                """Begin a transcription, converting a missing CUDA runtime.
+
+                ``faster-whisper`` decodes and detects the language inside this
+                call, before the segment iterator is ever handed back, so this is
+                where a missing cuBLAS first appears on most machines.
+                """
+
+                try:
+                    return instance.transcribe(
+                        str(source_path),
+                        word_timestamps=self.settings.whisper_word_timestamps,
+                        beam_size=self.settings.whisper_beam_size,
+                        language=self.settings.whisper_language,
+                        vad_filter=True,
+                    )
+                except BaseException as exc:
+                    if loaded.device == "cuda" and _is_cuda_runtime_failure(exc):
+                        raise _CudaRuntimeMissing(str(exc)) from exc
+                    raise
+
+            try:
+                segments_iter, info = start_inference(loaded.instance)
+                # The first segment is pulled here so a GPU runtime failure is
+                # caught while it can still be retried. CTranslate2 loads a CUDA
+                # model successfully even when the cuBLAS runtime is missing, and
+                # only fails on the first real inference, so a load-time fallback
+                # alone is not enough.
+                collected, info, device, compute_type = self._collect_segments(
+                    segments_iter,
+                    info=info,
+                    loaded=loaded,
+                    duration_hint=duration_hint,
+                    cancelled=cancelled,
+                    report=report,
+                )
+            except _CudaRuntimeMissing:
+                if loaded.device != "cuda":
+                    raise
+                notes.append(
+                    "The GPU runtime libraries (cuDNN/cuBLAS) are missing, so "
+                    "transcription ran on CPU/int8 instead."
+                )
+                report(_LOAD_SHARE, "The GPU runtime is unavailable — retrying on CPU…")
+                loaded = self._fallback_to_cpu()
+                segments_iter, info = start_inference(loaded.instance)
+                collected, info, device, compute_type = self._collect_segments(
+                    segments_iter,
+                    info=info,
+                    loaded=loaded,
+                    duration_hint=duration_hint,
+                    cancelled=cancelled,
+                    report=report,
+                )
 
             total = float(getattr(info, "duration", 0.0) or 0.0) or float(duration_hint or 0.0)
-            span = 100.0 - _LOAD_SHARE - _SAVE_SHARE
-
-            collected: list[object] = []
-            for segment in segments_iter:
-                if cancelled():
-                    raise ApiError("job_cancelled", "Transcription was cancelled.", 409)
-                collected.append(segment)
-                end = float(getattr(segment, "end", 0.0) or 0.0)
-                fraction = (end / total) if total > 0 else 0.0
-                report(
-                    _LOAD_SHARE + span * min(1.0, max(0.0, fraction)),
-                    f"Transcribed {end:.0f}s of {total:.0f}s — {len(collected)} segments.",
-                )
 
             if not collected:
                 notes.append(
@@ -400,8 +464,8 @@ class TranscriptionService:
                 segments=collected,
                 info=info,
                 model=self.settings.whisper_model,
-                device=loaded.device,
-                compute_type=loaded.compute_type,
+                device=device,
+                compute_type=compute_type,
                 duration=total,
                 elapsed_seconds=elapsed,
                 requested_word_timestamps=self.settings.whisper_word_timestamps,
@@ -416,6 +480,62 @@ class TranscriptionService:
 
             report(97.0, "Saving transcript…")
             return document, loaded
+
+    def _fallback_to_cpu(self) -> _LoadedModel:
+        """Rebuild the model on CPU/int8 and remember it for later jobs."""
+
+        compute_type = resolve_compute_type("cpu", self.settings.whisper_compute_type)
+        instance = self._build_model("cpu", compute_type)
+        loaded = _LoadedModel(
+            instance=instance, device="cpu", compute_type=compute_type, notes=[]
+        )
+        with self._model_lock:
+            self._model = loaded
+        return loaded
+
+    def _collect_segments(
+        self,
+        segments_iter,
+        *,
+        info,
+        loaded: _LoadedModel,
+        duration_hint: float,
+        cancelled,
+        report,
+    ) -> tuple[list[object], object, str, str]:
+        """Drain the segment iterator, reporting progress from real decoded audio.
+
+        The very first segment is pulled inside the caller's ``try`` so that a
+        missing CUDA runtime — which only surfaces on the first inference — can
+        still be retried on the CPU instead of failing the whole job.
+        """
+
+        total = float(getattr(info, "duration", 0.0) or 0.0) or float(duration_hint or 0.0)
+        span = 100.0 - _LOAD_SHARE - _SAVE_SHARE
+
+        collected: list[object] = []
+        try:
+            for segment in segments_iter:
+                if cancelled():
+                    raise ApiError("job_cancelled", "Transcription was cancelled.", 409)
+                collected.append(segment)
+                end = float(getattr(segment, "end", 0.0) or 0.0)
+                fraction = (end / total) if total > 0 else 0.0
+                report(
+                    _LOAD_SHARE + span * min(1.0, max(0.0, fraction)),
+                    f"Transcribed {end:.0f}s of {total:.0f}s — {len(collected)} segments.",
+                )
+        except ApiError:
+            raise
+        except BaseException as exc:
+            # Anything else may still be a missing CUDA runtime; recognise it here
+            # so the caller can retry on the CPU. `raise ... from exc` keeps the
+            # original for the log.
+            if loaded.device == "cuda" and _is_cuda_runtime_failure(exc):
+                raise _CudaRuntimeMissing(str(exc)) from exc
+            raise
+
+        return collected, info, loaded.device, loaded.compute_type
 
     @property
     def is_busy(self) -> bool:

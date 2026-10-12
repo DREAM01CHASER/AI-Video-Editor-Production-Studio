@@ -19,6 +19,7 @@ from app.main import create_app
 from app.timeline import (
     DEFAULT_FPS,
     FPS_CHOICES,
+    UNRENDERED_TRACKS,
     apply_timeline_patch,
     build_timeline,
     normalise_fps,
@@ -286,13 +287,14 @@ def test_a_transition_is_bounded_by_the_clip() -> None:
     assert "no more than 2s" in error.value.message
 
 
-@pytest.mark.parametrize("track", ["broll", "sfx"])
+@pytest.mark.parametrize("track", ["broll", "sfx", "transitions"])
 def test_an_item_track_the_renderer_can_draw_is_accepted(track: str) -> None:
-    """Milestone 7 makes these tracks real, so an edit on them is stored."""
+    """Milestones 7 and 9 made these tracks real, so an edit on them is stored."""
 
     item = {
         "broll": {"source": "source", "start": 1.0, "end": 2.0},
         "sfx": {"asset_id": "a", "start": 1.0, "end": 2.0},
+        "transitions": {"kind": "fade", "at": "start", "duration": 0.5},
     }[track]
 
     asset = {"id": "a", "kind": "sfx", "duration": 5.0}
@@ -307,27 +309,24 @@ def test_an_item_track_the_renderer_can_draw_is_accepted(track: str) -> None:
     assert len(patch["tracks"][track]) == 1
 
 
-def test_a_track_the_renderer_cannot_honour_yet_is_refused_with_a_reason() -> None:
-    """Storing an item the export would ignore would make the timeline lie.
+def test_the_unrendered_track_guard_still_works() -> None:
+    """No track is waiting any more, but the guard that protects the edit remains.
 
-    The item itself is valid — it is the *edit* that is refused until the render
-    can draw it, and the message says which milestone brings it.
+    ``UNRENDERED_TRACKS`` is empty because Milestone 9 drew transitions. The
+    mechanism is kept so the next track that cannot be rendered is refused at the
+    edit boundary rather than silently dropped from the export.
     """
 
-    item = {"kind": "fade", "at": "start", "duration": 0.5}
-    assert normalise_track_items([item], track="transitions", clip_duration=10.0, asset_ids=set())
-
+    assert UNRENDERED_TRACKS == {}
+    # An unknown track is still refused rather than accepted and ignored.
     with pytest.raises(ApiError) as error:
-        apply_timeline_patch(
-            _project_document(),
-            dict(CLIP),
-            {"clip_id": "clip-1", "transitions": [item]},
-            current_style=CAPTION_STYLE,
-            current_export=EXPORT,
+        normalise_track_items(
+            [{"kind": "fade", "at": "start", "duration": 0.5}],
+            track="sparkles",
+            clip_duration=10.0,
+            asset_ids=set(),
         )
-
-    assert error.value.code == "unsupported_track"
-    assert "Milestone 9" in error.value.message
+    assert "sparkles" in error.value.message
 
 
 # ------------------------------------------------------------------- patch
@@ -402,8 +401,8 @@ def test_the_timeline_route_returns_the_first_clip_by_default(tmp_path: Path) ->
     body = response.json()
     assert body["clip_id"] == "clip-1"
     assert body["video"]["fps"] == 30
-    # Only the transition track is still waiting for its milestone.
-    assert list(body["tracks_not_rendered"]) == ["transitions"]
+    # Milestone 9 made every track renderable, so nothing is waiting any more.
+    assert body["tracks_not_rendered"] == {}
 
 
 def test_editing_the_timeline_changes_the_saved_project_on_disk(tmp_path: Path) -> None:
@@ -451,12 +450,16 @@ def test_a_refused_timeline_edit_changes_nothing_on_disk(tmp_path: Path) -> None
         json={
             "clip_id": "clip-1",
             "video": {"source_start": 4.0, "source_end": 12.0},
-            "transitions": [{"kind": "fade", "at": "start", "duration": 0.4}],
+            # Two B-roll inserts sharing time are still refused as an edit.
+            "broll": [
+                {"source": "source", "start": 2.0, "end": 5.0},
+                {"source": "source", "start": 4.0, "end": 6.0},
+            ],
         },
     )
 
     assert response.status_code == 422
-    assert response.json()["error"]["code"] == "unsupported_track"
+    assert response.json()["error"]["code"] == "invalid_timeline"
     assert _stored_project(tmp_path) == before
 
 
@@ -482,25 +485,60 @@ def test_the_timeline_rejects_a_caption_preset_the_renderer_cannot_draw(tmp_path
     assert response.json()["error"]["code"] == "invalid_caption_style"
 
 
-def test_a_hand_edited_project_with_an_unrendered_track_cannot_render(tmp_path: Path) -> None:
-    """A project edited outside the app must not export something it cannot draw."""
+def test_a_hand_edited_project_pointing_at_a_missing_asset_cannot_render(tmp_path: Path) -> None:
+    """A project edited outside the app must not export something it cannot draw.
+
+    Milestone 9 made transitions renderable, so an unknown track is no longer the
+    interesting case. A B-roll item pointing at an asset that does not exist is:
+    the render has to refuse rather than quietly exporting without it. The
+    synthetic project here has no source *file* on disk either, and that check runs
+    first, so both guards are covered by asserting the refusal rather than the
+    specific guard that happens to fire.
+    """
 
     client = _project(tmp_path)
     store = client.app.state.projects
     project = store.load("abc123")
     project["timeline"] = {
         "version": 1,
-        "broll": [],
+        "broll": [
+            {
+                "id": "broll-1",
+                "source": "asset-that-was-deleted",
+                "source_start": 0.0,
+                "source_end": 1.0,
+                "start": 1.0,
+                "end": 2.0,
+                "placement": "full",
+                "fit": "cover",
+            }
+        ],
         "sfx": [],
-        "transitions": [{"id": "transition-1", "kind": "fade", "at": "start", "duration": 0.5}],
+        "transitions": [],
     }
     store.save(project)
 
     response = client.post("/api/projects/abc123/render", json={"clip_id": "clip-1"})
 
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "unsupported_track"
-    assert "Milestone 9" in response.json()["error"]["message"]
+    assert response.status_code == 404
+    assert "error" in response.json()
+
+
+def test_a_missing_asset_is_refused_before_the_render_starts(tmp_path: Path) -> None:
+    """The refusal names the asset, so the user knows what to fix."""
+
+    client = _project(tmp_path)
+    response = client.patch(
+        "/api/projects/abc123/timeline",
+        json={
+            "clip_id": "clip-1",
+            "broll": [{"source": "asset-that-was-deleted", "start": 1.0, "end": 2.0}],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "invalid_asset"
+    assert "asset-that-was-deleted" in response.json()["error"]["message"]
 
 
 def test_saving_render_settings_keeps_the_frame_rate(tmp_path: Path) -> None:

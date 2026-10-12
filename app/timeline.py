@@ -46,9 +46,10 @@ DEFAULT_SFX_FADE_SECONDS = 0.15
 #: Tracks the editor shows but the renderer cannot honour yet. Refusing an item is
 #: the honest answer: storing it and quietly dropping it from the render would make
 #: the interface lie about what the exported file contains.
-UNRENDERED_TRACKS = {
-    "transitions": "Transitions arrive with Milestone 9.",
-}
+#:
+#: Milestone 9 made the transition track real, so it is empty. The mechanism stays
+#: because the next track to arrive will need exactly this guard.
+UNRENDERED_TRACKS: dict[str, str] = {}
 
 _TRACK_KEYS = ("broll", "sfx", "transitions")
 
@@ -87,6 +88,11 @@ def stored_timeline(project: dict) -> dict:
     for key in _TRACK_KEYS:
         items = timeline.get(key)
         timeline[key] = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    # A project saved before Milestone 9 has no sound-design block at all, so the
+    # defaults are filled in here rather than at every read site.
+    from .sound_design import normalise_settings  # local import keeps the modules acyclic
+
+    timeline["sound_design"] = normalise_settings(timeline.get("sound_design"))
     timeline.setdefault("updated_at", None)
     return timeline
 
@@ -389,6 +395,8 @@ def build_timeline(
 ) -> dict[str, object]:
     """Compose the edit the interface shows for one clip."""
 
+    from .sound_design import propose_auto_sfx  # local import keeps the modules acyclic
+
     start = float(clip.get("source_start") or 0.0)
     end = float(clip.get("source_end") or 0.0)
     stored = stored_timeline(project)
@@ -420,6 +428,22 @@ def build_timeline(
         "broll": stored["broll"],
         "sfx": stored["sfx"],
         "transitions": stored["transitions"],
+        "sound_design": {
+            **stored["sound_design"],
+            # The proposals are shown in the interface so an automatic effect is
+            # never a surprise in the finished file, but they are drafts: they are
+            # recomputed from the tracks at render time and are not stored.
+            "proposed": propose_auto_sfx(
+                {
+                    "broll": stored["broll"],
+                    "transitions": stored["transitions"],
+                },
+                clip_duration=round(max(0.0, end - start), 3),
+                enabled=bool(stored["sound_design"].get("enabled")),
+                kind=str(stored["sound_design"].get("kind")),
+                max_effects=int(stored["sound_design"].get("max_effects")),
+            ),
+        },
         "render": {
             key: export.get(key)
             for key in (
@@ -455,6 +479,7 @@ def apply_timeline_patch(
     """
 
     from .captions import normalise_style  # local import keeps the modules acyclic
+    from .sound_design import normalise_settings  # local import keeps the modules acyclic
 
     body = dict(patch or {})
     clip_duration = max(
@@ -559,9 +584,20 @@ def apply_timeline_patch(
                 _check_asset_kinds(items, asset_kinds, field="asset_id", expected="sfx")
             tracks[key] = items
 
+    stored = stored_timeline(project)
     if not tracks:
-        stored = stored_timeline(project)
         tracks = {key: stored[key] for key in _TRACK_KEYS}
+    sound_design = stored["sound_design"]
+
+    # Sound design is part of the edit, so it is validated with the rest of it and
+    # written in the same single save. A refused setting leaves the stored one.
+    body_sound_design = body.get("sound_design")
+    if body_sound_design is not None:
+        if not isinstance(body_sound_design, dict):
+            raise ApiError(
+                "invalid_sound_design", "sound_design must be a JSON object.", 422
+            )
+        sound_design = normalise_settings(body_sound_design, sound_design)
 
     return {
         "source_start": round(start, 3),
@@ -569,6 +605,7 @@ def apply_timeline_patch(
         "caption_style": style,
         "export": export_patch,
         "tracks": tracks,
+        "sound_design": sound_design,
         "fps": export_patch["fps"],
         "updated_at": _utcnow(),
     }

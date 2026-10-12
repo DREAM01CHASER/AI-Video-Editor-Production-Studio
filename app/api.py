@@ -52,6 +52,12 @@ from .llm import LlmSettings, make_ranker
 from .jobs import JobRegistry
 from .media import probe_media, probe_video
 from .projects import ProjectStore
+from .sound_design import (
+    describe as sound_design_note,
+    materialise,
+    normalise_settings,
+    propose_auto_sfx,
+)
 from .render import (
     build_ffmpeg_command,
     ffmpeg_available,
@@ -78,6 +84,7 @@ from .timeline import (
     build_timeline,
     stored_timeline,
 )
+from .transitions import describe as transition_note
 from .transcription import TranscriptionService
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -643,6 +650,7 @@ def update_project_timeline(
         caption_style=patch["caption_style"],
         export=_export_document(plan),
         tracks={**current, **patch["tracks"]},
+        sound_design=patch["sound_design"],
     )
 
     edited_clip = next(
@@ -1229,18 +1237,38 @@ def start_render(
     workspace = store.project_workspace(project_id)
     segments = _transcript_segments(store, project)
 
+    clip_id = str(clip.get("id"))
+    clip_start = float(clip.get("source_start") or 0.0)
+    clip_end = float(clip.get("source_end") or 0.0)
+
     # Timeline items become real inputs here, so a missing asset fails before the
     # render starts rather than halfway through it.
     broll_items, sfx_items = _timeline_media(store, project, timeline)
+    transitions = [
+        item for item in (timeline.get("transitions") or []) if isinstance(item, dict)
+    ]
+
+    # Automatic effects are proposed from the saved edit and then written to real
+    # files, so they mix through the same graph as a chosen sound effect rather
+    # than a second code path with its own idea of levels and timing.
+    sound_settings = normalise_settings(
+        timeline.get("sound_design"),
+        body.get("sound_design") if isinstance(body.get("sound_design"), dict) else None,
+    )
+    auto_effects = propose_auto_sfx(
+        timeline,
+        clip_duration=clip_end - clip_start,
+        enabled=bool(sound_settings["enabled"]),
+        kind=str(sound_settings["kind"]),
+        max_effects=int(sound_settings["max_effects"]),
+    )
+
     source_has_audio = True
-    if broll_items or sfx_items:
+    if broll_items or sfx_items or auto_effects:
         # Whether the source has audio changes how the graph is built, so it is
         # measured rather than assumed: a video-only source must still render.
         source_has_audio = probe_media(source_path).has_audio
 
-    clip_id = str(clip.get("id"))
-    clip_start = float(clip.get("source_start") or 0.0)
-    clip_end = float(clip.get("source_end") or 0.0)
     caption_plan = _caption_plan(segments, clip, style, plan)
     cues = caption_plan["cues"]
     geometry = caption_plan["geometry"]
@@ -1274,6 +1302,10 @@ def start_render(
             else f"This clip has no audio track, so the export carries only the "
             f"{len(sfx_items)} sound effect(s)."
         )
+    if transitions:
+        notes.append(transition_note(transitions))
+    if auto_effects:
+        notes.append(sound_design_note(auto_effects))
 
     job = registry.create(RENDER_JOB_KIND, subject=project_id)
 
@@ -1282,6 +1314,23 @@ def start_render(
 
         if burning:
             subtitle_path.write_text(to_ass(cues, style, geometry), encoding="utf-8")
+
+        # The effects are written into the project's own temp folder and removed
+        # again below, so a repeated render never accumulates synthesised audio.
+        auto_paths: list[Path] = []
+        mixed_sfx = list(sfx_items)
+        if auto_effects:
+            registry.update(job, progress=1.0, message="Building sound design…")
+            try:
+                auto_entries = materialise(auto_effects, workspace.temp)
+            except BaseException:
+                # `materialise` removes what it wrote; this is belt and braces for
+                # a file that appeared between the write and the failure.
+                for path in workspace.temp.glob("auto-sfx-*.wav"):
+                    path.unlink(missing_ok=True)
+                raise
+            auto_paths = [entry["path"] for entry in auto_entries]
+            mixed_sfx = [*mixed_sfx, *auto_entries]
 
         command = build_ffmpeg_command(
             source_path=source_path,
@@ -1293,7 +1342,8 @@ def start_render(
             fps=int(plan["fps"]),
             subtitle_name=subtitle_name if burning else None,
             broll=broll_items,
-            sfx=sfx_items,
+            sfx=mixed_sfx,
+            transitions=transitions,
             source_has_audio=source_has_audio,
         )
 
@@ -1312,6 +1362,9 @@ def start_render(
             # behind; the .ass file is kept so a failure can be inspected.
             output_path.unlink(missing_ok=True)
             raise
+        finally:
+            for path in auto_paths:
+                path.unlink(missing_ok=True)
 
         if burning:
             subtitle_path.unlink(missing_ok=True)
@@ -1357,6 +1410,10 @@ def start_render(
             "fps": plan["fps"],
             "broll_count": len(broll_items),
             "sfx_count": len(sfx_items),
+            "auto_sfx_count": len(auto_effects),
+            "transition_count": len(transitions),
+            "transitions": transitions,
+            "sound_design": sound_settings,
             "caption_preset": style["preset"],
             "caption_style": style,
             "cue_count": len(cues),

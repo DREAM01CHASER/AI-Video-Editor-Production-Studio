@@ -26,6 +26,7 @@ from app.main import create_app
 from app.projects import ProjectStore
 from app.storage import Workspace
 from app.transcription import (
+    _is_cuda_runtime_failure,
     build_transcript_document,
     resolve_compute_type,
     resolve_device,
@@ -129,6 +130,46 @@ def test_resolve_device_rejects_an_unknown_value() -> None:
     with pytest.raises(ApiError) as error:
         resolve_device("tpu", 1)
     assert error.value.code == "invalid_whisper_device"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Library cublas64_12.dll is not found or cannot be loaded",
+        "Library cudnn64_9.dll is not found",
+        "Could not load library cudart64_12.dll",
+        "cuDNN error: CUDNN_STATUS_NOT_INITIALIZED",
+    ],
+)
+def test_a_missing_cuda_runtime_is_recognised_at_inference_time(message: str) -> None:
+    """A load-time fallback alone is not enough.
+
+    CTranslate2 loads a CUDA model successfully even when the cuBLAS runtime is
+    missing, and only fails on the first real inference — which is what happened
+    on a machine with a visible GPU but no CUDA runtime installed.
+    """
+
+    assert _is_cuda_runtime_failure(RuntimeError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No such file or directory: 'model.bin'",
+        "Some other decoding failure entirely",
+        "CUDA out of memory while transcribing",
+    ],
+)
+def test_a_failure_that_is_not_a_missing_runtime_is_left_alone(message: str) -> None:
+    assert not _is_cuda_runtime_failure(RuntimeError(message))
+
+
+def test_an_api_error_is_never_mistaken_for_a_cuda_problem() -> None:
+    """A cancellation must propagate as itself, not be retried on the CPU."""
+
+    assert not _is_cuda_runtime_failure(
+        ApiError("job_cancelled", "Transcription was cancelled.", 409)
+    )
 
 
 @pytest.mark.parametrize(

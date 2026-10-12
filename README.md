@@ -174,8 +174,41 @@ Milestone 8 adds optional stock B-roll search through Pexels:
   real browser to confirm a non-Pexels address is refused inside the UI, not only
   in a unit test.
 
-Milestones 9–10 (transitions and automatic sound design, and the release pass)
-are still to come.
+Milestone 9 adds transitions and automatic sound design:
+
+- Transitions are drawn by **FFmpeg itself** — `fade`, `slide-left`, and `wipe-left`
+  — so nothing is downloaded, committed, or redistributed, and there is no licence
+  to answer. A transition belongs to the clip's own **start or end**, which is what
+  a short actually needs and keeps the timing unambiguous. The **Transitions** lane
+  on the timeline draws each one as a bar at its edge, sized to its own length, so
+  the size of the effect is readable without opening it.
+- A transition is applied to the **finished** picture, after B-roll is composited,
+  so a fade covers the insert instead of letting it hang over black. Two of the
+  same kind at one edge never stack.
+- **Automatic sound design is off by default** and needs no asset: the effects are
+  **synthesised by FFmpeg** into the project's own `temp/` folder at export time, so
+  an automatic effect mixes through *exactly* the same path as a hand-placed one.
+  Two kinds are offered — a *whoosh* for a moving picture and a *pop* for a single
+  cut.
+- Effects are placed **only where the picture already changes** (a B-roll entrance
+  or exit, or a transition at the clip's end), are spaced apart, and are capped by
+  a setting you control. An edit with no cuts gets no automatic effects at all.
+- The mix stays conservative: an automatic effect is capped at the same **−3 dB**
+  ceiling as a chosen sound effect and defaults to −18 dB, and the graph mixes with
+  `amix=normalize=0` so speech keeps its recorded level.
+- The panel shows **exactly what the next render would add, and where**, so an
+  automatic effect is never a surprise. Switching it off removes all of them.
+- A project saved before Milestone 9 gets the settings defaulted on read, and the
+  synthesised files are removed afterwards — a repeated render never accumulates
+  audio in `temp/`.
+- **Every track is now renderable**, so `UNRENDERED_TRACKS` is empty. The guard
+  that refuses an item the renderer cannot draw is kept, so the next track that
+  arrives is still refused at the edit boundary rather than silently dropped.
+
+The controls are all wired to the live API — no button in the interface is a demo
+anymore. The sample project stays clearly labelled as sample data.
+
+Milestone 10 (the final reliability and demo pass) is still to come.
 
 ## Working directory
 
@@ -318,6 +351,16 @@ browser, with a stub standing in for the provider, to confirm the results render
 with their credit and that a non-Pexels download address is refused inside the
 UI rather than only in a test.
 
+The transition and sound-design tests are offline *and* real. Offline they cover
+the filter fragment for every kind at every edge, the length bounds, the ordering
+and de-duplication of a chain, the settings validation, the proposals that follow
+the real picture changes, the cap, and the gain ceiling — then read the saved
+`project.json` to prove an edit really was written and that a refused one changed
+nothing. With FFmpeg they **measure the finished file**: every filter is rendered,
+the fade is shown to take the first frame to black and then recover, the whoosh is
+shown to be loudest in the middle rather than assumed to be, and the mixed audio is
+measured inside an effect's window and against the silence outside it.
+
 The export tests include **real FFmpeg renders** of a synthesised source: they
 render a clip, measure the caption area of the output to show the captions really
 were burned in, compare it against the same clip rendered with captions off, check
@@ -329,6 +372,34 @@ skipped with an explicit reason when FFmpeg is unavailable.
 
 The interface can be opened without any API key or uploaded media, but
 transcription needs `faster-whisper` and a model. Clip suggestion needs neither.
+
+## Transitions and automatic sound design
+
+Both features need **no asset, no download, and no licence**: FFmpeg synthesises
+both at export time.
+
+**Transitions** are stored on the clip's own `transitions` track and happen at the
+clip's start or end. Three kinds are offered — *Fade to black*, *Slide in from the
+right*, and *Wipe in from the left* — and a length of up to 2 seconds, further
+bounded to half the clip so a transition can never cover the whole thing. Add one
+with **+ Transition** and edit it by clicking its marker on the timeline.
+
+**Automatic sound design** is **off until you turn it on**, in *Sound design*:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Automatic effects | Off | The master toggle. Off means no automatic sound is added at all. |
+| Effect | `whoosh` | `whoosh` marks a moving picture; `pop` marks a single cut. |
+| Maximum effects | 2 | A hard cap of 4 applies whatever you choose. |
+
+Effects are placed **only where the picture already changes** — a B-roll entrance or
+exit, or a transition at the clip's end — and are never added at arbitrary points.
+The panel lists the exact times the next render would use, so nothing is a
+surprise. An automatic effect is mixed at **−18 dB**, inside the same **−3 dB**
+ceiling as a hand-placed sound effect, so it can never bury the speech.
+
+If FFmpeg cannot create an effect, the export fails with a clear message rather
+than quietly exporting without it, and nothing is left behind in `temp/`.
 
 ## Transcription settings
 
@@ -348,7 +419,10 @@ needs an internet connection; after that the model is reused from the normal
 Hugging Face cache. Set `WHISPER_ALLOW_DOWNLOAD=false` to stay offline —
 transcription then reports a clear error unless the model is already cached.
 A CUDA device that is visible but missing its cuDNN/cuBLAS runtime falls back to
-CPU automatically, and the fallback is recorded in the transcript.
+CPU automatically, and the fallback is recorded in the transcript. This includes a
+runtime that only fails on the **first inference** — CTranslate2 loads a CUDA model
+successfully and only then fails on the CUDA libraries, so the retry is applied
+during transcription as well as at model load.
 
 ## Optional LLM clip labels
 

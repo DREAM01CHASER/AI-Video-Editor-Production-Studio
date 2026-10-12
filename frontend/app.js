@@ -140,6 +140,20 @@ const els = {
   itemGain: document.getElementById("item-gain"),
   itemFadeField: document.getElementById("item-fade-field"),
   itemFade: document.getElementById("item-fade"),
+  itemTransitionKindField: document.getElementById("item-transition-kind-field"),
+  itemTransitionKind: document.getElementById("item-transition-kind"),
+  itemTransitionAtField: document.getElementById("item-transition-at-field"),
+  itemTransitionAt: document.getElementById("item-transition-at"),
+  itemTransitionDurationField: document.getElementById("item-transition-duration-field"),
+  itemTransitionDuration: document.getElementById("item-transition-duration"),
+  btnAddTransition: document.getElementById("btn-add-transition"),
+  soundDesignEnabled: document.getElementById("sound-design-enabled"),
+  soundDesignKindField: document.getElementById("sound-design-kind-field"),
+  soundDesignKind: document.getElementById("sound-design-kind"),
+  soundDesignCountField: document.getElementById("sound-design-count-field"),
+  soundDesignCount: document.getElementById("sound-design-count"),
+  soundDesignState: document.getElementById("sound-design-state"),
+  soundDesignStatus: document.getElementById("sound-design-status"),
   btnItemDelete: document.getElementById("btn-item-delete"),
   itemError: document.getElementById("item-error"),
   processingPanel: document.getElementById("processing-panel"),
@@ -1159,7 +1173,8 @@ function renderTimeline() {
     { kind: "video", label: "Video", title: "Selected clip on the source timeline" },
     { kind: "caption", label: "Captions", title: "Burned-in caption track" },
     { kind: "broll", label: "B-roll", title: "B-roll overlays" },
-    { kind: "sfx", label: "SFX", title: "Sound effects and transitions" },
+    { kind: "sfx", label: "SFX", title: "Sound effects you placed by hand" },
+    { kind: "transition", label: "Transitions", title: "How the clip arrives or leaves" },
   ];
 
   for (const lane of lanes) {
@@ -1183,24 +1198,28 @@ function renderTimeline() {
           ? "No B-roll yet — import a clip and press “+ B-roll at playhead”"
           : "Select a real clip to edit this track",
       });
-    } else {
-      // Sound effects and transitions share one audio/effects lane, so they get
-      // one empty hint between them rather than one each.
-      const sfxCount = paintItems(track, timeline?.sfx, "sfx", pct, { trackName: "sfx" });
-      const transitionCount = paintItems(track, timeline?.transitions, "transition", pct, {
-        marker: true,
+    } else if (lane.kind === "sfx") {
+      paintItems(track, timeline?.sfx, "sfx", pct, {
+        trackName: "sfx",
+        empty: timeline
+          ? "No sound effects yet — import one and press “+ SFX at playhead”"
+          : "Select a real clip to edit this track",
       });
-      if (timeline && sfxCount + transitionCount === 0) {
+    } else {
+      // A transition is anchored to the clip's start or end, so it is drawn as a
+      // marker at that edge rather than as a block with a width of its own.
+      const drawn = paintTransitions(track, timeline, pct);
+      if (timeline && drawn === 0) {
         appendTimelineHint(
           track,
-          "No sound effects or transitions — effects are added at the playhead, transitions arrive in Milestone 9"
+          "No transitions — press “+ Transition” to fade, slide, or wipe the clip in or out"
         );
       } else if (!timeline) {
         appendTimelineHint(track, "Select a real clip to edit this track");
       }
     }
 
-    if (!timeline && lane.kind !== "video" && lane.kind !== "sfx") {
+    if (!timeline && lane.kind !== "video") {
       appendTimelineHint(track, "Select a real clip to edit this track");
     }
 
@@ -1208,6 +1227,7 @@ function renderTimeline() {
   }
 
   paintTimelineStatus(timeline, duration);
+  renderSoundDesign(timeline);
   updateTimelineControls();
 }
 
@@ -1322,6 +1342,54 @@ function paintItems(track, items, kind, pct, { marker = false, empty = null, tra
   return list.length;
 }
 
+/**
+ * Draw the transition markers and return how many were drawn.
+ *
+ * A transition belongs to an edge of the clip rather than to a span inside it, so
+ * each marker is drawn as a short block sitting at that edge. Its width is the
+ * transition's own length, which makes the size of the effect readable at a glance
+ * rather than having to open the item.
+ */
+function paintTransitions(track, timeline, pct) {
+  const list = timeline?.transitions || [];
+  const duration = Number(timeline?.duration) || 0;
+
+  for (const item of list) {
+    const length = Number(item.duration) || 0;
+    const atEnd = String(item.at || "start") === "end";
+    const start = atEnd ? Math.max(0, duration - length) : 0;
+
+    const element = document.createElement("div");
+    element.className = "timeline__marker timeline__marker--transition";
+    element.dataset.itemId = String(item.id);
+    element.style.left = pct(start);
+    element.style.width = pct(Math.max(0.05, length));
+    element.title =
+      `${transitionLabel(item.kind)} ${atEnd ? "out" : "in"} — ` +
+      `${formatTimecode(start)} → ${formatTimecode(start + length)}; click to edit`;
+
+    if (state.selectedItem?.track === "transitions" && state.selectedItem.id === item.id) {
+      element.classList.add("is-active");
+    }
+
+    element.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectTimelineItem("transitions", String(item.id));
+    });
+
+    track.append(element);
+  }
+
+  return list.length;
+}
+
+/** A readable name for a transition kind, matching the inspector's own labels. */
+function transitionLabel(kind) {
+  return (
+    { fade: "Fade", "slide-left": "Slide", "wipe-left": "Wipe" }[String(kind)] || String(kind)
+  );
+}
+
 function playheadElement(duration, pct) {
   const playhead = document.createElement("div");
   playhead.className = "timeline__playhead";
@@ -1387,17 +1455,26 @@ function renderItemPanel() {
     els.itemName.textContent = "None";
     els.itemName.className = "badge badge-muted";
     els.itemStatus.textContent =
-      "Click a B-roll or sound-effect block on the timeline to edit it here.";
+      "Click a B-roll, sound-effect, or transition block on the timeline to edit it here.";
     hideItemError();
     return;
   }
 
   const { track, item } = found;
   const isBroll = track === "broll";
+  const isTransition = track === "transitions";
 
   els.itemFields.classList.remove("is-hidden");
-  els.itemName.textContent = isBroll ? `B-roll ${item.id}` : `SFX ${item.id}`;
-  els.itemName.className = isBroll ? "badge tag--broll" : "badge tag--sfx";
+  els.itemName.textContent = isTransition
+    ? `Transition ${item.id}`
+    : isBroll
+      ? `B-roll ${item.id}`
+      : `SFX ${item.id}`;
+  els.itemName.className = isTransition
+    ? "badge tag--transition"
+    : isBroll
+      ? "badge tag--broll"
+      : "badge tag--sfx";
 
   els.itemStart.value = Number(item.start || 0).toFixed(1);
   els.itemEnd.value = Number(item.end || 0).toFixed(1);
@@ -1406,20 +1483,33 @@ function renderItemPanel() {
   els.itemFit.value = item.fit || "cover";
   els.itemGain.value = String(Number(item.gain_db ?? -12));
   els.itemFade.value = Number(item.fade_seconds || 0).toFixed(2);
+  els.itemTransitionKind.value = item.kind || "fade";
+  els.itemTransitionAt.value = item.at || "start";
+  els.itemTransitionDuration.value = Number(item.duration ?? 0.5).toFixed(1);
 
   for (const [element, visible] of [
     [els.itemSourceField, isBroll],
     [els.itemPlacementField, isBroll],
     [els.itemFitField, isBroll],
-    [els.itemGainField, !isBroll],
-    [els.itemFadeField, !isBroll],
+    [els.itemGainField, !isBroll && !isTransition],
+    [els.itemFadeField, !isBroll && !isTransition],
+    [els.itemTransitionKindField, isTransition],
+    [els.itemTransitionAtField, isTransition],
+    [els.itemTransitionDurationField, isTransition],
   ]) {
     element.classList.toggle("is-hidden", !visible);
   }
 
-  els.itemStatus.textContent = isBroll
-    ? `Overlaying ${assetLabelFor(item.source)} from ${Number(item.source_start || 0).toFixed(1)}s, ${item.placement || "full"} frame, ${item.fit || "cover"}.`
-    : `Mixing ${assetLabelFor(item.asset_id)} at ${Number(item.gain_db ?? -12)} dB with a ${Number(item.fade_seconds || 0).toFixed(2)}s fade.`;
+  // A transition lives at an edge of the clip, so it has no in/out of its own.
+  els.itemStart.closest(".field").classList.toggle("is-hidden", isTransition);
+  els.itemEnd.closest(".field").classList.toggle("is-hidden", isTransition);
+
+  els.itemStatus.textContent = isTransition
+    ? `${transitionLabel(item.kind)} ${item.at === "end" ? "out of" : "into"} the clip ` +
+      `over ${Number(item.duration ?? 0).toFixed(1)}s.`
+    : isBroll
+      ? `Overlaying ${assetLabelFor(item.source)} from ${Number(item.source_start || 0).toFixed(1)}s, ${item.placement || "full"} frame, ${item.fit || "cover"}.`
+      : `Mixing ${assetLabelFor(item.asset_id)} at ${Number(item.gain_db ?? -12)} dB with a ${Number(item.fade_seconds || 0).toFixed(2)}s fade.`;
   hideItemError();
 }
 
@@ -1530,6 +1620,100 @@ async function addSfxAtPlayhead() {
   }
 }
 
+/**
+ * Add a transition to the selected clip.
+ *
+ * A transition belongs to an edge rather than a point, so there is nothing for the
+ * playhead to decide here: the kind comes from the inspector's last choice, the
+ * edge from where the playhead sits (early in the clip means "in"), and the length
+ * is half a second unless the clip is too short to hold it. The backend validates
+ * the result, so an over-long request comes back with an explanation rather than
+ * being silently clamped here and stored as something the user did not ask for.
+ */
+async function addTransition() {
+  const timeline = currentTimeline();
+  if (!timeline) return;
+
+  const duration = Number(timeline.duration) || 0;
+  if (duration < 0.6) {
+    showItemError(
+      `A transition needs more than a moment to read. This clip is ${duration.toFixed(1)}s long.`
+    );
+    return;
+  }
+
+  const kind = els.itemTransitionKind.value || "fade";
+  const at = playheadInClip() <= duration / 2 ? "start" : "end";
+  const length = round3(Math.min(0.5, duration / 2));
+
+  const saved = await saveTimeline({ transitions: [...timeline.transitions, { kind, at, duration: length }] });
+  if (saved) {
+    const added = saved.transitions[saved.transitions.length - 1];
+    selectTimelineItem("transitions", added.id);
+    log(`Added a ${transitionLabel(kind)} ${added.at === "end" ? "out of" : "into"} the clip over ${added.duration}s.`);
+  }
+}
+
+/* ------------------------------------------------------ automatic sound design */
+
+/**
+ * Mirror the saved sound-design settings into the panel.
+ *
+ * The proposals the backend computed are shown as text rather than as stored
+ * items, so an automatic effect is never a surprise: the user can see exactly what
+ * the next render would add, and switch it off.
+ */
+function renderSoundDesign(timeline) {
+  const settings = timeline?.sound_design;
+  const on = Boolean(settings?.enabled);
+
+  els.soundDesignEnabled.value = on ? "true" : "false";
+  els.soundDesignKind.value = settings?.kind || "whoosh";
+  els.soundDesignCount.value = String(settings?.max_effects ?? 2);
+
+  els.soundDesignKindField.classList.toggle("is-hidden", !on);
+  els.soundDesignCountField.classList.toggle("is-hidden", !on);
+
+  els.soundDesignState.textContent = on ? "On" : "Off";
+  els.soundDesignState.className = on ? "badge badge-ok" : "badge badge-muted";
+
+  const proposals = settings?.proposed || [];
+  if (!timeline) {
+    els.soundDesignStatus.textContent = "Select a clip to see what automatic sound design would add.";
+  } else if (!on) {
+    els.soundDesignStatus.textContent =
+      "No automatic effects will be added. The clip exports exactly as it is on screen.";
+  } else if (proposals.length === 0) {
+    els.soundDesignStatus.textContent =
+      "Nothing to mark yet — automatic effects are only placed where the picture already changes, so add a transition or B-roll first.";
+  } else {
+    els.soundDesignStatus.textContent =
+      `The next export adds ${proposals.length} ` +
+      `${proposals[0].kind === "pop" ? "pop" : "whoosh"} effect(s) at ` +
+      `${proposals.map((effect) => `${Number(effect.start).toFixed(1)}s`).join(", ")}, ` +
+      "mixed under the speech.";
+  }
+}
+
+/** Save one sound-design setting through the same validated path as any edit. */
+async function saveSoundDesign(changes) {
+  const timeline = currentTimeline();
+  if (!timeline) return;
+
+  const saved = await saveTimeline({
+    sound_design: { ...(timeline.sound_design || {}), ...changes, proposed: undefined },
+  });
+  if (saved) {
+    log(
+      changes.enabled === false
+        ? "Automatic sound design switched off."
+        : `Automatic sound design saved: up to ${changes.max_effects ?? saved.sound_design.max_effects} ${
+            saved.sound_design.kind
+          } effect(s).`
+    );
+  }
+}
+
 /** Explain what the two placement buttons will use, and why they may be off. */
 function updateTimelinePlacement() {
   const timeline = currentTimeline();
@@ -1552,6 +1736,12 @@ function updateTimelinePlacement() {
     : sfxAsset
       ? `Add '${sfxAsset.label || sfxAsset.id}' at the playhead.`
       : "Select a sound-effect asset in the local asset library first.";
+
+  els.btnAddTransition.disabled = !clip;
+  els.btnAddTransition.title = !clip
+    ? "Select a clip first — a transition belongs to the selected clip."
+    : `Add a ${transitionLabel(els.itemTransitionKind.value || "fade").toLowerCase()} at the ` +
+      `${playheadInClip() <= (Number(timeline?.duration) || 0) / 2 ? "start" : "end"}.`;
 
   if (!isRealProject()) {
     els.timelinePlacement.textContent =
@@ -1586,6 +1776,17 @@ function paintTimelineStatus(timeline, duration) {
   else notes.push("captions off");
   notes.push(`${timeline.broll.length} B-roll item(s)`);
   notes.push(`${timeline.sfx.length} effect(s)`);
+  if (timeline.transitions.length) {
+    notes.push(
+      `${timeline.transitions.length} transition(s): ` +
+        timeline.transitions.map((item) => `${transitionLabel(item.kind).toLowerCase()} ${
+          item.at === "end" ? "out" : "in"
+        }`).join(", ")
+    );
+  }
+  if (timeline.sound_design?.enabled) {
+    notes.push(`up to ${timeline.sound_design.max_effects} automatic effect(s)`);
+  }
   els.timelineStatus.textContent = `Editing ${timeline.clip_title || timeline.clip_id}: ${notes.join(", ")}.`;
 }
 
@@ -3152,6 +3353,38 @@ els.btnTimelineIn.addEventListener("click", () => setClipEdgeFromPlayhead("in"))
 els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"));
 els.btnAddBroll.addEventListener("click", addBrollAtPlayhead);
 els.btnAddSfx.addEventListener("click", addSfxAtPlayhead);
+els.btnAddTransition.addEventListener("click", addTransition);
+
+// The transition fields edit the *selected* transition, so changing the kind is
+// also how the "+ Transition" button decides what kind to add next.
+for (const [name, field, parse] of [
+  ["itemTransitionKind", "kind", String],
+  ["itemTransitionAt", "at", String],
+  ["itemTransitionDuration", "duration", Number],
+]) {
+  els[name].addEventListener("change", () => {
+    const raw = els[name].value;
+    const value = parse === Number ? Number.parseFloat(raw) : raw;
+    if (parse === Number && !Number.isFinite(value)) {
+      showItemError(`${field} must be a number.`);
+      renderItemPanel();
+      return;
+    }
+    updateSelectedItem({ [field]: value });
+  });
+}
+
+els.itemTransitionKind.addEventListener("change", updateTimelinePlacement);
+
+els.soundDesignEnabled.addEventListener("change", () => {
+  saveSoundDesign({ enabled: els.soundDesignEnabled.value === "true" });
+});
+els.soundDesignKind.addEventListener("change", () => {
+  saveSoundDesign({ kind: els.soundDesignKind.value });
+});
+els.soundDesignCount.addEventListener("change", () => {
+  saveSoundDesign({ max_effects: Number(els.soundDesignCount.value) });
+});
 els.btnItemDelete.addEventListener("click", removeSelectedItem);
 
 // Item fields only send what changed, so the rest of the item is left as stored.

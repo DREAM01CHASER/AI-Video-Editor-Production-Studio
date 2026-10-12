@@ -24,6 +24,7 @@ from typing import Callable, Sequence
 
 from .errors import ApiError
 from .timeline import DEFAULT_FPS, normalise_fps
+from .transitions import build_transition_chain
 
 FFMPEG_BINARY = "ffmpeg"
 
@@ -222,13 +223,21 @@ def subtitle_filter_value(subtitle_name: str) -> str:
 
 
 def build_filter_chain(
-    width: int, height: int, subtitle_name: str | None = None
+    width: int,
+    height: int,
+    subtitle_name: str | None = None,
+    *,
+    duration: float = 0.0,
+    transitions: Sequence[dict] = (),
 ) -> str:
-    """Scale to cover the output, crop the centre, then draw the captions.
+    """Scale to cover the output, crop the centre, draw the captions, transition.
 
     ``force_original_aspect_ratio=increase`` followed by a centred crop keeps the
     source's aspect ratio and fills the frame without letterboxing, which is what
     a vertical short needs. No filter ever changes the audio.
+
+    Transitions come last so the clip arrives and leaves as one finished picture:
+    a fade has to cover the captions too, not just the raw source.
     """
 
     chain = (
@@ -237,6 +246,12 @@ def build_filter_chain(
     )
     if subtitle_name:
         chain = f"{chain},ass={subtitle_filter_value(subtitle_name)}"
+
+    transition_chain = build_transition_chain(
+        transitions, width=width, height=height, clip_duration=duration
+    )
+    if transition_chain:
+        chain = f"{chain},{transition_chain}"
     return chain
 
 
@@ -284,6 +299,7 @@ def build_composite_filters(
     subtitle_name: str | None = None,
     broll: Sequence[dict] = (),
     sfx: Sequence[dict] = (),
+    transitions: Sequence[dict] = (),
     source_has_audio: bool = True,
 ) -> dict[str, str]:
     """Build the filtergraph that composites one clip, its captions, and its items.
@@ -313,7 +329,13 @@ def build_composite_filters(
         )
         current = f"v{position}"
 
-    lines.append(f"[{current}]null[vout]")
+    # Transitions are applied to the *finished* picture, after the inserts are
+    # composited, so a fade covers the B-roll too instead of letting it hang on
+    # screen over black.
+    transition_chain = build_transition_chain(
+        transitions, width=width, height=height, clip_duration=duration
+    )
+    lines.append(f"[{current}]{transition_chain or 'null'}[vout]")
 
     audio_labels: list[str] = []
     if source_has_audio:
@@ -345,15 +367,30 @@ def build_composite_filters(
     audio: str | None = None
     if audio_labels:
         if len(audio_labels) == 1:
-            lines.append(f"{audio_labels[0]}anull[aout]")
+            lines.append(f"{audio_labels[0]}anull[mixed]")
         else:
             # normalize=0 keeps the speech at its recorded level: amix would
             # otherwise divide every input by the number of inputs and quieten the
             # speaker, which is the opposite of what an effect should do.
+            #
+            # `duration=first` is right when the source audio is one of the inputs,
+            # because that stream spans the whole clip. With no source audio the
+            # first input is one effect, which is only as long as the effect, so
+            # `first` would cut the mix off part-way through — silently dropping a
+            # later effect that the timeline said would be there.
+            duration_mode = "first" if source_has_audio else "longest"
             lines.append(
-                f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=first:"
-                "normalize=0[aout]"
+                f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:"
+                f"duration={duration_mode}:normalize=0[mixed]"
             )
+
+        if source_has_audio:
+            lines.append("[mixed]anull[aout]")
+        else:
+            # Without speech the mix only spans the last effect, so pad it out to
+            # the clip's length. The export then carries silent audio rather than a
+            # track that stops early and leaves the player guessing.
+            lines.append(f"[mixed]apad,atrim=end={duration:.3f}[aout]")
         audio = "[aout]"
 
     # A source with no audio track still gets its effects: the export then carries
@@ -373,6 +410,7 @@ def build_ffmpeg_command(
     subtitle_name: str | None = None,
     broll: Sequence[dict] = (),
     sfx: Sequence[dict] = (),
+    transitions: Sequence[dict] = (),
     source_has_audio: bool = True,
 ) -> list[str]:
     """Return the exact FFmpeg argument list used to render one clip.
@@ -384,6 +422,8 @@ def build_ffmpeg_command(
     With no timeline items the command stays the simple single-input form. Items
     add inputs and switch to a ``filter_complex`` graph, because overlaying an
     insert and mixing an effect needs the streams combined rather than mapped.
+    A transition on its own stays on the simple path: it is a plain video filter,
+    so it needs no extra inputs and no audio mixing.
     """
 
     duration = max(0.001, float(end) - float(start))
@@ -401,10 +441,13 @@ def build_ffmpeg_command(
             duration=duration,
             broll=broll,
             sfx=sfx,
+            transitions=transitions,
             source_has_audio=source_has_audio,
         )
 
-    chain = build_filter_chain(width, height, subtitle_name)
+    chain = build_filter_chain(
+        width, height, subtitle_name, duration=duration, transitions=transitions
+    )
 
     command = [
         FFMPEG_BINARY,
@@ -471,6 +514,7 @@ def _build_composite_command(
     duration: float,
     broll: Sequence[dict],
     sfx: Sequence[dict],
+    transitions: Sequence[dict],
     source_has_audio: bool,
 ) -> list[str]:
     """Open the clip, its inserts, and its effects as inputs to one filtergraph.
@@ -526,6 +570,7 @@ def _build_composite_command(
         subtitle_name=subtitle_name,
         broll=broll_entries,
         sfx=sfx_entries,
+        transitions=transitions,
         source_has_audio=source_has_audio,
     )
 

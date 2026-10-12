@@ -73,13 +73,20 @@ def test_shell_exposes_required_layout(tmp_path: Path) -> None:
 
 def test_shell_labels_sample_data_and_explains_export_requirements(tmp_path: Path) -> None:
     body = _client(tmp_path).get("/").text
+    # Markup is wrapped across lines, so compare against collapsed text.
+    flat = " ".join(body.split())
     assert "Demo data" in body
-    assert "Sample data is illustrative" in body
+    assert "Sample data is illustrative" in flat
     # Rendering is real now, but it renders a *selected clip*, so the button ships
     # disabled and its title says why rather than leaving a dead control.
     assert 'id="btn-export" class="btn btn-primary btn--block" type="button" disabled' in body
-    assert "Select a clip first" in body
-    assert "Rendering is not implemented yet" not in body
+    assert "Select a clip first" in flat
+    assert "Rendering is not implemented yet" not in flat
+    # No feature may be advertised before it is built, and none may still be
+    # announced as belonging to a future milestone.
+    assert "arrive with the next milestone" not in flat
+    assert "Transitions arrive with" not in flat
+    assert "Milestone 9" in flat  # the footer names the milestone that is now built
 
 
 def test_render_controls_and_result_player_are_present(tmp_path: Path) -> None:
@@ -187,6 +194,59 @@ def test_the_stock_search_panel_is_present_and_off_by_default(tmp_path: Path) ->
     assert "disabled" in body.split('id="btn-stock-search"', 1)[1][:140]
     # Nothing is downloaded before the user picks a result.
     assert "Nothing is downloaded until you press" in body
+
+
+def test_transitions_and_sound_design_have_real_controls(tmp_path: Path) -> None:
+    """Milestone 9: no control may ship that does not reach the live API."""
+
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "btn-add-transition",
+        "item-transition-kind-field",
+        "item-transition-kind",
+        "item-transition-at-field",
+        "item-transition-at",
+        "item-transition-duration-field",
+        "item-transition-duration",
+        "sound-design-controls",
+        "sound-design-enabled",
+        "sound-design-kind",
+        "sound-design-count",
+        "sound-design-state",
+        "sound-design-status",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
+
+    # Every transition the renderer implements is offered, and nothing more.
+    options = body.split('id="item-transition-kind"', 1)[1].split("</select>", 1)[0]
+    assert options.count("<option") == 3
+    for kind in ("fade", "slide-left", "wipe-left"):
+        assert f'value="{kind}"' in options
+
+    # The button ships disabled with a reason, never as a dead control.
+    assert 'id="btn-add-transition" class="btn btn-ghost" type="button" disabled' in body
+
+    # Automatic sound design is opt-in, and the interface says what it does.
+    assert 'id="sound-design-enabled" class="input"' in body
+    assert "Off — no automatic sound" in body
+    # The hint is wrapped across lines in the markup, so compare on collapsed text.
+    flat = " ".join(body.split())
+    assert "mixed under the speech" in flat
+
+
+def test_the_transition_and_sound_design_controls_are_wired_to_the_api(tmp_path: Path) -> None:
+    """A control that is never connected is worse than one that is missing."""
+
+    script = _client(tmp_path).get("/static/app.js").text
+
+    assert 'els.btnAddTransition.addEventListener("click", addTransition);' in script
+    assert 'els.soundDesignEnabled.addEventListener("change"' in script
+    assert 'els.soundDesignKind.addEventListener("change"' in script
+    assert 'els.soundDesignCount.addEventListener("change"' in script
+    # Both go through the one validated timeline save, so the project JSON and
+    # the next render can never disagree with the panel.
+    assert script.count("saveTimeline({") >= 3
+    assert "sound_design: { ...(timeline.sound_design || {}), ...changes" in script
 
 
 def test_static_assets_are_served(tmp_path: Path) -> None:

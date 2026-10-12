@@ -346,11 +346,76 @@
               <span class="field__label">Fade (s)</span>
               <input id="item-fade" class="input" type="number" min="0" step="0.05" />
             </label>
+            <label id="item-transition-kind-field" class="field is-hidden">
+              <span class="field__label">Transition</span>
+              <select id="item-transition-kind" class="input">
+                <option value="fade">Fade to black</option>
+                <option value="slide-left">Slide in from the right</option>
+                <option value="wipe-left">Wipe in from the left</option>
+              </select>
+            </label>
+            <label id="item-transition-at-field" class="field is-hidden">
+              <span class="field__label">Happens at</span>
+              <select id="item-transition-at" class="input">
+                <option value="start">The clip's start</option>
+                <option value="end">The clip's end</option>
+              </select>
+            </label>
+            <label id="item-transition-duration-field" class="field is-hidden">
+              <span class="field__label">Length (s, max 2)</span>
+              <input
+                id="item-transition-duration"
+                class="input"
+                type="number"
+                min="0.1"
+                max="2"
+                step="0.1"
+              />
+            </label>
             <button id="btn-item-delete" class="btn btn-ghost field--full" type="button">
               Remove from timeline
             </button>
           </div>
           <p id="item-error" class="processing-error is-hidden" role="alert"></p>
+        </section>
+
+        <section id="sound-design-controls" class="panel">
+          <div class="panel__heading">
+            <h2>Sound design</h2>
+            <span id="sound-design-state" class="badge badge-muted">Off</span>
+          </div>
+          <div class="field-grid">
+            <label class="field field--full">
+              <span class="field__label">Automatic effects</span>
+              <select id="sound-design-enabled" class="input">
+                <option value="false" selected>Off — no automatic sound</option>
+                <option value="true">On — mark picture changes</option>
+              </select>
+            </label>
+            <label id="sound-design-kind-field" class="field is-hidden">
+              <span class="field__label">Effect</span>
+              <select id="sound-design-kind" class="input">
+                <option value="whoosh" selected>Whoosh (a moving picture)</option>
+                <option value="pop">Pop (a single cut)</option>
+              </select>
+            </label>
+            <label id="sound-design-count-field" class="field is-hidden">
+              <span class="field__label">Maximum effects</span>
+              <select id="sound-design-count" class="input">
+                <option value="0">None</option>
+                <option value="1">1</option>
+                <option value="2" selected>2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+          </div>
+          <p class="panel__hint">
+            Effects are synthesised by FFmpeg at export time and mixed under the
+            speech, never over it. They are placed only where the picture already
+            changes, and the count is capped so an edit never turns into noise.
+          </p>
+          <p id="sound-design-status" class="panel__hint"></p>
         </section>
 
         <section id="caption-controls" class="panel">
@@ -514,6 +579,10 @@
           title="Select a clip first — items are placed on the selected clip.">
           + SFX at playhead
         </button>
+        <button id="btn-add-transition" class="btn btn-ghost" type="button" disabled
+          title="Select a clip first — a transition happens at the clip's start or end.">
+          + Transition
+        </button>
         <span id="timeline-summary" class="timeline__summary">No clip selected.</span>
       </div>
       <p id="timeline-placement" class="panel__hint"></p>
@@ -534,11 +603,11 @@
       </p>
     </section>      <footer class="app-footer">
         <p>
-          Milestone 8. Import, local transcription, clip suggestions, the editable
+          Milestone 9. Import, local transcription, clip suggestions, the editable
           timeline, local B-roll and sound effects, captions, a real captioned MP4
-          export, and optional Pexels stock search all run on this machine.
-          Sample data is illustrative. Transitions arrive with the next milestone and
-          say so rather than pretending to work.
+          export, optional Pexels stock search, and transitions with optional
+          automatic sound design all run on this machine. Sample data is
+          illustrative.
         </p>
       </footer>
 

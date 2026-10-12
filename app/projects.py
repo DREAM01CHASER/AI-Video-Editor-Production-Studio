@@ -232,6 +232,7 @@ class ProjectStore:
         caption_style: dict,
         export: dict,
         tracks: dict[str, list],
+        sound_design: dict | None = None,
     ) -> dict:
         """Write one validated timeline edit into the project document.
 
@@ -261,6 +262,8 @@ class ProjectStore:
         project["export"] = export
         timeline = dict(project.get("timeline") or {})
         timeline.update(tracks)
+        if sound_design is not None:
+            timeline["sound_design"] = sound_design
         # The timeline is stamped here so every saved edit is dated, whatever the
         # caller remembered to include.
         timeline["updated_at"] = _utcnow()
