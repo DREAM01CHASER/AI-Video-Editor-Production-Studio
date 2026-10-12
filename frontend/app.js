@@ -104,6 +104,35 @@ const els = {
   btnExport: document.getElementById("btn-export"),
   projectList: document.getElementById("project-list"),
   assetList: document.getElementById("asset-list"),
+  assetCount: document.getElementById("asset-count"),
+  assetStatus: document.getElementById("asset-status"),
+  assetError: document.getElementById("asset-error"),
+  assetSearch: document.getElementById("asset-search"),
+  assetKindFilter: document.getElementById("asset-kind-filter"),
+  assetFileInput: document.getElementById("asset-file-input"),
+  btnImportBroll: document.getElementById("btn-import-broll"),
+  btnImportSfx: document.getElementById("btn-import-sfx"),
+  btnAddBroll: document.getElementById("btn-add-broll"),
+  btnAddSfx: document.getElementById("btn-add-sfx"),
+  timelinePlacement: document.getElementById("timeline-placement"),
+  itemPanel: document.getElementById("item-panel"),
+  itemName: document.getElementById("item-name"),
+  itemStatus: document.getElementById("item-status"),
+  itemFields: document.getElementById("item-fields"),
+  itemStart: document.getElementById("item-start"),
+  itemEnd: document.getElementById("item-end"),
+  itemSourceField: document.getElementById("item-source-field"),
+  itemSourceStart: document.getElementById("item-source-start"),
+  itemPlacementField: document.getElementById("item-placement-field"),
+  itemPlacement: document.getElementById("item-placement"),
+  itemFitField: document.getElementById("item-fit-field"),
+  itemFit: document.getElementById("item-fit"),
+  itemGainField: document.getElementById("item-gain-field"),
+  itemGain: document.getElementById("item-gain"),
+  itemFadeField: document.getElementById("item-fade-field"),
+  itemFade: document.getElementById("item-fade"),
+  btnItemDelete: document.getElementById("btn-item-delete"),
+  itemError: document.getElementById("item-error"),
   processingPanel: document.getElementById("processing-panel"),
   processingMessage: document.getElementById("processing-message"),
   progressBar: document.getElementById("processing-progress"),
@@ -229,6 +258,12 @@ const state = {
   timelineSaving: false,
   //: Timeline saves run in order, so a slow response cannot overwrite a newer edit.
   timelineQueue: Promise.resolve(),
+  //: The local asset library, and which asset the next placement will use.
+  assets: [],
+  activeAssetId: null,
+  assetBusy: false,
+  //: The timeline item being edited in the inspector, as {track, id}.
+  selectedItem: null,
   export: {
     jobId: null,
     timer: null,
@@ -357,20 +392,243 @@ async function fetchProjects() {
   return state.projects;
 }
 
+/* ------------------------------------------------------- local assets */
+
+function showAssetError(message) {
+  els.assetError.textContent = message;
+  els.assetError.classList.remove("is-hidden");
+}
+
+function hideAssetError() {
+  els.assetError.textContent = "";
+  els.assetError.classList.add("is-hidden");
+}
+
+function formatAssetDuration(seconds) {
+  const value = Number(seconds) || 0;
+  return value >= 60 ? formatTimecode(value) : `${value.toFixed(1)}s`;
+}
+
+/** The asset the next “add at playhead” click will place. */
+function activeAsset() {
+  return state.assets.find((asset) => asset.id === state.activeAssetId) || null;
+}
+
+function updateAssetControls() {
+  const real = isRealProject();
+  const reason = "Import a video first — assets belong to a project.";
+
+  for (const button of [els.btnImportBroll, els.btnImportSfx]) {
+    button.disabled = !real || state.assetBusy;
+    button.title = real ? button.dataset.title || button.title : reason;
+  }
+}
+
 function renderAssetList() {
   els.assetList.replaceChildren();
-  for (const label of ["B-roll clips", "Sound effects", "Music"]) {
+
+  const query = els.assetSearch.value.trim().toLowerCase();
+  const kind = els.assetKindFilter.value;
+  const matches = state.assets.filter((asset) => {
+    if (kind && asset.kind !== kind) return false;
+    if (!query) return true;
+    const haystack = [asset.label, asset.original_name, ...(asset.tags || [])]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(query);
+  });
+
+  els.assetCount.textContent = String(state.assets.length);
+
+  for (const asset of matches) {
     const item = document.createElement("li");
-    const row = document.createElement("div");
-    row.className = "list__item";
-    const name = document.createElement("span");
-    name.textContent = label;
+    const card = document.createElement("div");
+    card.className = "asset";
+    if (asset.id === state.activeAssetId) card.classList.add("is-active");
+
+    const top = document.createElement("div");
+    top.className = "asset__top";
+    const label = document.createElement("span");
+    label.className = "asset__label";
+    label.textContent = asset.label || asset.original_name || asset.id;
+    const tag = document.createElement("span");
+    tag.className = `tag tag--${asset.kind}`;
+    tag.textContent = asset.kind === "broll" ? "B-roll" : "SFX";
+    top.append(label, tag);
+
     const meta = document.createElement("span");
-    meta.className = "list__meta";
-    meta.textContent = "0 files";
-    row.append(name, meta);
-    item.append(row);
+    meta.className = "asset__meta";
+    const bits = [formatAssetDuration(asset.duration), formatSize(asset.size_bytes)];
+    if (asset.kind === "broll" && asset.width) bits.push(`${asset.width}×${asset.height}`);
+    meta.textContent = bits.join(" · ");
+
+    card.append(top, meta);
+
+    if ((asset.tags || []).length > 0) {
+      const tags = document.createElement("div");
+      tags.className = "asset__tags";
+      for (const name of asset.tags) {
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        chip.textContent = name;
+        tags.append(chip);
+      }
+      card.append(tags);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "asset__actions";
+
+    const use = document.createElement("button");
+    use.type = "button";
+    use.className = "btn btn-ghost";
+    use.textContent = asset.id === state.activeAssetId ? "Selected" : "Select";
+    use.title = "Use this asset when adding a timeline item.";
+    use.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.activeAssetId = asset.id;
+      renderAssetList();
+      updateTimelinePlacement();
+    });
+
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "btn btn-ghost";
+    preview.textContent = "Preview";
+    preview.title = "Play this asset in the preview area.";
+    preview.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setPreviewSource(asset.url);
+      log(`Previewing asset ${asset.label || asset.id}.`);
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "btn btn-ghost";
+    // Deleting asks once more in the same place, so nothing is lost by a misclick.
+    remove.dataset.confirming = "false";
+    remove.textContent = "Delete";
+    remove.title = "Remove this asset from the project.";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (remove.dataset.confirming === "true") {
+        deleteAsset(asset);
+        return;
+      }
+      remove.dataset.confirming = "true";
+      remove.textContent = "Confirm delete";
+    });
+
+    actions.append(use, preview, remove);
+    card.append(actions);
+    item.append(card);
     els.assetList.append(item);
+  }
+
+  if (matches.length === 0) {
+    const item = document.createElement("li");
+    const hint = document.createElement("p");
+    hint.className = "panel__hint";
+    hint.textContent = state.assets.length
+      ? "No asset matches that search."
+      : isRealProject()
+        ? "No assets yet. Import your own B-roll or sound effect above."
+        : "Open or import a project to import assets into it.";
+    item.append(hint);
+    els.assetList.append(item);
+  }
+
+  updateAssetControls();
+  updateTimelinePlacement();
+}
+
+async function fetchAssets(projectId) {
+  if (!isRealProject()) {
+    state.assets = [];
+    state.activeAssetId = null;
+    renderAssetList();
+    return [];
+  }
+
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (state.project.id !== projectId) return [];
+
+    state.assets = Array.isArray(payload.assets) ? payload.assets : [];
+    if (!state.assets.some((asset) => asset.id === state.activeAssetId)) {
+      state.activeAssetId = state.assets[0]?.id ?? null;
+    }
+    hideAssetError();
+  } catch (error) {
+    state.assets = [];
+    showAssetError(`Could not list the asset library: ${error.message}`);
+  }
+
+  renderAssetList();
+  return state.assets;
+}
+
+async function importAsset(file, kind) {
+  if (!file || !isRealProject() || state.assetBusy) return;
+
+  state.assetBusy = true;
+  hideAssetError();
+  els.assetStatus.textContent = `Importing ${file.name}…`;
+  updateAssetControls();
+
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("kind", kind);
+  formData.append("label", file.name.replace(/\.[^.]+$/, ""));
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/assets`,
+      { method: "POST", body: formData }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Import failed (HTTP ${response.status}).`));
+    }
+
+    state.activeAssetId = payload.id;
+    els.assetStatus.textContent = `Imported ${payload.label} (${formatAssetDuration(payload.duration)}).`;
+    log(`Imported ${kind} asset ${payload.label}.`);
+    await fetchAssets(state.project.id);
+  } catch (error) {
+    showAssetError(error.message);
+    els.assetStatus.textContent = "The asset was not imported.";
+    log(`Error: ${error.message}`);
+  } finally {
+    state.assetBusy = false;
+    els.assetFileInput.value = "";
+    updateAssetControls();
+  }
+}
+
+async function deleteAsset(asset) {
+  if (!isRealProject()) return;
+
+  hideAssetError();
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/assets/${encodeURIComponent(asset.id)}`,
+      { method: "DELETE", headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not delete it (HTTP ${response.status}).`));
+    }
+    if (state.activeAssetId === asset.id) state.activeAssetId = null;
+    els.assetStatus.textContent = `Deleted ${asset.label || asset.id}.`;
+    log(`Deleted asset ${asset.label || asset.id}.`);
+    await fetchAssets(state.project.id);
+  } catch (error) {
+    showAssetError(error.message);
   }
 }
 
@@ -626,19 +884,22 @@ function renderTimeline() {
       paintCaptionTrack(track, timeline, pct);
     } else if (lane.kind === "broll") {
       paintItems(track, timeline?.broll, "broll", pct, {
-        empty: timeline ? "No B-roll — arrives in Milestone 7" : "Select a real clip to edit this track",
+        trackName: "broll",
+        empty: timeline
+          ? "No B-roll yet — import a clip and press “+ B-roll at playhead”"
+          : "Select a real clip to edit this track",
       });
     } else {
       // Sound effects and transitions share one audio/effects lane, so they get
       // one empty hint between them rather than one each.
-      const sfxCount = paintItems(track, timeline?.sfx, "sfx", pct);
+      const sfxCount = paintItems(track, timeline?.sfx, "sfx", pct, { trackName: "sfx" });
       const transitionCount = paintItems(track, timeline?.transitions, "transition", pct, {
         marker: true,
       });
       if (timeline && sfxCount + transitionCount === 0) {
         appendTimelineHint(
           track,
-          "No sound effects or transitions — arrive in Milestones 7 and 9"
+          "No sound effects or transitions — effects are added at the playhead, transitions arrive in Milestone 9"
         );
       } else if (!timeline) {
         appendTimelineHint(track, "Select a real clip to edit this track");
@@ -733,7 +994,7 @@ function appendTimelineHint(track, text) {
  * Returning the count lets a caller decide whether an empty hint is needed, so
  * lanes that hold two kinds of item cannot end up with two hints.
  */
-function paintItems(track, items, kind, pct, { marker = false, empty = null } = {}) {
+function paintItems(track, items, kind, pct, { marker = false, empty = null, trackName = null } = {}) {
   const list = items || [];
 
   for (const item of list) {
@@ -745,10 +1006,20 @@ function paintItems(track, items, kind, pct, { marker = false, empty = null } = 
       element.style.left = pct(start);
       element.title = `${item.kind} transition at ${formatTimecode(start)}`;
     } else {
-      element.className = `timeline__clip timeline__clip--${kind}`;
+      element.className = `timeline__clip timeline__clip--${kind} timeline__clip--item`;
+      element.dataset.itemId = String(item.id);
       element.style.left = pct(start);
       element.style.width = pct(Math.max(0.2, end - start));
-      element.title = `${kind} item ${item.id}`;
+      element.title = `${kind} item — click to edit ${formatTimecode(start)} → ${formatTimecode(end)}`;
+      if (state.selectedItem?.track === trackName && state.selectedItem.id === item.id) {
+        element.classList.add("is-active");
+      }
+      if (trackName) {
+        element.addEventListener("click", (event) => {
+          event.stopPropagation();
+          selectTimelineItem(trackName, String(item.id));
+        });
+      }
     }
     track.append(element);
   }
@@ -764,6 +1035,242 @@ function playheadElement(duration, pct) {
   const seconds = Number(els.video.currentTime) || 0;
   playhead.style.left = pct(Math.min(seconds, duration));
   return playhead;
+}
+
+/* ------------------------------------------------- timeline items */
+
+function showItemError(message) {
+  els.itemError.textContent = message;
+  els.itemError.classList.remove("is-hidden");
+}
+
+function hideItemError() {
+  els.itemError.textContent = "";
+  els.itemError.classList.add("is-hidden");
+}
+
+/** Where the playhead sits inside the selected clip, in clip-relative seconds. */
+function playheadInClip() {
+  const timeline = currentTimeline();
+  if (!timeline) return 0;
+  const source = Number(els.video.currentTime) || 0;
+  return Math.min(
+    Math.max(0, source - timeline.video.source_start),
+    Math.max(0, timeline.duration)
+  );
+}
+
+function selectTimelineItem(trackName, itemId) {
+  state.selectedItem = { track: trackName, id: itemId };
+  renderTimeline();
+  renderItemPanel();
+}
+
+function selectedTimelineItem() {
+  const selection = state.selectedItem;
+  const timeline = currentTimeline();
+  if (!selection || !timeline) return null;
+
+  const item = (timeline[selection.track] || []).find(
+    (entry) => String(entry.id) === String(selection.id)
+  );
+  return item ? { track: selection.track, item } : null;
+}
+
+function assetLabelFor(id) {
+  const asset = state.assets.find((entry) => entry.id === id);
+  if (asset) return asset.label || asset.original_name || asset.id;
+  return String(id) === "source" || String(id) === "video"
+    ? "this project's own video"
+    : String(id);
+}
+
+function renderItemPanel() {
+  const found = selectedTimelineItem();
+
+  if (!found) {
+    els.itemFields.classList.add("is-hidden");
+    els.itemName.textContent = "None";
+    els.itemName.className = "badge badge-muted";
+    els.itemStatus.textContent =
+      "Click a B-roll or sound-effect block on the timeline to edit it here.";
+    hideItemError();
+    return;
+  }
+
+  const { track, item } = found;
+  const isBroll = track === "broll";
+
+  els.itemFields.classList.remove("is-hidden");
+  els.itemName.textContent = isBroll ? `B-roll ${item.id}` : `SFX ${item.id}`;
+  els.itemName.className = isBroll ? "badge tag--broll" : "badge tag--sfx";
+
+  els.itemStart.value = Number(item.start || 0).toFixed(1);
+  els.itemEnd.value = Number(item.end || 0).toFixed(1);
+  els.itemSourceStart.value = Number(item.source_start || 0).toFixed(1);
+  els.itemPlacement.value = item.placement || "full";
+  els.itemFit.value = item.fit || "cover";
+  els.itemGain.value = String(Number(item.gain_db ?? -12));
+  els.itemFade.value = Number(item.fade_seconds || 0).toFixed(2);
+
+  for (const [element, visible] of [
+    [els.itemSourceField, isBroll],
+    [els.itemPlacementField, isBroll],
+    [els.itemFitField, isBroll],
+    [els.itemGainField, !isBroll],
+    [els.itemFadeField, !isBroll],
+  ]) {
+    element.classList.toggle("is-hidden", !visible);
+  }
+
+  els.itemStatus.textContent = isBroll
+    ? `Overlaying ${assetLabelFor(item.source)} from ${Number(item.source_start || 0).toFixed(1)}s, ${item.placement || "full"} frame, ${item.fit || "cover"}.`
+    : `Mixing ${assetLabelFor(item.asset_id)} at ${Number(item.gain_db ?? -12)} dB with a ${Number(item.fade_seconds || 0).toFixed(2)}s fade.`;
+  hideItemError();
+}
+
+/** Save one field of the selected item, keeping the rest of the track as it is. */
+async function updateSelectedItem(changes) {
+  const found = selectedTimelineItem();
+  const timeline = currentTimeline();
+  if (!found || !timeline) return;
+
+  const { track, item } = found;
+  const updated = timeline[track].map((entry) =>
+    String(entry.id) === String(item.id) ? { ...entry, ...changes } : entry
+  );
+
+  await saveTimeline({ [track]: updated });
+  renderItemPanel();
+}
+
+async function removeSelectedItem() {
+  const found = selectedTimelineItem();
+  const timeline = currentTimeline();
+  if (!found || !timeline) return;
+
+  const { track, item } = found;
+  state.selectedItem = null;
+  await saveTimeline({
+    [track]: timeline[track].filter((entry) => String(entry.id) !== String(item.id)),
+  });
+  renderItemPanel();
+}
+
+/** Place the selected asset on the B-roll track, starting at the playhead. */
+async function addBrollAtPlayhead() {
+  const timeline = currentTimeline();
+  if (!timeline) return;
+
+  const asset = activeAsset();
+  if (!asset || asset.kind !== "broll") {
+    showItemError("Select a B-roll asset in the local asset library first.");
+    return;
+  }
+
+  const start = round3(playheadInClip());
+  const room = round3(Math.max(0, timeline.duration - start));
+  const length = round3(Math.min(3, Number(asset.duration) || 3, room));
+
+  if (length < 0.5) {
+    showItemError(
+      "There is no room left in the clip for an insert. Move the playhead earlier or trim the clip."
+    );
+    return;
+  }
+
+  const item = {
+    source: asset.id,
+    source_start: 0,
+    source_end: length,
+    start,
+    end: round3(start + length),
+    placement: "full",
+    fit: "cover",
+  };
+
+  const saved = await saveTimeline({ broll: [...timeline.broll, item] });
+  if (saved) {
+    const added = saved.broll[saved.broll.length - 1];
+    selectTimelineItem("broll", added.id);
+    log(`Placed B-roll '${asset.label || asset.id}' at ${start.toFixed(1)}s.`);
+  }
+}
+
+/** Place the selected asset on the sound-effect track, starting at the playhead. */
+async function addSfxAtPlayhead() {
+  const timeline = currentTimeline();
+  if (!timeline) return;
+
+  const asset = activeAsset();
+  if (!asset || asset.kind !== "sfx") {
+    showItemError("Select a sound-effect asset in the local asset library first.");
+    return;
+  }
+
+  const start = round3(playheadInClip());
+  const room = round3(Math.max(0, timeline.duration - start));
+  const length = round3(Math.min(2, Number(asset.duration) || 2, room));
+
+  if (length < 0.2) {
+    showItemError(
+      "There is no room left in the clip for a sound effect. Move the playhead earlier or trim the clip."
+    );
+    return;
+  }
+
+  const item = {
+    asset_id: asset.id,
+    start,
+    end: round3(start + length),
+    // Default under the voice, which is why the ceiling is below full scale.
+    gain_db: -12,
+    fade_seconds: 0.15,
+  };
+
+  const saved = await saveTimeline({ sfx: [...timeline.sfx, item] });
+  if (saved) {
+    const added = saved.sfx[saved.sfx.length - 1];
+    selectTimelineItem("sfx", added.id);
+    log(`Placed sound effect '${asset.label || asset.id}' at ${start.toFixed(1)}s.`);
+  }
+}
+
+/** Explain what the two placement buttons will use, and why they may be off. */
+function updateTimelinePlacement() {
+  const timeline = currentTimeline();
+  const asset = activeAsset();
+  const clip = Boolean(timeline) && !state.timelineSaving && !state.export.jobId;
+
+  const brollAsset = asset?.kind === "broll" ? asset : null;
+  const sfxAsset = asset?.kind === "sfx" ? asset : null;
+
+  els.btnAddBroll.disabled = !clip || !brollAsset;
+  els.btnAddBroll.title = !clip
+    ? "Select a clip first — items are placed on the selected clip."
+    : brollAsset
+      ? `Add '${brollAsset.label || brollAsset.id}' at the playhead.`
+      : "Select a B-roll asset in the local asset library first.";
+
+  els.btnAddSfx.disabled = !clip || !sfxAsset;
+  els.btnAddSfx.title = !clip
+    ? "Select a clip first — items are placed on the selected clip."
+    : sfxAsset
+      ? `Add '${sfxAsset.label || sfxAsset.id}' at the playhead.`
+      : "Select a sound-effect asset in the local asset library first.";
+
+  if (!isRealProject()) {
+    els.timelinePlacement.textContent =
+      "Open an imported project to place B-roll and sound effects.";
+  } else if (!timeline) {
+    els.timelinePlacement.textContent = "Select a clip to place items on it.";
+  } else if (asset) {
+    els.timelinePlacement.textContent =
+      `Next placement uses ${asset.label || asset.id} (${asset.kind === "broll" ? "B-roll" : "SFX"}).`;
+  } else {
+    els.timelinePlacement.textContent =
+      "Select an asset in the library to place it at the playhead.";
+  }
 }
 
 function paintTimelineStatus(timeline, duration) {
@@ -784,6 +1291,7 @@ function paintTimelineStatus(timeline, duration) {
   if (timeline.captions?.enabled) notes.push(`${timeline.captions.preset} captions`);
   else notes.push("captions off");
   notes.push(`${timeline.broll.length} B-roll item(s)`);
+  notes.push(`${timeline.sfx.length} effect(s)`);
   els.timelineStatus.textContent = `Editing ${timeline.clip_title || timeline.clip_id}: ${notes.join(", ")}.`;
 }
 
@@ -812,6 +1320,9 @@ function updateTimelineControls() {
     button.disabled = !editable;
     button.title = editable ? title : reason;
   }
+
+  updateTimelinePlacement();
+  renderItemPanel();
 }
 
 /* --------------------------------------------------------- timeline edits */
@@ -828,6 +1339,7 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
     hideTimelineError();
   }
 
+
   try {
     const response = await fetch(
       `/api/projects/${encodeURIComponent(projectId)}/timeline?clip_id=${encodeURIComponent(clipId)}`,
@@ -839,6 +1351,10 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
     }
     if (state.project.id !== projectId || state.selectedId !== clipId) return null;
 
+    // A different clip brings different items, so nothing stays selected.
+    if (state.selectedItem && state.timeline?.clip_id !== payload.clip_id) {
+      state.selectedItem = null;
+    }
     state.timeline = payload;
     renderTimeline();
     setTimelineSaveState("Saved edit", "badge status-ready");
@@ -2059,6 +2575,9 @@ function projectFromServer(payload) {
 
   resetTranscript("This project has not been transcribed yet.");
   state.timeline = null;
+  state.selectedItem = null;
+  state.activeAssetId = null;
+  fetchAssets(payload.project_id);
   renderProjectList();
   renderProject();
   setPreviewSource(`/api/projects/${payload.project_id}/source`);
@@ -2098,6 +2617,10 @@ function loadDemoProject() {
   state.project = structuredClone(DEMO_PROJECT);
   state.project.hasTranscript = false;
   state.timeline = null;
+  state.selectedItem = null;
+  state.assets = [];
+  state.activeAssetId = null;
+  renderAssetList();
   state.selectedId = state.project.candidates[0]?.id ?? null;
   applyClipAnalysis(null, false);
   els.candidatesStatus.textContent = "Sample candidates — illustrative, not generated from a transcript.";
@@ -2331,6 +2854,56 @@ els.btnExportCancel.addEventListener("click", cancelExport);
 
 els.btnTimelineIn.addEventListener("click", () => setClipEdgeFromPlayhead("in"));
 els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"));
+els.btnAddBroll.addEventListener("click", addBrollAtPlayhead);
+els.btnAddSfx.addEventListener("click", addSfxAtPlayhead);
+els.btnItemDelete.addEventListener("click", removeSelectedItem);
+
+// Item fields only send what changed, so the rest of the item is left as stored.
+for (const [name, field, parse] of [
+  ["itemStart", "start", Number],
+  ["itemEnd", "end", Number],
+  ["itemSourceStart", "source_start", Number],
+  ["itemGain", "gain_db", Number],
+  ["itemFade", "fade_seconds", Number],
+  ["itemPlacement", "placement", String],
+  ["itemFit", "fit", String],
+]) {
+  els[name].addEventListener("change", () => {
+    const raw = els[name].value;
+    const value = parse === Number ? Number.parseFloat(raw) : raw;
+    if (parse === Number && !Number.isFinite(value)) {
+      showItemError(`${field} must be a number.`);
+      renderItemPanel();
+      return;
+    }
+    updateSelectedItem({ [field]: value });
+  });
+}
+
+/* --------------------------------------------------------- asset panel */
+
+els.btnImportBroll.addEventListener("click", () => {
+  if (!isRealProject() || state.assetBusy) return;
+  state.pendingAssetKind = "broll";
+  els.assetFileInput.accept =
+    "video/mp4,video/quicktime,video/x-m4v,video/x-msvideo,video/x-matroska,video/webm";
+  els.assetFileInput.click();
+});
+
+els.btnImportSfx.addEventListener("click", () => {
+  if (!isRealProject() || state.assetBusy) return;
+  state.pendingAssetKind = "sfx";
+  els.assetFileInput.accept = "audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/flac,.mp3,.wav,.m4a,.aac,.ogg,.flac";
+  els.assetFileInput.click();
+});
+
+els.assetFileInput.addEventListener("change", () => {
+  const file = els.assetFileInput.files?.[0];
+  importAsset(file, state.pendingAssetKind || "broll");
+});
+
+els.assetSearch.addEventListener("input", renderAssetList);
+els.assetKindFilter.addEventListener("change", renderAssetList);
 els.timelineRuler.addEventListener("click", seekFromRuler);
 els.timelineRuler.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") seekFromRuler(event);
@@ -2366,6 +2939,10 @@ function resetToEmptyProject() {
   state.project = { ...EMPTY_PROJECT };
   state.selectedId = null;
   state.timeline = null;
+  state.selectedItem = null;
+  state.assets = [];
+  state.activeAssetId = null;
+  renderAssetList();
   els.dataSourceBadge.textContent = "No project";
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();

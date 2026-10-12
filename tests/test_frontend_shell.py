@@ -128,6 +128,44 @@ def test_the_timeline_editor_controls_are_present(tmp_path: Path) -> None:
         assert fps in body
 
 
+def test_the_asset_library_and_item_inspector_are_present(tmp_path: Path) -> None:
+    """Milestone 7: local assets are imported, placed, and edited."""
+
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "asset-count",
+        "asset-status",
+        "asset-error",
+        "asset-search",
+        "asset-kind-filter",
+        "asset-file-input",
+        "btn-import-broll",
+        "btn-import-sfx",
+        "btn-add-broll",
+        "btn-add-sfx",
+        "timeline-placement",
+        "item-panel",
+        "item-name",
+        "item-status",
+        "item-fields",
+        "item-start",
+        "item-end",
+        "item-gain",
+        "item-fade",
+        "item-placement",
+        "item-fit",
+        "btn-item-delete",
+        "item-error",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
+
+    # Import and placement ship disabled with a reason, never as dead controls.
+    assert 'id="btn-import-broll" class="btn btn-secondary" type="button" disabled' in body
+    assert 'id="btn-import-sfx" class="btn btn-secondary" type="button" disabled' in body
+    assert 'id="btn-add-broll" class="btn btn-ghost" type="button" disabled' in body
+    assert 'id="btn-add-sfx" class="btn btn-ghost" type="button" disabled' in body
+
+
 def test_static_assets_are_served(tmp_path: Path) -> None:
     client = _client(tmp_path)
     css = client.get("/static/styles.css")

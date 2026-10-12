@@ -123,7 +123,32 @@ Milestone 6 makes the edit real and editable:
 - Changes are re-read from the backend after every save, so the interface always
   shows the saved edit rather than the attempted one.
 
-Milestones 7–10 (local B-roll and SFX, stock search, transitions, and the
+Milestone 7 adds local B-roll and sound effects:
+
+- `POST /api/projects/{project_id}/assets` imports **your own** video or audio
+  file into the project's library; `GET .../assets` searches it by kind, name, and
+  tag, `GET .../assets/{id}/file` previews it, and `DELETE .../assets/{id}` removes
+  it. An asset that the timeline still uses is refused with the track named.
+- Imports are streamed to a temporary file, probed with FFprobe, validated (a
+  B-roll asset must have video, a sound effect must have audio, and each has a
+  length limit) and only then moved into `assets/` under a **generated** name. A
+  refused or failed import leaves nothing behind, and the original filename is
+  kept only as a label — it can never become a path.
+- Nothing is discovered by scanning folders: an asset exists only because the user
+  chose that file, which is what "never use arbitrary files" means here.
+- Items are placed from the timeline at the playhead: **B-roll** overlays another
+  window of the source video or an imported clip, with placement (full frame, top
+  half, bottom half) and fit (cover or contain); **sound effects** are mixed under
+  the speech with gain and fade. Both are editable in the item inspector.
+- The mix is deliberately conservative: an effect's gain is **capped at −3 dB** and
+  defaults to −12 dB, and the graph mixes with `amix=normalize=0` so speech keeps
+  its recorded level instead of being divided down by the effect.
+- Inserts cannot overlap each other or run past the media they come from, and the
+  export only ever reads files from the project's own folder.
+- A source with no audio still gets its effects: the export then carries only the
+  sound design, and the result says so.
+
+Milestones 8–10 (stock search, transitions and automatic sound design, and the
 release pass) are still to come.
 
 ## Working directory
@@ -201,6 +226,10 @@ Stop the server with `Ctrl+C`.
 | `PATCH` | `/api/projects/{project_id}/clips` | Save edited in/out points, titles, and scores. |
 | `GET` | `/api/projects/{project_id}/captions` | Build the clip-relative caption cues for one clip. |
 | `PATCH` | `/api/projects/{project_id}/settings` | Save caption and export settings for the next render. |
+| `GET` | `/api/projects/{project_id}/assets` | Search the project's local B-roll and sound-effect library. |
+| `POST` | `/api/projects/{project_id}/assets` | Import a local file as a B-roll clip or sound effect. |
+| `GET` | `/api/projects/{project_id}/assets/{asset_id}/file` | Preview an imported asset. |
+| `DELETE` | `/api/projects/{project_id}/assets/{asset_id}` | Remove an asset that the timeline no longer uses. |
 | `GET` | `/api/projects/{project_id}/timeline` | Read the editable edit for one clip. |
 | `PATCH` | `/api/projects/{project_id}/timeline` | Save an edited timeline (clip, captions, render settings, tracks). |
 | `POST` | `/api/projects/{project_id}/render` | Render the selected clip to a captioned MP4 (`202` + job). |
@@ -240,6 +269,14 @@ validation, item and track validation, and then read the saved `project.json`
 from disk to prove an edit really was written, that a refused edit changed
 nothing, and that a project hand-edited with an item the renderer cannot draw is
 refused at render time instead of exporting something different.
+
+The asset tests cover per-kind file validation, tag handling, the search, the
+"in use" refusal, and path safety for a hand-edited asset record. The import and
+render tests write **real media** with FFmpeg: one imports a B-roll clip and a
+sound effect through the API and exports them, then measures the exported file to
+show the insert is composited only inside its own window (frame luma jumps from
+the source's level to the insert's and back) and that the effect is audible only
+inside its window (loudness against a silent source floor).
 
 The export tests include **real FFmpeg renders** of a synthesised source: they
 render a clip, measure the caption area of the output to show the captions really

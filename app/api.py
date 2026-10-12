@@ -14,11 +14,28 @@ from __future__ import annotations
 
 import re
 import shutil
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from .assets import (
+    BROLL,
+    SFX,
+    allocate_asset_path,
+    asset_from_import,
+    find_asset,
+    media_type_for,
+    normalise_kind,
+    normalise_label,
+    normalise_tags,
+    public_asset,
+    search_assets,
+    used_in_timeline,
+    validate_asset_metadata,
+    validate_asset_size,
+)
 from .captions import (
     build_cues,
     caption_summary,
@@ -32,7 +49,7 @@ from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
 from .llm import LlmSettings, make_ranker
 from .jobs import JobRegistry
-from .media import probe_video
+from .media import probe_media, probe_video
 from .projects import ProjectStore
 from .render import (
     build_ffmpeg_command,
@@ -492,6 +509,38 @@ def update_project_clips(
 # ----------------------------------------------------------------- timeline
 
 
+def _timeline_media(store: ProjectStore, project: dict, timeline: dict) -> tuple[list[dict], list[dict]]:
+    """Resolve timeline items to real files, refusing anything outside the project.
+
+    A B-roll insert may come from the project's own video (a cutaway to another
+    moment of the same source) or from an imported asset; a sound effect must come
+    from an imported asset. Nothing else is reachable, which is what "never use
+    arbitrary files" means for the renderer.
+    """
+
+    project_id = str(project.get("project_id"))
+    broll: list[dict] = []
+    sfx: list[dict] = []
+
+    for item in timeline.get("broll") or []:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "")
+        if source in {"source", "video"}:
+            path = store.source_path(project)
+        else:
+            path = store.resolve_asset_path(project_id, find_asset(project, source))
+        broll.append({**item, "path": path})
+
+    for item in timeline.get("sfx") or []:
+        if not isinstance(item, dict):
+            continue
+        path = store.resolve_asset_path(project_id, find_asset(project, item.get("asset_id")))
+        sfx.append({**item, "path": path})
+
+    return broll, sfx
+
+
 def _unsupported_tracks(timeline: dict) -> str | None:
     """Report the first non-empty track the renderer cannot honour yet.
 
@@ -590,6 +639,147 @@ def update_project_timeline(
         **_timeline_document(saved, edited_clip),
         "plan": plan,
     }
+
+
+# ------------------------------------------------------------------ assets
+
+
+@router.get("/projects/{project_id}/assets")
+def list_project_assets(
+    project_id: str,
+    request: Request,
+    kind: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+) -> dict[str, object]:
+    """List the project's imported B-roll and sound effects.
+
+    The library is searched locally: only files the user imported into this
+    project are ever returned.
+    """
+
+    project = _store(request).load(project_id)
+    assets = [asset for asset in (project.get("assets") or []) if isinstance(asset, dict)]
+    matches = search_assets(assets, query=q or "", kind=kind)
+
+    return {
+        "assets": [public_asset(asset, project_id) for asset in matches],
+        "total": len(matches),
+        "counts": {
+            BROLL: sum(1 for asset in assets if asset.get("kind") == BROLL),
+            SFX: sum(1 for asset in assets if asset.get("kind") == SFX),
+        },
+    }
+
+
+@router.post("/projects/{project_id}/assets", status_code=201)
+async def import_project_asset(
+    request: Request,
+    project_id: str,
+    file: UploadFile = File(...),
+    kind: str = Form(...),
+    label: str | None = Form(default=None),
+    tags: str | None = Form(default=None),
+) -> dict[str, object]:
+    """Import one local file into the project's asset library.
+
+    The upload is streamed to a temporary file, probed, and only then moved into
+    ``assets/`` under a generated name. A failed import leaves nothing behind and
+    never writes into the library.
+    """
+
+    store = _store(request)
+    settings = request.app.state.settings
+    project = store.load(project_id)
+
+    resolved_kind = normalise_kind(kind)
+    filename = file.filename or ""
+    validate_asset_metadata(filename, file.content_type, resolved_kind)
+    normalised_tags = normalise_tags(tags)
+
+    workspace = store.project_workspace(project_id)
+    part_path = workspace.temp / f"asset-{uuid.uuid4().hex}.part"
+    destination: Path | None = None
+
+    try:
+        written = await _stream_to_disk(file, part_path, settings.max_upload_size_bytes)
+        validate_asset_size(written, settings.max_upload_size_bytes)
+
+        metadata = probe_media(part_path)
+        asset_id = f"{resolved_kind}-{uuid.uuid4().hex[:12]}"
+        asset = asset_from_import(
+            asset_id=asset_id,
+            kind=resolved_kind,
+            label=normalise_label(label, Path(filename).stem or resolved_kind),
+            stored_name="",
+            original_name=filename,
+            tags=normalised_tags,
+            metadata=metadata,
+        )
+
+        destination = allocate_asset_path(
+            workspace.assets, resolved_kind, Path(filename).suffix.lower()
+        )
+        part_path.replace(destination)
+        asset["file"] = destination.name
+
+        assets = [a for a in (project.get("assets") or []) if isinstance(a, dict)]
+        saved = store.save_assets(project_id, [asset, *assets])
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    imported = next(
+        item for item in saved.get("assets") or [] if str(item.get("id")) == asset["id"]
+    )
+    return public_asset(imported, project_id)
+
+
+@router.get("/projects/{project_id}/assets/{asset_id}/file")
+def get_project_asset_file(project_id: str, asset_id: str, request: Request) -> FileResponse:
+    """Serve an imported asset so it can be previewed before it is placed."""
+
+    store = _store(request)
+    project = store.load(project_id)
+    asset = find_asset(project, asset_id)
+    path = store.resolve_asset_path(project_id, asset)
+    return FileResponse(path, media_type=media_type_for(path), filename=path.name)
+
+
+@router.delete("/projects/{project_id}/assets/{asset_id}")
+def delete_project_asset(project_id: str, asset_id: str, request: Request) -> dict[str, object]:
+    """Remove an asset from the library and from disk.
+
+    An asset that is on the timeline is refused rather than removed underneath the
+    edit: the user is told which track still uses it.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    asset = find_asset(project, asset_id)
+
+    used = used_in_timeline(project, asset_id)
+    if used:
+        raise ApiError(
+            "asset_in_use",
+            f"'{asset.get('label')}' is still used by the {', '.join(used)} track. "
+            "Remove it from the timeline first.",
+            409,
+        )
+
+    path = store.resolve_asset_path(project_id, asset)
+    remaining = [
+        item
+        for item in (project.get("assets") or [])
+        if isinstance(item, dict) and str(item.get("id")) != asset_id
+    ]
+    store.save_assets(project_id, remaining)
+    path.unlink(missing_ok=True)
+
+    return {"deleted": asset_id, "assets": [public_asset(a, project_id) for a in remaining]}
 
 
 # ------------------------------------------------------- captions and export
@@ -851,6 +1041,15 @@ def start_render(
     workspace = store.project_workspace(project_id)
     segments = _transcript_segments(store, project)
 
+    # Timeline items become real inputs here, so a missing asset fails before the
+    # render starts rather than halfway through it.
+    broll_items, sfx_items = _timeline_media(store, project, timeline)
+    source_has_audio = True
+    if broll_items or sfx_items:
+        # Whether the source has audio changes how the graph is built, so it is
+        # measured rather than assumed: a video-only source must still render.
+        source_has_audio = probe_media(source_path).has_audio
+
     clip_id = str(clip.get("id"))
     clip_start = float(clip.get("source_start") or 0.0)
     clip_end = float(clip.get("source_end") or 0.0)
@@ -874,6 +1073,19 @@ def start_render(
     notes = list(plan["notes"])
     if plan["caption_mode"] == "burn" and not cues:
         notes.append(str(caption_plan["summary"]["note"]))
+    if broll_items:
+        notes.append(
+            f"{len(broll_items)} B-roll insert(s) are composited over the clip; "
+            "the spoken audio is unchanged."
+        )
+    if sfx_items:
+        notes.append(
+            f"{len(sfx_items)} sound effect(s) are mixed under the speech at a level "
+            "that cannot exceed it."
+            if source_has_audio
+            else f"This clip has no audio track, so the export carries only the "
+            f"{len(sfx_items)} sound effect(s)."
+        )
 
     job = registry.create(RENDER_JOB_KIND, subject=project_id)
 
@@ -892,6 +1104,9 @@ def start_render(
             height=int(plan["height"]),
             fps=int(plan["fps"]),
             subtitle_name=subtitle_name if burning else None,
+            broll=broll_items,
+            sfx=sfx_items,
+            source_has_audio=source_has_audio,
         )
 
         try:
@@ -952,6 +1167,8 @@ def start_render(
             "aspect_ratio": plan["aspect_ratio"],
             "caption_mode": plan["caption_mode"],
             "fps": plan["fps"],
+            "broll_count": len(broll_items),
+            "sfx_count": len(sfx_items),
             "caption_preset": style["preset"],
             "caption_style": style,
             "cue_count": len(cues),

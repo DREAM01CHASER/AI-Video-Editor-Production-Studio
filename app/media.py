@@ -39,6 +39,30 @@ class VideoMetadata:
         }
 
 
+@dataclass(frozen=True)
+class MediaMetadata:
+    """What an imported asset needs: how long it is, and whether it has video."""
+
+    duration: float
+    size_bytes: int
+    width: int
+    height: int
+    fps: float
+    has_video: bool
+    has_audio: bool
+
+    def as_dict(self) -> dict[str, float | int | bool]:
+        return {
+            "duration": self.duration,
+            "size_bytes": self.size_bytes,
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "has_video": self.has_video,
+            "has_audio": self.has_audio,
+        }
+
+
 def ffprobe_available() -> bool:
     """Report whether FFprobe can be found on PATH."""
 
@@ -121,8 +145,53 @@ def metadata_from_probe(payload: dict, size_bytes: int) -> VideoMetadata:
     )
 
 
-def probe_video(path: Path) -> VideoMetadata:
-    """Read metadata for a local video file using FFprobe."""
+def metadata_from_media_probe(payload: dict, size_bytes: int) -> MediaMetadata:
+    """Turn an FFprobe payload into :class:`MediaMetadata`.
+
+    Unlike :func:`metadata_from_probe` this does not require a video stream, so the
+    same call describes an audio-only sound effect and a B-roll clip.
+    """
+
+    streams = [s for s in (payload.get("streams") or []) if isinstance(s, dict)]
+    video = _first_video_stream(payload)
+    has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+
+    container = payload.get("format") or {}
+    duration = _positive_float(container.get("duration"))
+    if duration == 0.0:
+        for stream in streams:
+            duration = _positive_float(stream.get("duration"))
+            if duration:
+                break
+
+    if duration == 0.0 and video is None and not has_audio:
+        raise ApiError(
+            "unreadable_media",
+            "The file contains no readable audio or video stream.",
+            status_code=422,
+        )
+
+    return MediaMetadata(
+        duration=round(duration, 3),
+        size_bytes=int(size_bytes),
+        width=int((video or {}).get("width") or 0),
+        height=int((video or {}).get("height") or 0),
+        fps=parse_frame_rate((video or {}).get("avg_frame_rate"))
+        or parse_frame_rate((video or {}).get("r_frame_rate")),
+        has_video=video is not None,
+        has_audio=has_audio,
+    )
+
+
+def probe_media(path: Path) -> MediaMetadata:
+    """Read duration and stream information for any local media file."""
+
+    payload = _run_ffprobe(path)
+    return metadata_from_media_probe(payload, size_bytes=path.stat().st_size)
+
+
+def _run_ffprobe(path: Path) -> dict:
+    """Run FFprobe and return the parsed JSON, with clear failures."""
 
     if not ffprobe_available():
         raise ApiError(
@@ -158,7 +227,7 @@ def probe_video(path: Path) -> VideoMetadata:
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise ApiError(
-            "probe_timeout", "Reading this video's metadata timed out.", status_code=504
+            "probe_timeout", "Reading this file's metadata timed out.", status_code=504
         ) from exc
 
     if completed.returncode != 0:
@@ -169,10 +238,15 @@ def probe_video(path: Path) -> VideoMetadata:
         )
 
     try:
-        payload = json.loads(completed.stdout or "{}")
+        return json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
         raise ApiError(
             "unreadable_media", "FFprobe returned output that could not be parsed.", status_code=422
         ) from exc
 
+
+def probe_video(path: Path) -> VideoMetadata:
+    """Read metadata for a local video file using FFprobe."""
+
+    payload = _run_ffprobe(path)
     return metadata_from_probe(payload, size_bytes=path.stat().st_size)

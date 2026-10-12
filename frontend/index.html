@@ -57,15 +57,45 @@
           <ul id="project-list" class="list"></ul>
         </section>
 
-        <section class="panel">
+        <section class="panel" id="asset-panel">
           <div class="panel__heading">
             <h2>Local assets</h2>
-            <span class="badge badge-muted">Empty</span>
+            <span id="asset-count" class="badge badge-muted">0</span>
           </div>
-          <ul id="asset-list" class="list list--muted"></ul>
-          <p class="panel__hint">
-            B-roll and sound effects become selectable in a later milestone.
+
+          <input id="asset-file-input" type="file" hidden />
+          <div class="asset-actions">
+            <button id="btn-import-broll" class="btn btn-secondary" type="button" disabled
+              title="Import a video first — assets belong to a project.">
+              Import B-roll
+            </button>
+            <button id="btn-import-sfx" class="btn btn-secondary" type="button" disabled
+              title="Import a video first — assets belong to a project.">
+              Import SFX
+            </button>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span class="field__label">Search</span>
+              <input id="asset-search" class="input" type="search" placeholder="name or tag" />
+            </label>
+            <label class="field">
+              <span class="field__label">Kind</span>
+              <select id="asset-kind-filter" class="input">
+                <option value="" selected>All assets</option>
+                <option value="broll">B-roll</option>
+                <option value="sfx">Sound effects</option>
+              </select>
+            </label>
+          </div>
+
+          <ul id="asset-list" class="list assets"></ul>
+          <p id="asset-status" class="panel__hint">
+            Import your own B-roll and sound effects — only files you choose are used,
+            and they stay inside this project's folder.
           </p>
+          <p id="asset-error" class="processing-error is-hidden" role="alert"></p>
         </section>
       </aside>
 
@@ -224,6 +254,58 @@
           </p>
         </section>
 
+        <section id="item-panel" class="panel">
+          <div class="panel__heading">
+            <h2>Timeline item</h2>
+            <span id="item-name" class="badge badge-muted">None</span>
+          </div>
+          <p id="item-status" class="panel__hint">
+            Click a B-roll or sound-effect block on the timeline to edit it here.
+          </p>
+
+          <div id="item-fields" class="field-grid is-hidden">
+            <label class="field">
+              <span class="field__label">Starts at (s)</span>
+              <input id="item-start" class="input" type="number" min="0" step="0.1" />
+            </label>
+            <label class="field">
+              <span class="field__label">Ends at (s)</span>
+              <input id="item-end" class="input" type="number" min="0" step="0.1" />
+            </label>
+            <label id="item-source-field" class="field is-hidden">
+              <span class="field__label">Source from (s)</span>
+              <input id="item-source-start" class="input" type="number" min="0" step="0.1" />
+            </label>
+            <label id="item-placement-field" class="field is-hidden">
+              <span class="field__label">Placement</span>
+              <select id="item-placement" class="input">
+                <option value="full" selected>Full frame</option>
+                <option value="top">Top half</option>
+                <option value="bottom">Bottom half</option>
+              </select>
+            </label>
+            <label id="item-fit-field" class="field is-hidden">
+              <span class="field__label">Fit</span>
+              <select id="item-fit" class="input">
+                <option value="cover" selected>Cover (fill and crop)</option>
+                <option value="contain">Contain (fit inside)</option>
+              </select>
+            </label>
+            <label id="item-gain-field" class="field is-hidden">
+              <span class="field__label">Gain (dB, max −3)</span>
+              <input id="item-gain" class="input" type="number" min="-60" max="-3" step="1" />
+            </label>
+            <label id="item-fade-field" class="field is-hidden">
+              <span class="field__label">Fade (s)</span>
+              <input id="item-fade" class="input" type="number" min="0" step="0.05" />
+            </label>
+            <button id="btn-item-delete" class="btn btn-ghost field--full" type="button">
+              Remove from timeline
+            </button>
+          </div>
+          <p id="item-error" class="processing-error is-hidden" role="alert"></p>
+        </section>
+
         <section id="caption-controls" class="panel">
           <div class="panel__heading">
             <h2>Captions</h2>
@@ -377,8 +459,17 @@
           title="Select a clip first — the out point is inside the selected clip.">
           Set out at playhead ⟧
         </button>
+        <button id="btn-add-broll" class="btn btn-ghost" type="button" disabled
+          title="Select a clip first — items are placed on the selected clip.">
+          + B-roll at playhead
+        </button>
+        <button id="btn-add-sfx" class="btn btn-ghost" type="button" disabled
+          title="Select a clip first — items are placed on the selected clip.">
+          + SFX at playhead
+        </button>
         <span id="timeline-summary" class="timeline__summary">No clip selected.</span>
       </div>
+      <p id="timeline-placement" class="panel__hint"></p>
 
       <p id="timeline-status" class="processing-message">
         Select a clip to load its edit from the saved project.
@@ -396,10 +487,10 @@
       </p>
     </section>      <footer class="app-footer">
         <p>
-          Milestone 6. Import, local transcription, clip suggestions, the editable
-          timeline, captions, and a real captioned MP4 export all run on this machine.
-          Sample data is illustrative; B-roll, sound effects, and transitions land in
-          later milestones and their tracks say so rather than pretending to work.
+          Milestone 7. Import, local transcription, clip suggestions, the editable
+          timeline, local B-roll and sound effects, captions, and a real captioned MP4
+          export all run on this machine. Sample data is illustrative; stock search and
+          transitions land in later milestones and say so rather than pretending to work.
         </p>
       </footer>
 

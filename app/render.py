@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .errors import ApiError
 from .timeline import DEFAULT_FPS, normalise_fps
@@ -240,6 +240,127 @@ def build_filter_chain(
     return chain
 
 
+#: FFmpeg wants an explicit layout when mixing, so effects are converted to it.
+SFX_SAMPLE_RATE = 48000
+
+
+def broll_box(item: dict, width: int, height: int) -> tuple[int, int, int]:
+    """The pixel box a B-roll insert fills, and the y position it sits at."""
+
+    placement = str(item.get("placement") or "full")
+    if placement == "top":
+        return width, height // 2, 0
+    if placement == "bottom":
+        box_h = height // 2
+        return width, box_h, height - box_h
+    return width, height, 0
+
+
+def broll_fit_filter(item: dict, box_width: int, box_height: int) -> str:
+    """Scale an insert into its box: filling it, or fitting inside it.
+
+    ``cover`` scales the insert up until it covers the box and crops the overhang,
+    which is what a full-frame cutaway wants. ``contain`` fits the whole insert
+    inside the box and pads the difference, which is what a portrait clip inserted
+    into a 9:16 frame wants when nothing may be cut off.
+    """
+
+    if str(item.get("fit") or "cover") == "contain":
+        return (
+            f"scale={box_width}:{box_height}:force_original_aspect_ratio=decrease,"
+            f"pad={box_width}:{box_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+        )
+    return (
+        f"scale={box_width}:{box_height}:force_original_aspect_ratio=increase,"
+        f"crop={box_width}:{box_height},setsar=1"
+    )
+
+
+def build_composite_filters(
+    *,
+    width: int,
+    height: int,
+    duration: float,
+    subtitle_name: str | None = None,
+    broll: Sequence[dict] = (),
+    sfx: Sequence[dict] = (),
+    source_has_audio: bool = True,
+) -> dict[str, str]:
+    """Build the filtergraph that composites one clip, its captions, and its items.
+
+    ``broll`` and ``sfx`` entries carry the FFmpeg input index each item was opened
+    as, so the graph only refers to inputs that really exist. Returning the graph
+    and the two output labels (instead of a finished argument list) keeps it
+    readable in a test and impossible to confuse with a shell command.
+    """
+
+    lines: list[str] = []
+    base = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
+    if subtitle_name:
+        base = f"{base},ass={subtitle_filter_value(subtitle_name)}"
+    lines.append(f"[0:v]{base}[vbase]")
+
+    current = "vbase"
+    for position, entry in enumerate(broll, start=1):
+        item = entry["item"]
+        box_width, box_height, box_y = broll_box(item, width, height)
+        lines.append(f"[{entry['index']}:v]{broll_fit_filter(item, box_width, box_height)}[b{position}]")
+        start = float(item.get("start") or 0.0)
+        end = float(item.get("end") or 0.0)
+        lines.append(
+            f"[{current}][b{position}]overlay=0:{box_y}:"
+            f"enable='between(t,{start:.3f},{end:.3f})'[v{position}]"
+        )
+        current = f"v{position}"
+
+    lines.append(f"[{current}]null[vout]")
+
+    audio_labels: list[str] = []
+    if source_has_audio:
+        lines.append("[0:a]anull[abase]")
+        audio_labels.append("[abase]")
+
+    for position, entry in enumerate(sfx, start=1):
+        item = entry["item"]
+        start = max(0.0, float(item.get("start") or 0.0))
+        length = max(0.05, float(item.get("end") or 0.0) - start)
+        gain_db = float(item.get("gain_db", -12.0))
+        gain = 10 ** (gain_db / 20.0)
+        fade = max(0.0, min(float(item.get("fade_seconds") or 0.0), length / 2))
+
+        chain = (
+            f"atrim=0:{length:.3f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates={SFX_SAMPLE_RATE}:channel_layouts=stereo,"
+            f"volume={gain:.4f}"
+        )
+        if fade > 0:
+            chain += (
+                f",afade=t=in:st=0:d={fade:.3f},"
+                f"afade=t=out:st={max(0.0, length - fade):.3f}:d={fade:.3f}"
+            )
+        chain += f",adelay={int(round(start * 1000))}:all=1"
+        lines.append(f"[{entry['index']}:a]{chain}[s{position}]")
+        audio_labels.append(f"[s{position}]")
+
+    audio: str | None = None
+    if audio_labels:
+        if len(audio_labels) == 1:
+            lines.append(f"{audio_labels[0]}anull[aout]")
+        else:
+            # normalize=0 keeps the speech at its recorded level: amix would
+            # otherwise divide every input by the number of inputs and quieten the
+            # speaker, which is the opposite of what an effect should do.
+            lines.append(
+                f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=first:"
+                "normalize=0[aout]"
+            )
+        audio = "[aout]"
+
+    # A source with no audio track still gets its effects: the export then carries
+    # only the sound design, which is better than refusing to add any.
+    return {"graph": ";".join(lines), "video": "[vout]", "audio": audio}
+
+
 def build_ffmpeg_command(
     *,
     source_path: Path,
@@ -250,15 +371,39 @@ def build_ffmpeg_command(
     height: int,
     fps: int | None = None,
     subtitle_name: str | None = None,
+    broll: Sequence[dict] = (),
+    sfx: Sequence[dict] = (),
+    source_has_audio: bool = True,
 ) -> list[str]:
     """Return the exact FFmpeg argument list used to render one clip.
 
     Seeking with ``-ss`` **before** ``-i`` and re-encoding means the output starts
     on the requested frame without decoding the whole source first, and ``-t``
     bounds the clip even if the timestamps drift slightly.
+
+    With no timeline items the command stays the simple single-input form. Items
+    add inputs and switch to a ``filter_complex`` graph, because overlaying an
+    insert and mixing an effect needs the streams combined rather than mapped.
     """
 
     duration = max(0.001, float(end) - float(start))
+
+    if broll or sfx:
+        return _build_composite_command(
+            source_path=source_path,
+            output_path=output_path,
+            start=start,
+            end=end,
+            width=width,
+            height=height,
+            fps=fps,
+            subtitle_name=subtitle_name,
+            duration=duration,
+            broll=broll,
+            sfx=sfx,
+            source_has_audio=source_has_audio,
+        )
+
     chain = build_filter_chain(width, height, subtitle_name)
 
     command = [
@@ -284,7 +429,14 @@ def build_ffmpeg_command(
         # The requested rate is the timeline's, not the source's.
         command += ["-r", str(int(fps))]
 
-    command += [
+    command += _output_arguments(output_path)
+    return command
+
+
+def _output_arguments(output_path: Path) -> list[str]:
+    """The encoder and container settings shared by every render."""
+
+    return [
         "-c:v",
         VIDEO_ENCODER,
         "-preset",
@@ -304,6 +456,98 @@ def build_ffmpeg_command(
         "-nostats",
         str(output_path),
     ]
+
+
+def _build_composite_command(
+    *,
+    source_path: Path,
+    output_path: Path,
+    start: float,
+    end: float,
+    width: int,
+    height: int,
+    fps: int | None,
+    subtitle_name: str | None,
+    duration: float,
+    broll: Sequence[dict],
+    sfx: Sequence[dict],
+    source_has_audio: bool,
+) -> list[str]:
+    """Open the clip, its inserts, and its effects as inputs to one filtergraph.
+
+    Each insert is seeked on its own input, so FFmpeg decodes only the seconds of
+    the asset that are actually shown, and each effect keeps its own file because
+    two effects may come from different assets.
+    """
+
+    inputs: list[str] = [
+        "-ss",
+        f"{max(0.0, float(start)):.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(source_path),
+    ]
+
+    broll_entries: list[dict] = []
+    sfx_entries: list[dict] = []
+    index = 1
+
+    for item in broll:
+        path = item.get("path")
+        if not path:
+            raise ApiError(
+                "asset_file_missing",
+                f"The B-roll item '{item.get('id')}' has no file to render.",
+                404,
+            )
+        asset_start = max(0.0, float(item.get("source_start") or 0.0))
+        length = max(0.05, float(item.get("end") or 0.0) - float(item.get("start") or 0.0))
+        inputs += ["-ss", f"{asset_start:.3f}", "-t", f"{length:.3f}", "-i", str(path)]
+        broll_entries.append({"item": item, "index": index})
+        index += 1
+
+    for item in sfx:
+        path = item.get("path")
+        if not path:
+            raise ApiError(
+                "asset_file_missing",
+                f"The sound-effect item '{item.get('id')}' has no file to render.",
+                404,
+            )
+        inputs += ["-i", str(path)]
+        sfx_entries.append({"item": item, "index": index})
+        index += 1
+
+    filters = build_composite_filters(
+        width=width,
+        height=height,
+        duration=duration,
+        subtitle_name=subtitle_name,
+        broll=broll_entries,
+        sfx=sfx_entries,
+        source_has_audio=source_has_audio,
+    )
+
+    command = [
+        FFMPEG_BINARY,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        filters["graph"],
+        "-map",
+        filters["video"],
+    ]
+
+    if filters["audio"]:
+        command += ["-map", filters["audio"]]
+
+    if fps:
+        command += ["-r", str(int(fps))]
+
+    command += _output_arguments(output_path)
     return command
 
 

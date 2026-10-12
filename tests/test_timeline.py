@@ -286,35 +286,48 @@ def test_a_transition_is_bounded_by_the_clip() -> None:
     assert "no more than 2s" in error.value.message
 
 
-@pytest.mark.parametrize("track", ["broll", "sfx", "transitions"])
-def test_a_track_the_renderer_cannot_honour_yet_is_refused_with_a_reason(track: str) -> None:
+@pytest.mark.parametrize("track", ["broll", "sfx"])
+def test_an_item_track_the_renderer_can_draw_is_accepted(track: str) -> None:
+    """Milestone 7 makes these tracks real, so an edit on them is stored."""
+
+    item = {
+        "broll": {"source": "source", "start": 1.0, "end": 2.0},
+        "sfx": {"asset_id": "a", "start": 1.0, "end": 2.0},
+    }[track]
+
+    asset = {"id": "a", "kind": "sfx", "duration": 5.0}
+    patch = apply_timeline_patch(
+        _project_document(assets=[asset]),
+        dict(CLIP),
+        {"clip_id": "clip-1", track: [item]},
+        current_style=CAPTION_STYLE,
+        current_export=EXPORT,
+    )
+
+    assert len(patch["tracks"][track]) == 1
+
+
+def test_a_track_the_renderer_cannot_honour_yet_is_refused_with_a_reason() -> None:
     """Storing an item the export would ignore would make the timeline lie.
 
     The item itself is valid — it is the *edit* that is refused until the render
     can draw it, and the message says which milestone brings it.
     """
 
-    item = {
-        "broll": {"source": "source", "start": 1.0, "end": 2.0},
-        "sfx": {"asset_id": "a", "start": 1.0, "end": 2.0},
-        "transitions": {"kind": "fade", "at": "start", "duration": 0.5},
-    }[track]
-
-    assert normalise_track_items(
-        [item], track=track, clip_duration=10.0, asset_ids={"a"}
-    )
+    item = {"kind": "fade", "at": "start", "duration": 0.5}
+    assert normalise_track_items([item], track="transitions", clip_duration=10.0, asset_ids=set())
 
     with pytest.raises(ApiError) as error:
         apply_timeline_patch(
-            _project_document(assets=[{"id": "a", "kind": "sfx"}]),
+            _project_document(),
             dict(CLIP),
-            {"clip_id": "clip-1", track: [item]},
+            {"clip_id": "clip-1", "transitions": [item]},
             current_style=CAPTION_STYLE,
             current_export=EXPORT,
         )
 
     assert error.value.code == "unsupported_track"
-    assert "Milestone" in error.value.message
+    assert "Milestone 9" in error.value.message
 
 
 # ------------------------------------------------------------------- patch
@@ -389,7 +402,8 @@ def test_the_timeline_route_returns_the_first_clip_by_default(tmp_path: Path) ->
     body = response.json()
     assert body["clip_id"] == "clip-1"
     assert body["video"]["fps"] == 30
-    assert body["tracks_not_rendered"]["broll"]
+    # Only the transition track is still waiting for its milestone.
+    assert list(body["tracks_not_rendered"]) == ["transitions"]
 
 
 def test_editing_the_timeline_changes_the_saved_project_on_disk(tmp_path: Path) -> None:
@@ -437,7 +451,7 @@ def test_a_refused_timeline_edit_changes_nothing_on_disk(tmp_path: Path) -> None
         json={
             "clip_id": "clip-1",
             "video": {"source_start": 4.0, "source_end": 12.0},
-            "broll": [{"source": "source", "start": 1.0, "end": 2.0}],
+            "transitions": [{"kind": "fade", "at": "start", "duration": 0.4}],
         },
     )
 
@@ -476,9 +490,9 @@ def test_a_hand_edited_project_with_an_unrendered_track_cannot_render(tmp_path: 
     project = store.load("abc123")
     project["timeline"] = {
         "version": 1,
-        "broll": [{"id": "broll-1", "source": "source", "start": 1.0, "end": 2.0}],
+        "broll": [],
         "sfx": [],
-        "transitions": [],
+        "transitions": [{"id": "transition-1", "kind": "fade", "at": "start", "duration": 0.5}],
     }
     store.save(project)
 
@@ -486,7 +500,7 @@ def test_a_hand_edited_project_with_an_unrendered_track_cannot_render(tmp_path: 
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "unsupported_track"
-    assert "Milestone 7" in response.json()["error"]["message"]
+    assert "Milestone 9" in response.json()["error"]["message"]
 
 
 def test_saving_render_settings_keeps_the_frame_rate(tmp_path: Path) -> None:

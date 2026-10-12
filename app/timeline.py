@@ -35,15 +35,18 @@ BROLL_FITS = ("cover", "contain")
 TRANSITION_KINDS = ("fade", "slide-left", "wipe-left")
 MAX_TRANSITION_SECONDS = 2.0
 
+#: A sound effect is mixed *under* the speech, so its gain is capped below the
+#: voice level. The cap is deliberate: an effect that can be louder than the words
+#: is how a mix ends up burying the speaker.
 SFX_MIN_GAIN_DB = -60.0
-SFX_MAX_GAIN_DB = 12.0
+SFX_MAX_GAIN_DB = -3.0
+DEFAULT_SFX_GAIN_DB = -12.0
+DEFAULT_SFX_FADE_SECONDS = 0.15
 
 #: Tracks the editor shows but the renderer cannot honour yet. Refusing an item is
 #: the honest answer: storing it and quietly dropping it from the render would make
 #: the interface lie about what the exported file contains.
 UNRENDERED_TRACKS = {
-    "broll": "B-roll items need the local asset library, which arrives with Milestone 7.",
-    "sfx": "Sound effects need the local asset library, which arrives with Milestone 7.",
     "transitions": "Transitions arrive with Milestone 9.",
 }
 
@@ -119,7 +122,12 @@ def _item_time(item: dict, field: str) -> float:
     return _number(item.get(field), field)
 
 
-def _validate_broll_item(item: dict, clip_duration: float, asset_ids: set[str]) -> dict:
+def _validate_broll_item(
+    item: dict,
+    clip_duration: float,
+    asset_ids: set[str],
+    asset_durations: dict[str, float] | None = None,
+) -> dict:
     source = str(item.get("source") or "").strip()
     if not source:
         raise ApiError(
@@ -168,6 +176,17 @@ def _validate_broll_item(item: dict, clip_duration: float, asset_ids: set[str]) 
     else:
         asset_start, asset_end = 0.0, round(end - start, 3)
 
+    # The inserted seconds have to exist in whatever the insert comes from, or the
+    # render would show black frames the timeline never mentioned.
+    limit = (asset_durations or {}).get("source" if source in {"source", "video"} else source)
+    if limit and asset_end > limit + 0.05:
+        raise ApiError(
+            "invalid_timeline",
+            f"The insert shows {asset_start:g}s → {asset_end:g}s of "
+            f"'{source}', which is only {limit:.2f}s long.",
+            422,
+        )
+
     return {
         "source": source,
         "source_start": round(asset_start, 3),
@@ -193,7 +212,7 @@ def _validate_sfx_item(item: dict, clip_duration: float, asset_ids: set[str]) ->
     start, end = _item_time(item, "start"), _item_time(item, "end")
     _check_range(start, end, clip_duration, "Sound-effect item")
 
-    gain = _number(item.get("gain_db", -6.0), "gain_db")
+    gain = _number(item.get("gain_db", DEFAULT_SFX_GAIN_DB), "gain_db")
     if not SFX_MIN_GAIN_DB <= gain <= SFX_MAX_GAIN_DB:
         raise ApiError(
             "invalid_timeline",
@@ -202,7 +221,7 @@ def _validate_sfx_item(item: dict, clip_duration: float, asset_ids: set[str]) ->
             422,
         )
 
-    fade = _number(item.get("fade_seconds", 0.0), "fade_seconds")
+    fade = _number(item.get("fade_seconds", DEFAULT_SFX_FADE_SECONDS), "fade_seconds")
     if fade < 0 or fade > (end - start):
         raise ApiError(
             "invalid_timeline",
@@ -265,6 +284,45 @@ def _check_range(start: float, end: float, clip_duration: float, label: str) -> 
         )
 
 
+def _check_asset_kinds(
+    items: Sequence[dict], asset_kinds: dict[str, str], *, field: str, expected: str
+) -> None:
+    """A B-roll insert must use a B-roll asset, and an effect a sound effect."""
+
+    for item in items:
+        asset_id = str(item.get(field) or "")
+        if asset_id in {"source", "video"}:
+            continue
+        kind = asset_kinds.get(asset_id)
+        if kind and kind != expected:
+            raise ApiError(
+                "invalid_asset",
+                f"Asset '{asset_id}' is a {kind} asset, so it cannot be used on the "
+                f"{expected} track.",
+                422,
+            )
+
+
+def _check_broll_overlaps(items: Sequence[dict]) -> None:
+    """Refuse overlapping B-roll inserts so the picture has one clear meaning.
+
+    Two overlays covering the same seconds would draw on top of each other, and
+    which one wins would be an accident of ordering rather than an edit.
+    """
+
+    ordered = sorted(items, key=lambda item: float(item["start"]))
+    for previous, current in zip(ordered, ordered[1:]):
+        if float(current["start"]) < float(previous["end"]) - 0.01:
+            raise ApiError(
+                "invalid_timeline",
+                "B-roll inserts cannot overlap: "
+                f"{previous['start']:g}s → {previous['end']:g}s and "
+                f"{current['start']:g}s → {current['end']:g}s share time. "
+                "Trim one of them first.",
+                422,
+            )
+
+
 def _assign_ids(items: Sequence[dict], prefix: str, existing: set[str]) -> list[dict]:
     """Give every item a stable, unique id, keeping ids the editor already had."""
 
@@ -292,6 +350,7 @@ def normalise_track_items(
     track: str,
     clip_duration: float,
     asset_ids: set[str],
+    asset_durations: dict[str, float] | None = None,
 ) -> list[dict]:
     """Validate one track's items, in order.
 
@@ -301,7 +360,11 @@ def normalise_track_items(
 
     items = [item for item in (raw_items or []) if isinstance(item, dict)]
     if track == "broll":
-        prepared = [_validate_broll_item(item, clip_duration, asset_ids) for item in items]
+        prepared = [
+            _validate_broll_item(item, clip_duration, asset_ids, asset_durations)
+            for item in items
+        ]
+        _check_broll_overlaps(prepared)
         return _assign_ids(prepared, "broll", set())
     if track == "sfx":
         prepared = [_validate_sfx_item(item, clip_duration, asset_ids) for item in items]
@@ -466,22 +529,34 @@ def apply_timeline_patch(
     )
 
     # --- item tracks
-    asset_ids = {
-        str(asset.get("id"))
-        for asset in (project.get("assets") or [])
-        if isinstance(asset, dict) and asset.get("id")
+    assets = [asset for asset in (project.get("assets") or []) if isinstance(asset, dict)]
+    asset_ids = {str(asset.get("id")) for asset in assets if asset.get("id")}
+    asset_kinds = {str(asset.get("id")): str(asset.get("kind")) for asset in assets}
+    asset_durations = {
+        str(asset.get("id")): float(asset.get("duration") or 0.0) for asset in assets
     }
+    asset_durations["source"] = float(
+        (project.get("source_metadata") or {}).get("duration") or 0.0
+    )
     tracks: dict[str, list] = {}
     for key in _TRACK_KEYS:
         if key in body:
             items = normalise_track_items(
-                body.get(key), track=key, clip_duration=clip_duration, asset_ids=asset_ids
+                body.get(key),
+                track=key,
+                clip_duration=clip_duration,
+                asset_ids=asset_ids,
+                asset_durations=asset_durations,
             )
             # A track the renderer cannot honour yet is refused here, at the edit
             # boundary, so the timeline can never describe an export that would
             # silently leave the item out.
             if items and key in UNRENDERED_TRACKS:
                 raise ApiError("unsupported_track", UNRENDERED_TRACKS[key], 422)
+            if key == "broll":
+                _check_asset_kinds(items, asset_kinds, field="source", expected="broll")
+            if key == "sfx":
+                _check_asset_kinds(items, asset_kinds, field="asset_id", expected="sfx")
             tracks[key] = items
 
     if not tracks:
