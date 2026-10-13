@@ -1386,7 +1386,7 @@ def start_render(
 
         srt_name = None
         if plan["write_srt"]:
-            subtitle_sidecar.write_text(to_srt(cues), encoding="utf-8")
+            subtitle_sidecar.write_text(to_srt(cues, style), encoding="utf-8")
             srt_name = subtitle_sidecar.name
 
         registry.update(job, progress=99.0, message="Saving the export…")

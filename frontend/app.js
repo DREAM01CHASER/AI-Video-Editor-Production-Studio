@@ -214,6 +214,10 @@ const els = {
   lineLength: document.getElementById("line-length"),
   captionPosition: document.getElementById("caption-position"),
   captionPositionValue: document.getElementById("caption-position-value"),
+  captionFontFamily: document.getElementById("caption-font-family"),
+  captionAnimation: document.getElementById("caption-animation"),
+  captionHighlighting: document.getElementById("caption-highlighting"),
+  captionUppercase: document.getElementById("caption-uppercase"),
   highContrast: document.getElementById("high-contrast"),
   captionPreview: document.getElementById("caption-preview"),
   captionPreviewStatus: document.getElementById("caption-preview-status"),
@@ -251,6 +255,10 @@ const RENDER_CONTROLS = [
   "highlightMode",
   "lineLength",
   "captionPosition",
+  "captionFontFamily",
+  "captionAnimation",
+  "captionHighlighting",
+  "captionUppercase",
   "highContrast",
 ];
 
@@ -2551,6 +2559,10 @@ function captionStyleFromControls() {
     high_contrast: els.highContrast.checked,
     // The user can move the captions; the backend clamps it into the safe area.
     position: Number(els.captionPosition.value),
+    font_family: els.captionFontFamily.value,
+    animation: els.captionAnimation.value,
+    highlighting: els.captionHighlighting.checked,
+    uppercase: els.captionUppercase.checked,
   };
 }
 
@@ -2583,6 +2595,10 @@ function applyStyleToControls(style) {
   if (value.position !== undefined && value.position !== null) {
     els.captionPosition.value = String(value.position);
   }
+  if (value.font_family) els.captionFontFamily.value = value.font_family;
+  if (value.animation) els.captionAnimation.value = value.animation;
+  els.captionHighlighting.checked = value.highlighting !== false;
+  els.captionUppercase.checked = Boolean(value.uppercase);
   els.highContrast.checked = Boolean(value.high_contrast);
   updateCaptionPositionLabel();
 }
@@ -3461,7 +3477,7 @@ els.timelineRuler.addEventListener("keydown", (event) => {
 
 // Caption controls change the burned-in text, so the preview is rebuilt from the
 // backend-validated cues instead of guessing locally what will be rendered.
-for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "captionPosition", "highContrast"]) {
+for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "captionPosition", "captionFontFamily", "captionAnimation", "captionHighlighting", "captionUppercase", "highContrast"]) {
   els[name].addEventListener("change", async () => {
     updateCaptionPositionLabel();
     if (!isRealProject()) {

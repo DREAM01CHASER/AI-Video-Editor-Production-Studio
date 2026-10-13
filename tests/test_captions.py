@@ -181,6 +181,78 @@ def test_karaoke_captions_wrap_instead_of_overflowing_one_line() -> None:
     assert "\\k" in dialogue[0]
 
 
+def _cue_with_words(count: int = 4) -> dict[str, object]:
+    words = [
+        {"text": f"word{index}", "start": index * 0.4, "end": index * 0.4 + 0.4}
+        for index in range(count)
+    ]
+    return {
+        "start": 0.0,
+        "end": 2.0,
+        "text": " ".join(str(word["text"]) for word in words),
+        "words": words,
+        "lines": ["word0 word1", "word2 word3"],
+    }
+
+
+def _dialogue(body: str) -> str:
+    return [line for line in body.splitlines() if line.startswith("Dialogue:")][0]
+
+
+def test_the_three_short_form_presets_render_differently() -> None:
+    cue = _cue_with_words()
+
+    karaoke = _dialogue(to_ass([cue], style_for(preset="karaoke"), geometry_for(preset="karaoke")))
+    pop = _dialogue(to_ass([cue], style_for(preset="bold-pop"), geometry_for(preset="bold-pop")))
+    podcast = _dialogue(
+        to_ass([cue], style_for(preset="clean-podcast"), geometry_for(preset="clean-podcast"))
+    )
+
+    # Karaoke fills the colour across each word; Bold Pop switches it and springs
+    # the line into place; Clean Podcast does neither.
+    assert "\\kf" in karaoke
+    assert "\\k" in pop and "\\t(" in pop
+    assert "\\k" not in podcast and "\\t(" not in podcast
+
+
+def test_highlighting_can_be_switched_off_for_every_preset() -> None:
+    cue = _cue_with_words()
+    body = to_ass(
+        [cue],
+        style_for(preset="karaoke", highlighting=False),
+        geometry_for(preset="karaoke", highlighting=False),
+    )
+
+    assert "\\k" not in _dialogue(body)
+
+
+def test_animation_off_removes_the_pop() -> None:
+    cue = _cue_with_words()
+    body = to_ass(
+        [cue],
+        style_for(preset="bold-pop", animation="off"),
+        geometry_for(preset="bold-pop", animation="off"),
+    )
+
+    assert "\\t(" not in _dialogue(body)
+
+
+def test_uppercase_and_font_family_reach_the_subtitle() -> None:
+    cue = {"start": 0.0, "end": 1.0, "text": "hello there", "words": [], "lines": ["hello there"]}
+    style = style_for(preset="clean-podcast", uppercase=True, font_family="impact")
+    body = to_ass([cue], style, geometry_for(preset="clean-podcast", uppercase=True, font_family="impact"))
+
+    assert "HELLO THERE" in body
+    assert "Impact" in body
+
+
+def test_an_unknown_font_family_is_refused() -> None:
+    with pytest.raises(ApiError) as error:
+        normalise_style({**default_style(), "font_family": "comic"})
+
+    assert error.value.code == "invalid_caption_style"
+
+
 def test_geometry_scales_the_font_with_the_output_height() -> None:
     large = resolve_geometry(style_for(), width=1080, height=1920)
     small = resolve_geometry(style_for(), width=540, height=960)

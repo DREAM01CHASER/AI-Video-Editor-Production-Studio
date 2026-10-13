@@ -121,9 +121,27 @@ Milestone 5 makes captions and the first real export:
 - Caption timings are **shifted to clip-relative time** from the saved transcript,
   so the first cue starts at `0.0s` in the exported file. Speech is never
   invented: a segment that only partly overlaps the clip is trimmed to the clip.
-- Three presets (**Clean**, **Bold Highlight**, **Minimal**) plus font size,
-  placement, line length, highlight mode, and a high-contrast box. The preview in
-  the inspector is built from the same cues the render burns in.
+- Six presets: the original **Clean**, **Bold Highlight**, **Minimal**, and three
+  short-form looks — **Bold Pop** (the spoken word changes colour and the line
+  springs into place), **Karaoke Highlight** (the colour sweeps word by word with
+  `\kf`), and **Clean Podcast** (white text, dark outline, no colour change and no
+  animation). Bold Highlight switches colour instantly with `\k`; all three
+  highlight presets wrap their own words, so a long cue is broken across lines
+  rather than clipped at the frame edge.
+- Style controls: **font family**, **font size**, **UPPERCASE**, **word
+  highlighting on/off**, **animation level** (off / subtle / strong), **line
+  length**, **highlight mode**, a **high-contrast box**, and a **movable caption
+  position**. The position is a percentage of the frame height measured from the
+  chosen edge; it is clamped into the safe band, so the captions never touch the
+  frame border whatever it is set to, and the interface shows the reserved safe
+  area. The preview in the inspector is built from the same cues the render burns
+  in.
+- The caption layout is **resolution-independent**: font size, outlines, shadows,
+  margins, and the per-line character budget are all derived from the *output*
+  size, and the ASS is written with `PlayResX/Y` equal to the output, so 1080 ×
+  1920 and 1440 × 2560 keep the same apparent size and the same safe area.
+  Devanagari and other scripts rely on libass font fallback; when a glyph has no
+  font the export says so instead of silently dropping it.
 - Styled captions are written as **ASS** and burned in by FFmpeg; the optional
   sidecar is a real **SRT**. Subtitle serialisation uses `pysubs2` (the library
   named in `TECH_STACK.md`) and the resulting file is read back by the tests.

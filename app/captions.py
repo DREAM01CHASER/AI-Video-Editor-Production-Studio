@@ -32,18 +32,67 @@ from .errors import ApiError
 
 # --------------------------------------------------------------- style model
 
-PRESETS = ("clean", "bold-highlight", "minimal")
+PRESETS = (
+    "clean",
+    "bold-highlight",
+    "minimal",
+    # The three short-form presets. Each renders genuinely differently: a
+    # colour-and-pop active word, a progressive fill, and a plain broadcast look.
+    "bold-pop",
+    "karaoke",
+    "clean-podcast",
+)
 FONT_SIZES = ("small", "medium", "large")
 PLACEMENTS = ("bottom", "center", "top")
 HIGHLIGHT_MODES = ("outline", "shadow", "none")
 LINE_LENGTHS = ("auto", "short", "medium", "long")
+UPPERCASE_CHOICES = ("off", "uppercase")
+ANIMATION_LEVELS = ("off", "subtle", "strong")
+#: The typeface family. A generic family is used rather than a bundled font: the
+#: app ships no font files, and libass falls back through fontconfig for glyphs the
+#: chosen family does not cover, which is what lets Devanagari still render.
+FONT_FAMILIES = ("sans", "impact", "serif", "mono")
+
+#: Presets that highlight the spoken word, and how they do it.
+HIGHLIGHT_PRESETS = frozenset({"bold-highlight", "bold-pop", "karaoke"})
+#: ``\k`` switches colour instantly; ``\kf`` sweeps the colour across the word.
+KARAOKE_TAG = {"karaoke": "\\kf", "bold-pop": "\\k", "bold-highlight": "\\k"}
+#: Presets that add a pop-in. The others stay still, so "no excessive animation"
+#: is true for Clean Podcast and the plain presets whatever the level is set to.
+ANIMATED_PRESETS = frozenset({"bold-pop"})
+#: Pop-in intensity, as the starting scale of the cue before it springs to 100%.
+ANIMATION_START_SCALE = {"off": 100, "subtle": 96, "strong": 88}
+ANIMATION_MS = {"off": 0, "subtle": 150, "strong": 220}
+
+FONT_FAMILY_FONTS = {
+    "sans": "Arial",
+    "impact": "Impact",
+    "serif": "Georgia",
+    "mono": "Consolas",
+}
+
+PRESET_BOLD = {
+    "clean": True,
+    "bold-highlight": True,
+    "minimal": False,
+    "bold-pop": True,
+    "karaoke": True,
+    "clean-podcast": True,
+}
 
 #: Font size in pixels at a 1920 px tall output. Other heights scale from this so
 #: the captions keep the same apparent size relative to the frame.
 BASE_FONT_SIZE_PX = {"small": 50, "medium": 66, "large": 84}
 
 #: Extra size for presets that are meant to read bigger than the plain default.
-PRESET_SIZE_FACTOR = {"clean": 1.0, "bold-highlight": 1.05, "minimal": 0.92}
+PRESET_SIZE_FACTOR = {
+    "clean": 1.0,
+    "bold-highlight": 1.05,
+    "minimal": 0.92,
+    "bold-pop": 1.12,
+    "karaoke": 1.05,
+    "clean-podcast": 0.96,
+}
 
 #: How much of the frame is kept clear at the top and bottom. Platforms draw
 #: their own buttons, captions, and usernames there.
@@ -85,7 +134,8 @@ ASS_BOX_COLOUR = "&H00000000"
 #: what lets a Devanagari transcript still render on Windows.
 DEFAULT_FONT = "Arial"
 
-PRESET_FONT = {"clean": DEFAULT_FONT, "bold-highlight": DEFAULT_FONT, "minimal": DEFAULT_FONT}
+#: Kept for compatibility with projects that only stored a preset.
+PRESET_FONT = {preset: DEFAULT_FONT for preset in PRESETS}
 
 
 def default_style() -> dict[str, object]:
@@ -99,6 +149,10 @@ def default_style() -> dict[str, object]:
         "line_length": "auto",
         "high_contrast": False,
         "position": DEFAULT_POSITION_PERCENT,
+        "font_family": "sans",
+        "uppercase": False,
+        "highlighting": True,
+        "animation": "subtle",
     }
 
 
@@ -193,6 +247,16 @@ def normalise_style(raw: dict | None) -> dict[str, object]:
         ),
         "high_contrast": _flag(source.get("high_contrast"), bool(defaults["high_contrast"])),
         "position": _percent(source.get("position"), float(defaults["position"])),
+        "font_family": _enum(
+            source.get("font_family"), FONT_FAMILIES, "font_family", str(defaults["font_family"])
+        ),
+        "uppercase": _flag(source.get("uppercase"), bool(defaults["uppercase"])),
+        "highlighting": _flag(
+            source.get("highlighting"), bool(defaults["highlighting"])
+        ),
+        "animation": _enum(
+            source.get("animation"), ANIMATION_LEVELS, "animation", str(defaults["animation"])
+        ),
     }
     return style
 
@@ -594,31 +658,65 @@ def _ass_text(cue: dict[str, object], style: dict[str, object], geometry: Captio
     """Render one cue's text, adding karaoke highlighting when it is meaningful."""
 
     words = cue.get("words") or []
-    highlighted = str(style.get("preset")) == "bold-highlight" and len(words) > 1
+    preset = str(style.get("preset"))
+    prefix = _pop_prefix(style)
+    highlighted = (
+        bool(style.get("highlighting", True))
+        and preset in HIGHLIGHT_PRESETS
+        and len(words) > 1
+    )
 
     if highlighted:
+        # \k switches the following text from the secondary to the primary colour
+        # when its time elapses; \kf sweeps the colour across the word instead.
+        tag = KARAOKE_TAG.get(preset, "\\k")
         rendered: list[str] = []
         for group in _wrap_words(words, geometry):
             pieces: list[str] = []
             for word in group:
                 length = max(0.01, _number(word["end"]) - _number(word["start"]))
-                # \k switches the following text from the secondary to the primary
-                # colour when its time elapses: word-level highlighting in ASS.
-                pieces.append(
-                    f"{{\\k{max(1, int(round(length * 100)))}}}{_ass_escape(str(word['text']))}"
-                )
+                count = max(1, int(round(length * 100)))
+                text = _ass_escape(_display_text(str(word["text"]), style))
+                pieces.append(f"{{{tag}{count}}}{text}")
             rendered.append(" ".join(pieces))
-        return "\\N".join(rendered)
+        return prefix + "\\N".join(rendered)
 
-    return "\\N".join(_ass_escape(line) for line in cue.get("lines") or [])
+    lines = [_ass_escape(_display_text(line, style)) for line in cue.get("lines") or []]
+    return prefix + "\\N".join(lines)
 
 
 def _ass_colours(style: dict[str, object]) -> tuple[str, str]:
     """Primary and secondary colour: the second is the un-highlighted karaoke colour."""
 
-    if str(style.get("preset")) == "bold-highlight":
+    preset = str(style.get("preset"))
+    # Clean Podcast is deliberately plain: white text with a dark outline and no
+    # colour change at all, which is what makes it read on any background.
+    if preset == "clean-podcast":
+        return ASS_TEXT_COLOUR, ASS_TEXT_COLOUR
+    if preset in HIGHLIGHT_PRESETS:
         return ASS_HIGHLIGHT_COLOUR, ASS_TEXT_COLOUR
     return ASS_TEXT_COLOUR, ASS_HIGHLIGHT_COLOUR
+
+
+def _display_text(text: object, style: dict[str, object]) -> str:
+    """Apply the case choice; punctuation and scripts are left untouched."""
+
+    value = str(text or "")
+    return value.upper() if style.get("uppercase") else value
+
+
+def _pop_prefix(style: dict[str, object]) -> str:
+    """An ASS override that springs the cue from a slightly smaller scale to 100%."""
+
+    if str(style.get("preset")) not in ANIMATED_PRESETS:
+        return ""
+
+    level = str(style.get("animation", "subtle"))
+    start = ANIMATION_START_SCALE.get(level, 100)
+    duration = ANIMATION_MS.get(level, 0)
+    if start >= 100 or duration <= 0:
+        return ""
+    return f"{{\\fscx{start}\\fscy{start}\\t(0,{duration},\\fscx100\\fscy100)}}"
 
 
 def _colour(ass_value: str) -> pysubs2.Color:
@@ -674,7 +772,7 @@ def build_subtitle_file(
     primary, secondary = _ass_colours(style)
     preset = str(style.get("preset"))
     subs.styles["Default"] = pysubs2.SSAStyle(
-        fontname=PRESET_FONT.get(preset, DEFAULT_FONT),
+        fontname=FONT_FAMILY_FONTS.get(str(style.get("font_family")), DEFAULT_FONT),
         fontsize=geometry.font_size,
         primarycolor=_colour(primary),
         secondarycolor=_colour(secondary),
@@ -682,7 +780,7 @@ def build_subtitle_file(
             ASS_BOX_COLOUR if geometry.border_style == 3 else ASS_OUTLINE_COLOUR
         ),
         backcolor=_colour(ASS_BOX_COLOUR),
-        bold=preset in {"bold-highlight", "clean"},
+        bold=PRESET_BOLD.get(preset, True),
         borderstyle=geometry.border_style,
         outline=geometry.outline,
         shadow=geometry.shadow,
@@ -718,9 +816,10 @@ def to_ass(
     return build_subtitle_file(cues, style, geometry).to_string("ass")
 
 
-def to_srt(cues: Sequence[dict[str, object]]) -> str:
+def to_srt(cues: Sequence[dict[str, object]], style: dict | None = None) -> str:
     """Write cues as a plain SRT sidecar file, with override tags stripped."""
 
+    chosen = dict(style or {})
     subs = pysubs2.SSAFile()
     for cue in cues:
         lines = cue.get("lines") or wrap_text(
@@ -732,8 +831,9 @@ def to_srt(cues: Sequence[dict[str, object]]) -> str:
             pysubs2.SSAEvent(
                 start=milliseconds(cue["start"]),
                 end=milliseconds(cue["end"]),
-                # SRT has no styling, so the words go out as plain lines.
-                text="\n".join(str(line) for line in lines),
+                # SRT has no styling, but the case choice is part of the words, so
+                # it is carried over rather than left to differ from the burn-in.
+                text="\n".join(_display_text(line, chosen) for line in lines),
             )
         )
 

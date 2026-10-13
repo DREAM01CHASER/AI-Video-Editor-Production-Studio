@@ -426,6 +426,9 @@
             <label class="field field--full">
               <span class="field__label">Preset</span>
               <select id="caption-style" class="input">
+                <option value="bold-pop">Bold Pop — active word pops</option>
+                <option value="karaoke">Karaoke Highlight — word-by-word fill</option>
+                <option value="clean-podcast">Clean Podcast — plain and readable</option>
                 <option value="clean">Clean</option>
                 <option value="bold-highlight" selected>Bold Highlight</option>
                 <option value="minimal">Minimal</option>
@@ -463,6 +466,31 @@
                 <option value="medium">Medium</option>
                 <option value="long">Long</option>
               </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Font</span>
+              <select id="caption-font-family" class="input">
+                <option value="sans" selected>Sans (Arial)</option>
+                <option value="impact">Impact</option>
+                <option value="serif">Serif (Georgia)</option>
+                <option value="mono">Mono (Consolas)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Animation</span>
+              <select id="caption-animation" class="input">
+                <option value="off">Off</option>
+                <option value="subtle" selected>Subtle</option>
+                <option value="strong">Strong</option>
+              </select>
+            </label>
+            <label class="field field--check">
+              <input id="caption-highlighting" type="checkbox" checked />
+              <span class="field__label">Highlight the spoken word</span>
+            </label>
+            <label class="field field--check">
+              <input id="caption-uppercase" type="checkbox" />
+              <span class="field__label">UPPERCASE</span>
             </label>
             <label class="field field--full">
               <span class="field__label">Caption position — move it up or down</span>
