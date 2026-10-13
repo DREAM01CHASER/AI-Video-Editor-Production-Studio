@@ -21,7 +21,9 @@ from app.main import create_app
 from app.render import build_composite_filters, build_filter_chain, ffmpeg_available
 from app.sound_design import (
     AUTO_SFX_COUNT_CHOICES,
+    AUTO_SFX_DURATION_SECONDS,
     AUTO_SFX_KINDS,
+    LEAD_SECONDS,
     MAX_AUTO_SFX,
     build_synth_command,
     describe as sound_design_note,
@@ -357,10 +359,42 @@ def test_effects_land_on_picture_changes_and_nowhere_else() -> None:
     }
     effects = propose_auto_sfx(timeline, clip_duration=10.0, enabled=True)
 
-    starts = {round(float(effect["start"]) + 0.15, 2) for effect in effects}
-    # The B-roll entrance (2.0s), the B-roll exit (4.0s), and the clip's end.
-    assert starts <= {2.0, 4.0, 10.0}
-    assert 10.0 not in starts  # a marker at the clip's very end has no room to play
+    # A normal effect leads its marker by LEAD_SECONDS, so the marker is recovered
+    # from the start. The end marker is the exception: its effect is anchored to
+    # finish on the cut, so it is recovered from the effect's end.
+    markers = set()
+    for effect in effects:
+        start = float(effect["start"])
+        end = float(effect["end"])
+        if abs(end - 10.0) < 0.01:
+            markers.add(round(end, 2))
+        else:
+            markers.add(round(start + LEAD_SECONDS, 2))
+    # The B-roll entrance (2.0s), the B-roll exit (4.0s), and the clip's end (10.0s).
+    assert markers == {2.0, 4.0, 10.0}
+
+
+def test_an_end_transition_alone_still_places_an_effect() -> None:
+    """A transition at the clip's end is a picture change, so it gets an effect.
+
+    The effect must finish on the cut rather than begin there: an effect that
+    started at the clip's very end would never be heard.
+    """
+
+    effects = propose_auto_sfx(
+        {
+            "broll": [],
+            "transitions": [{"kind": "fade", "at": "end", "duration": 0.5}],
+        },
+        clip_duration=6.0,
+        enabled=True,
+    )
+
+    assert len(effects) == 1
+    effect = effects[0]
+    assert effect["end"] == 6.0
+    assert round(6.0 - float(effect["start"]), 3) == AUTO_SFX_DURATION_SECONDS
+    assert float(effect["start"]) < 6.0
 
 
 def test_sound_design_never_buries_the_speech() -> None:

@@ -185,7 +185,10 @@ def propose_auto_sfx(
     # the cap — an edit with twenty cutaways does not get twenty whooshes.
     limit = min(int(max_effects), MAX_AUTO_SFX)
     chosen: list[float] = []
-    for moment in sorted(moment for moment in moments if 0.0 < moment < clip_duration):
+    # A marker at the clip's own end counts: a transition there is still a picture
+    # change. Such an effect is anchored to finish on the cut rather than to start
+    # on it (see below), so the bound is inclusive.
+    for moment in sorted(moment for moment in moments if 0.0 < moment <= clip_duration):
         if any(abs(moment - kept) < MIN_GAP_SECONDS for kept in chosen):
             continue
         chosen.append(moment)
@@ -194,8 +197,17 @@ def propose_auto_sfx(
 
     effects: list[dict] = []
     for position, moment in enumerate(chosen, start=1):
-        start = _moment(start=moment - LEAD_SECONDS, clip_duration=clip_duration)
-        end = round(min(clip_duration, start + AUTO_SFX_DURATION_SECONDS), 3)
+        if moment >= clip_duration:
+            # An effect that began at the clip's very end would have no room to
+            # play, so anchor it to finish exactly on the last frame instead.
+            end = round(clip_duration, 3)
+            start = _moment(
+                start=clip_duration - AUTO_SFX_DURATION_SECONDS,
+                clip_duration=clip_duration,
+            )
+        else:
+            start = _moment(start=moment - LEAD_SECONDS, clip_duration=clip_duration)
+            end = round(min(clip_duration, start + AUTO_SFX_DURATION_SECONDS), 3)
         if end - start < MIN_SFX_SECONDS:
             continue
         effects.append(
