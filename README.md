@@ -4,6 +4,44 @@ Local-first, browser-based video editing assistant for turning long-form video
 into editable short-form clips. The browser is the interface and the Python API
 runs locally on the user's machine.
 
+## Quick start
+
+```powershell
+cd "$HOME\Documents\Ai video production studio\AI-Video-Editor-Production-Studio"
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Then open <http://127.0.0.1:8000/>. The health endpoint is at
+<http://127.0.0.1:8000/api/health> and the API docs at
+<http://127.0.0.1:8000/docs>. Stop with `Ctrl+C`.
+
+**FFmpeg and FFprobe must be installed and on `PATH`** (`winget install
+Gyan.FFmpeg`, then reopen PowerShell). Check with `ffmpeg -version`.
+
+Want something to try straight away? Generate a demo clip — it is built on your
+machine, so there is no download and no licence question:
+
+```powershell
+python scripts/make_demo_media.py
+```
+
+Then import `demo-media/demo-source.mp4` in the app.
+
+Both optional integrations are **off by default**. To enable them, copy the
+template and fill it in, then restart the server:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+`.env` is ignored by Git. **Never put a real key in `.env.example`** — that file
+is committed.
+
 ## Milestone status
 
 Milestone 0 established the repository and safe local foundation:
@@ -208,7 +246,71 @@ Milestone 9 adds transitions and automatic sound design:
 The controls are all wired to the live API — no button in the interface is a demo
 anymore. The sample project stays clearly labelled as sample data.
 
-Milestone 10 (the final reliability and demo pass) is still to come.
+Milestone 10 adds the release pass: a demo you can run without any media of your
+own, and an acceptance test that walks the whole workflow.
+
+- **One command builds the demo.** `python scripts/make_demo_media.py` writes a
+  narrated clip, a B-roll insert and a sound effect into `demo-media/` using only
+  FFmpeg and Windows speech synthesis. Nothing is downloaded, so the demo carries
+  no third-party licence and no media enters Git. Each scene is a distinct flat
+  colour, so trimming, B-roll compositing and transitions are all visible by eye.
+- **One test proves the whole workflow.** `tests/test_acceptance.py` walks
+  PROJECT.md's "definition of done" end to end: start the app, load the
+  interface, import a real video, transcribe it with the real Whisper model,
+  suggest clips, adjust a clip's in/out points, build captions, save an edit,
+  render, and download the result. It inspects the exported file with `ffprobe`
+  rather than trusting the API's own report, and reads the saved `project.json`
+  from disk to confirm the edit that was rendered is the edit that was saved.
+- Two more tests cover the failure messages (an invalid file, an unknown project,
+  a clip that does not exist, a path that tries to escape) and confirm the output
+  stays inside the project's own folder.
+- **`.env` is now genuinely read.** The README, `.env.example` and every
+  stock/LLM error message told you to put your keys in `.env`, but nothing ever
+  opened the file, so a configured key was silently ignored. It is read at startup
+  now, and a variable exported in your shell still wins over the file.
+
+## Known limitations
+
+Stated plainly, because a feature that is not finished should not look finished.
+
+- **No speaker diarization.** The transcript has no "who spoke when", so a
+  multi-speaker conversation is one undifferentiated stream of text.
+- **Clip scores are estimates, never predictions.** A score describes how
+  self-contained and information-dense a moment is. Nothing here predicts whether
+  a clip will perform well on a platform.
+- **Transcription runs on CPU here.** This machine has a visible NVIDIA GPU but no
+  cuBLAS runtime, so it falls back to CPU/int8 — correct, but noticeably slower
+  than the GPU path on a machine with a working CUDA runtime.
+- **Whisper does not always punctuate.** When a transcript has little sentence
+  punctuation, clip edges are described as estimates that may need a trim rather
+  than as exact sentence boundaries.
+- **Transitions are a small fixed set** (fade, slide, wipe) at the clip's start
+  or end. There is no transition *between two shots*, because a short is cut from
+  one source here.
+- **The timeline is deliberately simple.** It edits one clip at a time and has no
+  undo history, snapping, ripple editing, or a multi-clip project view.
+- **Stock B-roll needs a Pexels account**, and its licence has conditions of its
+  own — check <https://www.pexels.com/license/> before publishing, especially
+  where a clip shows a recognisable person or brand.
+- **Video is rendered by FFmpeg in software.** Hardware encoding is not wired up,
+  so a 1440 × 2560 export is slower than the 1080 × 1920 default.
+- **The LLM pass may only rewrite titles, reasons, and scores.** Clip times always
+  come from the transcript, so a hallucinated time can never reach a render.
+
+## AI tools used
+
+- **faster-whisper** (CTranslate2, OpenAI Whisper weights) for local
+  speech-to-text with word-level timestamps.
+- **An optional OpenAI-compatible LLM** for clip titles, reasons, and scores.
+  Disabled unless `LLM_API_KEY` is set, and the transparent heuristic is used
+  whenever it is unavailable.
+- **An optional Pexels API** for stock B-roll search. Disabled unless
+  `PEXELS_API_KEY` is set.
+- **FFmpeg/FFprobe** for every media operation: probing, trimming, compositing,
+  subtitle burn-in, transitions, synthesised sound effects, and export.
+
+No model is trained, no LoRA is fine-tuned, and no media is uploaded anywhere
+except to the two optional APIs you explicitly enable.
 
 ## Working directory
 

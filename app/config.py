@@ -66,6 +66,61 @@ def _text(value: str | None, default: str) -> str:
     return value.strip()
 
 
+#: The optional environment file, read at startup if it exists.
+ENV_FILENAME = ".env"
+
+
+def load_env_file(path: Path | None = None, *, override: bool = False) -> dict[str, str]:
+    """Read a simple ``KEY=VALUE`` file into the process environment.
+
+    The README, ``.env.example`` and every stock/LLM error message tell the user
+    to put their keys in ``.env``, so the file has to actually be read — without
+    this, configuring an optional key appears to work and then does nothing.
+
+    This is hand-written rather than a new dependency: the format is a handful of
+    lines, and ``TECH_STACK.md`` asks not to add a library unless it is needed.
+
+    Existing environment variables always win, so a value exported in the shell
+    still overrides the file, and anything already exported is left alone.
+    """
+
+    target = path or (PROJECT_ROOT / ENV_FILENAME)
+    loaded: dict[str, str] = {}
+
+    try:
+        raw = target.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        # A missing file is the normal case, so this is not an error worth raising.
+        return loaded
+
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.lower().startswith("export "):
+            text = text[7:].strip()
+        key, separator, value = text.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if not key:
+            continue
+
+        value = value.strip()
+        # A quoted value keeps its inner spaces and loses the quotes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        else:
+            # An unquoted value may carry a trailing comment.
+            value = value.split(" #", 1)[0].strip()
+
+        loaded[key] = value
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+    return loaded
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the local application."""
@@ -101,6 +156,10 @@ class Settings:
 
     @classmethod
     def from_environment(cls) -> "Settings":
+        # The optional keys are documented as living in `.env`, so it is read
+        # before anything is looked up. Values already exported in the shell win.
+        load_env_file()
+
         workspace_value = os.getenv("AI_VIDEO_WORKSPACE", "workspace").strip()
         workspace_dir = Path(workspace_value).expanduser()
         if not workspace_dir.is_absolute():

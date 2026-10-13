@@ -227,6 +227,29 @@ def _is_cuda_runtime_failure(exc: BaseException) -> bool:
     return "cuda" in text or "cublas" in text or "cudnn" in text
 
 
+#: Whether this machine's CUDA runtime turned out to be unusable.
+#:
+#: CTranslate2 initialises and then tears down a CUDA context per model, and on a
+#: machine with a visible GPU but no cuBLAS installed, the *second* attempt in one
+#: process can hang instead of failing. Remembering the first failure for the life
+#: of the process means the GPU is tried at most once, which is both safer and
+#: faster. The machine's runtime cannot change mid-run, so this is process-wide.
+_CUDA_RUNTIME_BROKEN = False
+
+
+def cuda_runtime_is_broken() -> bool:
+    """Whether a previous attempt proved the CUDA runtime unusable."""
+
+    return _CUDA_RUNTIME_BROKEN
+
+
+def mark_cuda_runtime_broken() -> None:
+    """Stop trying CUDA for the rest of this process."""
+
+    global _CUDA_RUNTIME_BROKEN
+    _CUDA_RUNTIME_BROKEN = True
+
+
 class TranscriptionService:
     """Owns the faster-whisper model and turns a video into a transcript."""
 
@@ -319,6 +342,14 @@ class TranscriptionService:
             device, note = resolve_device(
                 self.settings.whisper_device, cuda_device_count()
             )
+            if device == "cuda" and cuda_runtime_is_broken():
+                # A previous attempt in this process already proved the runtime
+                # unusable, so do not pay for the same failure twice.
+                device = "cpu"
+                note = (
+                    "The GPU runtime libraries are unavailable on this machine, so "
+                    "transcription runs on CPU/int8."
+                )
             compute_type = resolve_compute_type(device, self.settings.whisper_compute_type)
             notes = [note] if note else []
 
@@ -328,6 +359,7 @@ class TranscriptionService:
                 if device != "cuda":
                     raise
                 # cuDNN or cuBLAS is usually the real reason a GPU load fails.
+                mark_cuda_runtime_broken()
                 fallback_type = resolve_compute_type("cpu", self.settings.whisper_compute_type)
                 try:
                     instance = self._build_model("cpu", fallback_type)
@@ -433,6 +465,7 @@ class TranscriptionService:
             except _CudaRuntimeMissing:
                 if loaded.device != "cuda":
                     raise
+                mark_cuda_runtime_broken()
                 notes.append(
                     "The GPU runtime libraries (cuDNN/cuBLAS) are missing, so "
                     "transcription ran on CPU/int8 instead."

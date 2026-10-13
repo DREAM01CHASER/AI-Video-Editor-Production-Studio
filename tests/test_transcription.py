@@ -25,6 +25,7 @@ from app.jobs import CANCELLED, FAILED, SUCCEEDED, JobRegistry
 from app.main import create_app
 from app.projects import ProjectStore
 from app.storage import Workspace
+from app import transcription as transcription_module
 from app.transcription import (
     _is_cuda_runtime_failure,
     build_transcript_document,
@@ -170,6 +171,37 @@ def test_an_api_error_is_never_mistaken_for_a_cuda_problem() -> None:
     assert not _is_cuda_runtime_failure(
         ApiError("job_cancelled", "Transcription was cancelled.", 409)
     )
+
+
+def test_a_broken_cuda_runtime_is_remembered_for_the_rest_of_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GPU must be tried at most once.
+
+    CTranslate2 initialises and tears down a CUDA context per model. On a machine
+    with a visible GPU but no cuBLAS, the *second* attempt in one process hung
+    instead of failing, which stalled a whole test run. Once a failure has been
+    seen, later jobs go straight to CPU.
+    """
+
+    monkeypatch.setattr(transcription_module, "_CUDA_RUNTIME_BROKEN", False)
+    assert transcription_module.cuda_runtime_is_broken() is False
+
+    transcription_module.mark_cuda_runtime_broken()
+
+    assert transcription_module.cuda_runtime_is_broken() is True
+
+    # A service built afterwards must not choose CUDA again.
+    settings = Settings(
+        project_root=Path(__file__).resolve().parents[1],
+        workspace_dir=Path("unused"),
+        max_upload_size_bytes=1024,
+        whisper_device="auto",
+    )
+    service = transcription_module.TranscriptionService(settings)
+    loaded = service.load_model()
+    assert loaded.device == "cpu"
+    assert any("unavailable" in note for note in loaded.notes)
 
 
 @pytest.mark.parametrize(

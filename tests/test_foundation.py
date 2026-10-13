@@ -3,9 +3,121 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import Settings, load_env_file
 from app.main import create_app
 from app.storage import UploadValidationError, Workspace, validate_upload
+
+
+# ------------------------------------------------------------------ .env
+
+
+def test_the_env_file_is_actually_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A key in `.env` has to reach the settings, or configuring it does nothing.
+
+    The README, `.env.example` and every stock/LLM error message tell the user to
+    put their keys in `.env`. Without this the file was never opened, so the keys
+    were silently ignored and both optional features stayed switched off.
+    """
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "PEXELS_API_KEY=pexels-secret\n"
+        "LLM_API_KEY=llm-secret\n"
+        "LLM_BASE_URL=https://example.invalid/v1\n"
+        "LLM_MODEL=some-model\n",
+        encoding="utf-8",
+    )
+
+    for name in ("PEXELS_API_KEY", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+    loaded = load_env_file(env)
+
+    assert loaded["PEXELS_API_KEY"] == "pexels-secret"
+    assert loaded["LLM_API_KEY"] == "llm-secret"
+
+
+def test_the_env_file_reaches_the_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = tmp_path / ".env"
+    env.write_text("PEXELS_API_KEY=pexels-secret\nLLM_MODEL=chosen-model\n", encoding="utf-8")
+
+    for name in ("PEXELS_API_KEY", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL",
+                 "PEXELS_BASE_URL", "AI_VIDEO_WORKSPACE", "MAX_UPLOAD_SIZE_MB"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("app.config.PROJECT_ROOT", tmp_path)
+
+    settings = Settings.from_environment()
+
+    assert settings.pexels_api_key == "pexels-secret"
+    assert settings.llm_model == "chosen-model"
+
+
+def test_a_missing_env_file_is_not_an_error(tmp_path: Path) -> None:
+    """Most users have no `.env` at all, so its absence must stay silent."""
+
+    assert load_env_file(tmp_path / "does-not-exist.env") == {}
+
+
+def test_an_exported_variable_beats_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A value set in the shell must not be overwritten by the file."""
+
+    env = tmp_path / ".env"
+    env.write_text("LLM_MODEL=from-file\n", encoding="utf-8")
+    monkeypatch.setenv("LLM_MODEL", "from-shell")
+
+    loaded = load_env_file(env)
+
+    assert loaded["LLM_MODEL"] == "from-file"  # what the file says
+    import os
+
+    assert os.environ["LLM_MODEL"] == "from-shell"  # what the app actually uses
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("KEY=value", "value"),
+        ("KEY=value with spaces", "value with spaces"),
+        ("KEY='quoted value'", "quoted value"),
+        ('KEY="quoted value"', "quoted value"),
+        ("KEY=value # trailing comment", "value"),
+        ("export KEY=exported", "exported"),
+        ("  KEY=indented  ", "indented"),
+        ("KEY=", ""),
+    ],
+)
+def test_the_env_file_parses_the_shapes_people_actually_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str, expected: str
+) -> None:
+    env = tmp_path / ".env"
+    env.write_text(line + "\n", encoding="utf-8")
+    monkeypatch.delenv("KEY", raising=False)
+
+    assert load_env_file(env).get("KEY", None) == expected
+
+
+def test_comments_and_blank_lines_are_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = tmp_path / ".env"
+    env.write_text(
+        "# a comment\n"
+        "\n"
+        "   \n"
+        "REAL_KEY=real\n"
+        "no_equals_sign_here\n"
+        "=novalue\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("REAL_KEY", raising=False)
+
+    loaded = load_env_file(env)
+
+    assert loaded == {"REAL_KEY": "real"}
 
 
 def test_health_endpoint_and_frontend_load(tmp_path: Path) -> None:
