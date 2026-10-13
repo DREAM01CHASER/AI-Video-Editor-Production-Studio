@@ -41,6 +41,10 @@ logs/
 *.mp3
 *.flac
 
+# Demo media is rebuilt by scripts/make_demo_media.py rather than committed, so no
+# media and no licence question ever enters the repository.
+demo-media/
+
 # Editor and operating-system files
 .vscode/
 .idea/
