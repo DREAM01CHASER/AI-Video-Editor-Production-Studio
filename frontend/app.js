@@ -214,6 +214,13 @@ const els = {
   lineLength: document.getElementById("line-length"),
   captionPosition: document.getElementById("caption-position"),
   captionPositionValue: document.getElementById("caption-position-value"),
+  brollMode: document.getElementById("broll-mode"),
+  brollMax: document.getElementById("broll-max"),
+  btnBrollSuggest: document.getElementById("btn-broll-suggest"),
+  brollStatus: document.getElementById("broll-status"),
+  brollError: document.getElementById("broll-error"),
+  brollProposals: document.getElementById("broll-proposals"),
+  brollCount: document.getElementById("broll-count"),
   captionFontFamily: document.getElementById("caption-font-family"),
   captionAnimation: document.getElementById("caption-animation"),
   captionHighlighting: document.getElementById("caption-highlighting"),
@@ -285,6 +292,11 @@ const state = {
   captions: {
     clipId: null,
     busy: false,
+  },
+  //: Automatic B-roll proposals for the selected clip, and where they came from.
+  broll: {
+    proposals: [],
+    payload: null,
   },
   //: The composed edit for the selected clip: in/out points, captions, render
   //: settings, and the item tracks. The project JSON stays the source of truth.
@@ -1552,6 +1564,149 @@ async function removeSelectedItem() {
   renderItemPanel();
 }
 
+/* ------------------------------------------------ automatic b-roll */
+
+function showBrollError(message) {
+  els.brollError.textContent = message;
+  els.brollError.classList.remove("is-hidden");
+}
+
+function hideBrollError() {
+  els.brollError.textContent = "";
+  els.brollError.classList.add("is-hidden");
+}
+
+function updateBrollControls() {
+  els.btnBrollSuggest.disabled = !isRealProject() || !state.timeline;
+}
+
+function resetBroll(note) {
+  state.broll = { proposals: [], payload: null };
+  els.brollProposals.replaceChildren();
+  els.brollCount.textContent = "0";
+  hideBrollError();
+  els.brollStatus.textContent = note || "";
+  updateBrollControls();
+}
+
+/** Render the proposed insert times and where each one would come from. */
+function renderBrollProposals() {
+  els.brollProposals.replaceChildren();
+  const proposals = state.broll.proposals || [];
+  els.brollCount.textContent = String(proposals.length);
+
+  for (const proposal of proposals) {
+    const item = document.createElement("li");
+    item.className = "list__item";
+
+    const time = document.createElement("p");
+    time.className = "list__title";
+    time.textContent = `${Number(proposal.start).toFixed(1)}s to ${Number(proposal.end).toFixed(1)}s · ${proposal.duration}s`;
+    item.append(time);
+
+    const reason = document.createElement("p");
+    reason.className = "panel__hint";
+    reason.textContent = `${proposal.source?.label || "No source"} — ${proposal.reason}`;
+    item.append(reason);
+
+    const source = proposal.source || {};
+    if (source.type === "local") {
+      const button = document.createElement("button");
+      button.className = "btn btn-secondary";
+      button.type = "button";
+      button.textContent = "Add this insert";
+      button.addEventListener("click", () => applyBrollProposal(proposal));
+      item.append(button);
+    } else if (source.type === "online") {
+      const button = document.createElement("button");
+      button.className = "btn btn-ghost";
+      button.type = "button";
+      button.textContent = `Find stock for “${proposal.query}”`;
+      button.addEventListener("click", () => {
+        els.stockQuery.value = proposal.query;
+        searchStock();
+      });
+      item.append(button);
+    }
+
+    els.brollProposals.append(item);
+  }
+}
+
+/** Ask the backend where B-roll should go, for how long, and from where. */
+async function suggestBroll() {
+  if (!isRealProject() || !state.timeline) return;
+  hideBrollError();
+  els.btnBrollSuggest.disabled = true;
+  els.brollStatus.textContent = "Reading the transcript…";
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/broll/propose`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          clip_id: state.timeline.clip_id,
+          mode: els.brollMode.value,
+          max_items: Number(els.brollMax.value) || 3,
+        }),
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not suggest B-roll (HTTP ${response.status}).`));
+    }
+
+    state.broll = { proposals: payload.items || [], payload };
+    renderBrollProposals();
+    els.brollStatus.textContent = [payload.note, payload.stock_note]
+      .filter(Boolean)
+      .join(" ");
+  } catch (error) {
+    showBrollError(error.message);
+    els.brollStatus.textContent = "";
+  } finally {
+    updateBrollControls();
+  }
+}
+
+/** Place one accepted proposal through the validated timeline path. */
+async function applyBrollProposal(proposal) {
+  if (!isRealProject() || !state.timeline) return;
+  hideBrollError();
+  els.btnBrollSuggest.disabled = true;
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/broll/apply`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          clip_id: state.timeline.clip_id,
+          items: [{
+            asset_id: proposal.source?.asset_id,
+            start: proposal.start,
+            end: proposal.end,
+          }],
+        }),
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(apiErrorMessage(payload, `Could not place B-roll (HTTP ${response.status}).`));
+    }
+
+    els.brollStatus.textContent = payload.note || "Placed.";
+    await loadTimeline(state.project.id, state.timeline.clip_id);
+  } catch (error) {
+    showBrollError(error.message);
+  } finally {
+    updateBrollControls();
+  }
+}
+
 /** Place the selected asset on the B-roll track, starting at the playhead. */
 async function addBrollAtPlayhead() {
   const timeline = currentTimeline();
@@ -1864,6 +2019,7 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
     state.timeline = payload;
     renderTimeline();
     setTimelineSaveState("Saved edit", "badge status-ready");
+    resetBroll("Suggest B-roll follows what this clip's transcript says.");
     return payload;
   } catch (error) {
     state.timeline = null;
@@ -3385,6 +3541,7 @@ els.btnExportCancel.addEventListener("click", cancelExport);
 els.btnTimelineIn.addEventListener("click", () => setClipEdgeFromPlayhead("in"));
 els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"));
 els.btnAddBroll.addEventListener("click", addBrollAtPlayhead);
+els.btnBrollSuggest.addEventListener("click", suggestBroll);
 els.btnAddSfx.addEventListener("click", addSfxAtPlayhead);
 els.btnAddTransition.addEventListener("click", addTransition);
 
@@ -3515,6 +3672,7 @@ function resetToEmptyProject() {
   state.activeAssetId = null;
   renderAssetList();
   resetStock("Import a video first — stock search needs a project.");
+  resetBroll("Import a video first — B-roll follows a clip's transcript.");
   els.dataSourceBadge.textContent = "No project";
   els.dataSourceBadge.className = "badge badge-muted";
   resetPreview();

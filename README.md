@@ -264,6 +264,29 @@ Milestone 9 adds transitions and automatic sound design:
 The controls are all wired to the live API — no button in the interface is a demo
 anymore. The sample project stays clearly labelled as sample data.
 
+## Automatic B-roll
+
+`POST /api/projects/{project_id}/broll/propose` reads the clip's transcript and
+suggests where a cutaway should go, **how long it should run, and from where** — a
+draft the user accepts or ignores. `POST .../broll/apply` places accepted items
+through the same validated timeline path as a hand-placed insert.
+
+- **Placement follows the words.** A moment is suggested only where a sentence has
+  concrete, visual words to illustrate; filler and short lines are skipped.
+- **Duration reasons are explicit.** An insert covers about 80% of the spoken turn,
+  bounded between 1.5s and 4s, so a short line still gets a readable glance and a
+  long sentence stays a cutaway rather than a second edit.
+- **The speaker keeps the screen.** Inserts cover at most 40% of the clip, stay at
+  least 0.5s apart, and a short asset shortens the insert instead of freezing or
+  blacking the frame.
+- **Three source modes.** *Local* uses only imported B-roll; *Online* queries the
+  configured Pexels key; *Auto* prefers a local asset whose label or tags match the
+  words and falls back to a stock query. Nothing is downloaded until the user
+  accepts a stock result, and with no key the panel says why while local B-roll
+  keeps working.
+- **Diagnosable by design.** A proposal that cannot be made is reported with a
+  plain-language reason rather than silently skipped.
+
 Milestone 10 adds the release pass: a demo you can run without any media of your
 own, and an acceptance test that walks the whole workflow.
 

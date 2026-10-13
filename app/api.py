@@ -46,6 +46,12 @@ from .captions import (
     to_ass,
     to_srt,
 )
+from .broll import (
+    build_broll_item,
+    normalise_max_items,
+    normalise_mode,
+    propose_broll,
+)
 from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
 from .llm import LlmSettings, make_ranker
@@ -660,6 +666,157 @@ def update_project_timeline(
     return {
         **_timeline_document(saved, edited_clip),
         "plan": plan,
+    }
+
+
+# -------------------------------------------------------------------- b-roll
+
+
+def _broll_assets(project: dict) -> list[dict]:
+    """The project's B-roll assets, which are the only local visuals allowed."""
+
+    return [
+        asset
+        for asset in (project.get("assets") or [])
+        if isinstance(asset, dict) and str(asset.get("kind")) == "broll"
+    ]
+
+
+@router.post("/projects/{project_id}/broll/propose")
+def propose_project_broll(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Suggest where B-roll should go, for how long, and from where.
+
+    This is a draft: nothing is downloaded, nothing is written to the project. The
+    proposals follow the transcript's own sentences, so an insert lands on a moment
+    the words actually describe rather than at an arbitrary time.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    body = payload or {}
+    if not isinstance(body, dict):
+        raise ApiError("invalid_broll_request", "Send a JSON object.", 422)
+
+    clip = _clip_by_id(project, body.get("clip_id"))
+    segments = _transcript_segments(store, project)
+    assets = _broll_assets(project)
+    settings = _stock_settings(request)
+    mode = normalise_mode(body.get("mode"))
+
+    proposal = propose_broll(
+        segments,
+        clip_start=float(clip.get("source_start") or 0.0),
+        clip_end=float(clip.get("source_end") or 0.0),
+        assets=assets,
+        mode=mode,
+        max_items=normalise_max_items(body.get("max_items")),
+    )
+
+    return {
+        **proposal,
+        "clip_id": str(clip.get("id")),
+        "local_broll_count": len(assets),
+        "stock_configured": settings.enabled,
+        "stock_note": (
+            None
+            if settings.enabled
+            else "Stock search is off: set PEXELS_API_KEY in .env to enable it. "
+            "Local B-roll keeps working without a key."
+        ),
+    }
+
+
+@router.post("/projects/{project_id}/broll/apply")
+def apply_project_broll(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Place accepted B-roll proposals on the clip's timeline.
+
+    Each item names a local ``asset_id`` (a stock clip is imported first, through
+    the stock import endpoint, because its terms require the user to choose it).
+    The whole set is validated through the same timeline path as a hand-placed
+    insert, so one bad item changes nothing at all.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    body = payload or {}
+    if not isinstance(body, dict):
+        raise ApiError("invalid_broll_request", "Send a JSON object.", 422)
+
+    clip = _clip_by_id(project, body.get("clip_id"))
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(
+            "invalid_broll_request", "Send a non-empty 'items' list.", 422
+        )
+
+    assets = {
+        str(asset.get("id")): asset
+        for asset in (project.get("assets") or [])
+        if isinstance(asset, dict) and asset.get("id")
+    }
+
+    placed: list[dict] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise ApiError("invalid_broll_request", "Each item must be a JSON object.", 422)
+        asset_id = str(raw.get("asset_id") or "").strip()
+        asset = assets.get(asset_id)
+        if asset is None:
+            raise ApiError(
+                "invalid_asset", f"No asset with id '{asset_id}' exists in this project.", 404
+            )
+        if str(asset.get("kind")) != "broll":
+            raise ApiError(
+                "invalid_asset", f"Asset '{asset_id}' is not a B-roll clip.", 422
+            )
+        placed.append(
+            build_broll_item(
+                raw,
+                asset_id=asset_id,
+                asset_duration=float(asset.get("duration") or 0.0),
+                placement=str(raw.get("placement") or "full"),
+                fit=str(raw.get("fit") or "cover"),
+            )
+        )
+
+    current = stored_timeline(project)
+    existing = [item for item in (current.get("broll") or []) if isinstance(item, dict)]
+
+    patch = apply_timeline_patch(
+        project,
+        clip,
+        {"broll": [*existing, *placed]},
+        current_style=normalise_style(project.get("caption_style")),
+        current_export=project.get("export") or {},
+    )
+    plan = _export_plan(project, patch["export"])
+    saved = store.save_timeline(
+        project_id,
+        source_start=float(patch["source_start"]),
+        source_end=float(patch["source_end"]),
+        clip_id=str(clip.get("id")),
+        caption_style=patch["caption_style"],
+        export=_export_document(plan),
+        tracks={**current, **patch["tracks"]},
+        sound_design=patch["sound_design"],
+    )
+
+    edited_clip = next(
+        item for item in saved.get("clips") or [] if str(item.get("id")) == str(clip.get("id"))
+    )
+    timeline = _timeline_document(saved, edited_clip)
+    return {
+        "placed": len(placed),
+        "broll_count": len(timeline.get("broll") or []),
+        "note": (
+            f"Placed {len(placed)} B-roll insert(s) on the clip; the spoken audio "
+            "is unchanged."
+        ),
+        **timeline,
     }
 
 

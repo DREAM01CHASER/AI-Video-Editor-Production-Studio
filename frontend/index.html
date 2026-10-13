@@ -418,6 +418,43 @@
           <p id="sound-design-status" class="panel__hint"></p>
         </section>
 
+        <section id="broll-controls" class="panel">
+          <div class="panel__heading">
+            <h2>Automatic B-roll</h2>
+            <span id="broll-count" class="badge badge-muted">0</span>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span class="field__label">Source</span>
+              <select id="broll-mode" class="input">
+                <option value="auto" selected>Auto — local first, then stock</option>
+                <option value="local">Local library only</option>
+                <option value="online">Stock (Pexels) only</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field__label">Most inserts</span>
+              <select id="broll-max" class="input">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3" selected>3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+              </select>
+            </label>
+          </div>
+          <button id="btn-broll-suggest" class="btn btn-secondary btn--block" type="button" disabled
+            title="Select a clip first — suggestions follow its transcript.">
+            Suggest B-roll from the transcript
+          </button>
+          <p id="broll-status" class="panel__hint">
+            Suggests where a cutaway should go and how long it should run, from what
+            is actually being said. Nothing is downloaded until you apply a stock result.
+          </p>
+          <p id="broll-error" class="processing-error is-hidden" role="alert"></p>
+          <ul id="broll-proposals" class="list"></ul>
+        </section>
+
         <section id="caption-controls" class="panel">
           <div class="panel__heading">
             <h2>Captions</h2>
