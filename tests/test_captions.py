@@ -13,7 +13,9 @@ import pysubs2
 
 from app.captions import (
     MAX_CUE_SECONDS,
+    MAX_POSITION_PERCENT,
     MIN_CUE_SECONDS,
+    MIN_POSITION_PERCENT,
     build_cues,
     build_subtitle_file,
     caption_summary,
@@ -120,6 +122,63 @@ def test_geometry_centres_and_aligns_to_the_top_when_asked() -> None:
     assert geometry_for(placement="center").margin_v == 0
     assert geometry_for(placement="top").alignment == 8
     assert geometry_for(placement="top").margin_v == round(1920 * 0.12)
+
+
+def test_the_user_can_move_captions_up_or_down() -> None:
+    # The position is a percentage of the frame height, so moving it changes the
+    # margin the export uses without changing anything else.
+    assert geometry_for(position=30).margin_v == round(1920 * 0.30)
+    assert geometry_for(placement="top", position=25).margin_v == round(1920 * 0.25)
+    assert geometry_for(position=30).position_percent == 30
+    # Center placement already fixes the vertical position, so it ignores it.
+    assert geometry_for(placement="center", position=30).margin_v == 0
+
+
+def test_a_position_that_would_leave_the_safe_area_is_clamped() -> None:
+    """Text must never be placed into the frame border, however it is requested."""
+
+    assert style_for(position=-40)["position"] == MIN_POSITION_PERCENT
+    assert style_for(position=500)["position"] == MAX_POSITION_PERCENT
+    # Even a style that skipped normalisation is clamped inside resolve_geometry.
+    raw = {**default_style(), "position": 0.1}
+    clamped = resolve_geometry(raw, width=1080, height=1920)
+    assert clamped.margin_v == round(1920 * MIN_POSITION_PERCENT / 100)
+
+
+def test_a_non_numeric_position_is_refused() -> None:
+    with pytest.raises(ApiError) as error:
+        normalise_style({**default_style(), "position": "low"})
+
+    assert error.value.code == "invalid_caption_style"
+    assert "position" in error.value.message
+
+
+def test_karaoke_captions_wrap_instead_of_overflowing_one_line() -> None:
+    """The word-highlight path must wrap its own text.
+
+    The export uses ``WrapStyle=2``, so libass does not wrap on its own; a karaoke
+    cue that skipped line breaking used to become one over-wide line that clipped
+    at the left and right edges of the frame.
+    """
+
+    words = [
+        {"text": f"w{index}", "start": index * 0.2, "end": index * 0.2 + 0.2}
+        for index in range(30)
+    ]
+    cue = {
+        "start": 0.0,
+        "end": 6.0,
+        "text": " ".join(str(word["text"]) for word in words),
+        "words": words,
+        "lines": [],
+    }
+    style = style_for(preset="bold-highlight", line_length="short")
+    body = to_ass([cue], style, geometry_for(preset="bold-highlight", line_length="short"))
+
+    dialogue = [line for line in body.splitlines() if line.startswith("Dialogue:")]
+    assert dialogue
+    assert "\\N" in dialogue[0]
+    assert "\\k" in dialogue[0]
 
 
 def test_geometry_scales_the_font_with_the_output_height() -> None:

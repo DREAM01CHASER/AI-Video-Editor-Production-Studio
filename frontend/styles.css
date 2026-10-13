@@ -704,6 +704,15 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+/* A range input is drawn by the browser, so the text-input chrome gets in the way. */
+.input--range {
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+  cursor: grab;
+}
+
 select.input {
   cursor: pointer;
 }

@@ -464,6 +464,24 @@
                 <option value="long">Long</option>
               </select>
             </label>
+            <label class="field field--full">
+              <span class="field__label">Caption position — move it up or down</span>
+              <input
+                id="caption-position"
+                class="input input--range"
+                type="range"
+                min="6"
+                max="70"
+                step="1"
+                value="12"
+                aria-describedby="caption-position-hint"
+              />
+              <output id="caption-position-value" class="input input--readonly">12% from the bottom</output>
+              <span id="caption-position-hint" class="panel__hint">
+                Distance from the frame edge. Captions are kept inside the safe area,
+                so they never touch the border.
+              </span>
+            </label>
             <label class="field field--full field--check">
               <input id="high-contrast" type="checkbox" />
               <span class="field__label">High contrast (opaque caption box)</span>

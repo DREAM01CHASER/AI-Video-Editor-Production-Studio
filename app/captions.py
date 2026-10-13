@@ -50,6 +50,15 @@ PRESET_SIZE_FACTOR = {"clean": 1.0, "bold-highlight": 1.05, "minimal": 0.92}
 SAFE_AREA_RATIO = {"bottom": 0.12, "center": 0.0, "top": 0.12}
 SIDE_MARGIN_RATIO = 0.07
 
+#: Where the caption block sits, as a percentage of the frame height measured
+#: from the chosen edge. The user may move it, but never into the frame border or
+#: the platform overlay: the bounds keep every line inside the safe area whatever
+#: the frame size or line count. The default matches the historical safe area, so
+#: an existing edit keeps the position it had.
+DEFAULT_POSITION_PERCENT = 12.0
+MIN_POSITION_PERCENT = 6.0
+MAX_POSITION_PERCENT = 70.0
+
 #: Average glyph width as a fraction of the font size, used to work out how many
 #: characters fit on a line. Deliberately generous so lines do not overflow.
 AVERAGE_GLYPH_WIDTH = 0.5
@@ -89,6 +98,7 @@ def default_style() -> dict[str, object]:
         "highlight_mode": "shadow",
         "line_length": "auto",
         "high_contrast": False,
+        "position": DEFAULT_POSITION_PERCENT,
     }
 
 
@@ -128,6 +138,29 @@ def _flag(value: object, fallback: bool) -> bool:
     )
 
 
+def _percent(value: object, fallback: float) -> float:
+    """Validate a vertical position, clamped into the safe band.
+
+    Clamping rather than rejecting means a slightly out-of-range value from an
+    older project still renders inside the frame instead of failing the export,
+    while the stored settings and the interface always show the safe value.
+    """
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return round(fallback, 2)
+
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ApiError(
+            "invalid_caption_style",
+            f"position must be a number (got '{value}').",
+            422,
+        ) from exc
+
+    return round(min(MAX_POSITION_PERCENT, max(MIN_POSITION_PERCENT, number)), 2)
+
+
 def normalise_style(raw: dict | None) -> dict[str, object]:
     """Validate a caption style, filling in defaults for anything omitted.
 
@@ -159,6 +192,7 @@ def normalise_style(raw: dict | None) -> dict[str, object]:
             str(defaults["line_length"]),
         ),
         "high_contrast": _flag(source.get("high_contrast"), bool(defaults["high_contrast"])),
+        "position": _percent(source.get("position"), float(defaults["position"])),
     }
     return style
 
@@ -178,6 +212,9 @@ class CaptionGeometry:
     margin_h: int
     max_line_chars: int
     max_lines: int
+    #: The vertical position that produced ``margin_v``, kept so the interface
+    #: can show where the captions sit without reverse-engineering the pixels.
+    position_percent: float = DEFAULT_POSITION_PERCENT
 
     @property
     def safe_area(self) -> int:
@@ -194,6 +231,7 @@ class CaptionGeometry:
             "alignment": self.alignment,
             "margin_v": self.margin_v,
             "margin_h": self.margin_h,
+            "position_percent": self.position_percent,
         }
 
 
@@ -235,8 +273,16 @@ def resolve_geometry(
     placement = str(style.get("placement", "bottom"))
     alignment = {"bottom": 2, "center": 5, "top": 8}[placement]
 
+    # The vertical position is owned by the user, but it is clamped into the safe
+    # band here as well as when the style is validated, so a style that reached
+    # this function some other way still cannot put text into the frame border.
+    position = min(
+        MAX_POSITION_PERCENT,
+        max(MIN_POSITION_PERCENT, _number(style.get("position"), DEFAULT_POSITION_PERCENT)),
+    )
+
     margin_h = int(round(width * SIDE_MARGIN_RATIO))
-    margin_v = int(round(height * SAFE_AREA_RATIO[placement]))
+    margin_v = 0 if placement == "center" else int(round(height * position / 100.0))
 
     usable = max(1, width - 2 * margin_h)
     per_line = usable / max(1.0, font_size * AVERAGE_GLYPH_WIDTH)
@@ -256,6 +302,7 @@ def resolve_geometry(
         margin_h=margin_h,
         max_line_chars=max_line_chars,
         max_lines=max(1, lines),
+        position_percent=round(position, 2),
     )
 
 
@@ -506,6 +553,43 @@ def _ass_escape(text: str) -> str:
     )
 
 
+def _wrap_words(
+    words: Sequence[dict[str, object]], geometry: CaptionGeometry
+) -> list[list[dict[str, object]]]:
+    """Wrap timed words into lines that fit the frame.
+
+    The karaoke path renders its own text (each word carries a ``\\k`` tag), so it
+    cannot reuse the plain ``lines`` computed for the other presets. Without this
+    the whole cue became one over-wide line that libass clipped at the left and
+    right edges, because the export uses ``WrapStyle=2`` (no automatic wrapping).
+    """
+
+    limit = max(1, int(geometry.max_line_chars))
+    lines: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    length = 0
+
+    for word in words:
+        text = str(word["text"])
+        addition = len(text) + (1 if current else 0)
+        if current and length + addition > limit:
+            lines.append(current)
+            current, length = [], 0
+        current.append(word)
+        length += addition
+
+    if current:
+        lines.append(current)
+
+    # Keep the promise of at most ``max_lines`` lines by folding any overflow
+    # back into the last line rather than dropping speech.
+    if len(lines) > max(1, geometry.max_lines):
+        head = lines[: max(1, geometry.max_lines) - 1]
+        head.append([word for group in lines[max(1, geometry.max_lines) - 1 :] for word in group])
+        lines = head
+    return lines
+
+
 def _ass_text(cue: dict[str, object], style: dict[str, object], geometry: CaptionGeometry) -> str:
     """Render one cue's text, adding karaoke highlighting when it is meaningful."""
 
@@ -513,13 +597,18 @@ def _ass_text(cue: dict[str, object], style: dict[str, object], geometry: Captio
     highlighted = str(style.get("preset")) == "bold-highlight" and len(words) > 1
 
     if highlighted:
-        pieces: list[str] = []
-        for word in words:
-            length = max(0.01, _number(word["end"]) - _number(word["start"]))
-            # \k switches the following text from the secondary to the primary
-            # colour when its time elapses: word-level highlighting in ASS.
-            pieces.append(f"{{\\k{max(1, int(round(length * 100)))}}}{_ass_escape(str(word['text']))}")
-        return " ".join(pieces)
+        rendered: list[str] = []
+        for group in _wrap_words(words, geometry):
+            pieces: list[str] = []
+            for word in group:
+                length = max(0.01, _number(word["end"]) - _number(word["start"]))
+                # \k switches the following text from the secondary to the primary
+                # colour when its time elapses: word-level highlighting in ASS.
+                pieces.append(
+                    f"{{\\k{max(1, int(round(length * 100)))}}}{_ass_escape(str(word['text']))}"
+                )
+            rendered.append(" ".join(pieces))
+        return "\\N".join(rendered)
 
     return "\\N".join(_ass_escape(line) for line in cue.get("lines") or [])
 

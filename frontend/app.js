@@ -212,6 +212,8 @@ const els = {
   captionPlacement: document.getElementById("caption-placement"),
   highlightMode: document.getElementById("highlight-mode"),
   lineLength: document.getElementById("line-length"),
+  captionPosition: document.getElementById("caption-position"),
+  captionPositionValue: document.getElementById("caption-position-value"),
   highContrast: document.getElementById("high-contrast"),
   captionPreview: document.getElementById("caption-preview"),
   captionPreviewStatus: document.getElementById("caption-preview-status"),
@@ -248,6 +250,7 @@ const RENDER_CONTROLS = [
   "captionPlacement",
   "highlightMode",
   "lineLength",
+  "captionPosition",
   "highContrast",
 ];
 
@@ -2546,7 +2549,16 @@ function captionStyleFromControls() {
     highlight_mode: els.highlightMode.value,
     line_length: els.lineLength.value,
     high_contrast: els.highContrast.checked,
+    // The user can move the captions; the backend clamps it into the safe area.
+    position: Number(els.captionPosition.value),
   };
+}
+
+/** Show the chosen caption position as human-readable text. */
+function updateCaptionPositionLabel() {
+  const value = Number(els.captionPosition.value) || 0;
+  const edge = els.captionPlacement.value === "top" ? "the top" : "the bottom";
+  els.captionPositionValue.textContent = `${value}% from ${edge}`;
 }
 
 /** The export choices currently in the inspector. */
@@ -2568,7 +2580,11 @@ function applyStyleToControls(style) {
   if (value.placement) els.captionPlacement.value = value.placement;
   if (value.highlight_mode) els.highlightMode.value = value.highlight_mode;
   if (value.line_length) els.lineLength.value = value.line_length;
+  if (value.position !== undefined && value.position !== null) {
+    els.captionPosition.value = String(value.position);
+  }
   els.highContrast.checked = Boolean(value.high_contrast);
+  updateCaptionPositionLabel();
 }
 
 function applyExportSettingsToControls(settings) {
@@ -2651,6 +2667,7 @@ function renderCaptionPreview(payload, message) {
   const bits = [`${cues.length} caption(s)`];
   if (geometry.max_line_chars) bits.push(`up to ${geometry.max_line_chars} characters per line`);
   if (geometry.font_size) bits.push(`${geometry.font_size}px text`);
+  if (geometry.position_percent) bits.push(`${geometry.position_percent}% from the edge`);
   els.captionPreviewStatus.textContent = `${bits.join(" · ")}.`;
 
   for (const cue of cues) {
@@ -3444,8 +3461,9 @@ els.timelineRuler.addEventListener("keydown", (event) => {
 
 // Caption controls change the burned-in text, so the preview is rebuilt from the
 // backend-validated cues instead of guessing locally what will be rendered.
-for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "highContrast"]) {
+for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMode", "lineLength", "captionPosition", "highContrast"]) {
   els[name].addEventListener("change", async () => {
+    updateCaptionPositionLabel();
     if (!isRealProject()) {
       renderCaptionPreview(null, "Sample project — settings are not saved.");
       return;
@@ -3453,6 +3471,10 @@ for (const name of ["captionStyle", "fontSize", "captionPlacement", "highlightMo
     await saveProjectSettings({ reloadCaptions: true });
   });
 }
+
+// The range input updates its readout while the handle is still being dragged.
+els.captionPosition.addEventListener("input", updateCaptionPositionLabel);
+els.captionPlacement.addEventListener("change", updateCaptionPositionLabel);
 
 els.aspectRatio.addEventListener("change", async () => {
   // Keep the resolution list consistent with the chosen ratio before saving.
