@@ -443,13 +443,19 @@
               </select>
             </label>
           </div>
+          <button id="btn-broll-auto" class="btn btn-primary btn--block" type="button" disabled
+            title="Select a clip first — the search follows its transcript.">
+            Add B-Rolls
+          </button>
           <button id="btn-broll-suggest" class="btn btn-secondary btn--block" type="button" disabled
             title="Select a clip first — suggestions follow its transcript.">
             Suggest B-roll from the transcript
           </button>
           <p id="broll-status" class="panel__hint">
-            Suggests where a cutaway should go and how long it should run, from what
-            is actually being said. Nothing is downloaded until you apply a stock result.
+            <strong>Add B-Rolls</strong> reads the current clip's own transcript, finds
+            stock videos and photos that match what is being said, downloads the best
+            match for each moment, and puts it on the timeline — ready to export.
+            <em>Suggest</em> only plans the placements so you can edit them first.
           </p>
           <p id="broll-error" class="processing-error is-hidden" role="alert"></p>
           <ul id="broll-proposals" class="list"></ul>

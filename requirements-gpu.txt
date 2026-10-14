@@ -1,0 +1,21 @@
+# Optional GPU acceleration for local transcription (Windows and Linux x86_64).
+#
+# `pip install -r requirements.txt` cannot enable the GPU on its own: CTranslate2
+# is built against the CUDA 12 runtime, and the cuBLAS and cuDNN 9 libraries it
+# loads are a *separate* install. Those wheels are not published for every
+# platform and are about 1 GB together, so they live here instead of in the main
+# requirements file.
+#
+#   python -m pip install -r requirements-gpu.txt
+#
+# Installing this file puts the runtime inside the virtualenv
+# (`.venv/Lib/site-packages/nvidia/<package>/bin`). The application adds those
+# directories to its DLL search path at startup, so no code change and no
+# system-wide CUDA toolkit is needed. An up-to-date NVIDIA driver is still
+# required — the wheels ship the runtime libraries, not the driver.
+#
+# Skipping this file is fine. Transcription then runs on CPU/int8 and the
+# interface and the log say so, with the reason.
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cublas-cu12==12.6.4.1
+nvidia-cudnn-cu12==9.5.1.17

@@ -59,10 +59,32 @@ PEXELS_HOST_SUFFIX = ".pexels.com"
 ALLOWED_CDN_HOSTS = frozenset(
     {
         "videos.pexels.com",
+        "images.pexels.com",
         "vod-progressive.akamaized.net",
         "player.vimeo.com",
     }
 )
+
+#: Pexels photo renditions, best first. The original is last on purpose: it is
+#: often several thousand pixels wide, which is wasted bandwidth for a 1080-wide
+#: export that crops with ``cover`` anyway. ``large2x`` keeps the photo's own
+#: orientation at about 1880 px, which matches what the renderer needs.
+PHOTO_SIZE_ORDER = ("large2x", "large", "medium", "portrait", "landscape", "original")
+#: The preview shown in the interface — small, and safe to load many of.
+PHOTO_PREVIEW_SIZES = ("medium", "large", "small")
+
+#: The long side of each scaled rendition, used when the URL does not state the
+#: size itself. The *rendition* is what gets downloaded, so scoring a photo by the
+#: size of its original would claim a resolution the file does not have.
+PHOTO_RENDITION_LONG_SIDE = {
+    "large2x": 1880,
+    "large": 940,
+    "medium": 750,
+    "small": 640,
+    "tiny": 280,
+}
+#: Renditions that are cropped to a fixed shape rather than scaled.
+PHOTO_RENDITION_FIXED_SIZE = {"portrait": (800, 1200), "landscape": (1200, 800)}
 
 USER_AGENT = "AI-Video-Production-Studio/0.3 (local)"
 
@@ -317,18 +339,25 @@ def normalise_video(video: dict) -> dict[str, object] | None:
     user = video.get("user") if isinstance(video.get("user"), dict) else {}
     page_url = _CONTROL.sub("", str(video.get("url") or "")).strip()
     preview_url = _CONTROL.sub("", str(video.get("image") or "")).strip()
+    photographer = " ".join(
+        str(user.get("name") or video.get("photographer") or "").split()
+    )[:80]
+    photographer_url = _CONTROL.sub(
+        "", str(user.get("url") or video.get("photographer_url") or "")
+    ).strip()
 
     return {
         "provider": PROVIDER,
         "provider_name": PROVIDER_NAME,
+        "media_type": "video",
         "id": str(video_id),
         "width": _positive_int(video.get("width")),
         "height": _positive_int(video.get("height")),
         "duration": _positive_float(video.get("duration")),
         "page_url": page_url,
         "preview_url": preview_url,
-        "photographer": " ".join(str(user.get("name") or "").split())[:80],
-        "photographer_url": _CONTROL.sub("", str(user.get("url") or "")).strip(),
+        "photographer": photographer,
+        "photographer_url": photographer_url,
         "attribution": ATTRIBUTION,
         "license": {"name": LICENSE_NAME, "url": LICENSE_URL},
         "files": files,
@@ -355,6 +384,184 @@ def parse_search_results(body: bytes) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for raw in raw_videos:
         normalised = normalise_video(raw) if isinstance(raw, dict) else None
+        if normalised is not None:
+            results.append(normalised)
+    return results
+
+
+# -------------------------------------------------------------------- photos
+
+
+def photo_src(photo: dict) -> dict:
+    """The rendition URLs of a photo record, or an empty mapping."""
+
+    source = photo.get("src") if isinstance(photo.get("src"), dict) else {}
+    return source
+
+
+def rendition_size(url: str, quality: str, record: tuple[int, int]) -> tuple[int, int]:
+    """The pixel size a rendition will really have.
+
+    The transform parameters in the URL are the delivered size, so they win; the
+    documented size for that rendition is the next best answer; the photo's own
+    size is the last resort. When only one dimension is stated the photo's aspect
+    ratio fills in the other, because the transformation scales rather than crops.
+    """
+
+    record_width, record_height = record
+    aspect = (
+        record_width / record_height if record_width > 0 and record_height > 0 else 0.0
+    )
+
+    if quality in PHOTO_RENDITION_FIXED_SIZE:
+        return PHOTO_RENDITION_FIXED_SIZE[quality]
+
+    try:
+        parameters = urllib.parse.parse_qs(urllib.parse.urlparse(str(url)).query)
+    except ValueError:
+        parameters = {}
+
+    dpr = _positive_float((parameters.get("dpr") or [1])[0]) or 1.0
+    width = _positive_int((parameters.get("w") or [0])[0])
+    height = _positive_int((parameters.get("h") or [0])[0])
+
+    if width and height:
+        return (round(width * dpr), round(height * dpr))
+    if height and aspect > 0:
+        return (round(height * dpr * aspect), round(height * dpr))
+    if width and aspect > 0:
+        return (round(width * dpr), round(width * dpr / aspect))
+
+    long_side = PHOTO_RENDITION_LONG_SIDE.get(quality)
+    if long_side and aspect > 0:
+        # The long side is scaled; which side that is depends on the photo itself.
+        if aspect >= 1:
+            return (long_side, round(long_side / aspect))
+        return (round(long_side * aspect), long_side)
+
+    return (record_width, record_height)
+
+
+def photo_files(photo: dict) -> list[dict[str, object]]:
+    """The downloadable renditions of a stock photo, smallest decision first.
+
+    A photo has no ``video_files`` array, so the renditions are built from ``src``
+    in a fixed order rather than trusting whatever the response happens to hold.
+    Each one carries the size it will really be.
+    """
+
+    source = photo_src(photo)
+    record = (_positive_int(photo.get("width")), _positive_int(photo.get("height")))
+    files: list[dict[str, object]] = []
+
+    for rank, size in enumerate(PHOTO_SIZE_ORDER):
+        link = _CONTROL.sub("", str(source.get(size) or "")).strip()
+        if not link:
+            continue
+        width, height = rendition_size(link, size, record)
+        files.append(
+            {
+                "id": 0,
+                "quality": size,
+                "file_type": "image/jpeg",
+                "width": width,
+                "height": height,
+                "link": link,
+                "rank": rank,
+            }
+        )
+    return files
+
+
+def choose_photo_file(files: Sequence[dict]) -> dict[str, object] | None:
+    """Pick the rendition to download: the best one that is not the original."""
+
+    if not files:
+        return None
+    ordered = sorted(files, key=lambda item: int(item.get("rank") or 0))
+    return dict(ordered[0])
+
+
+def normalise_photo(photo: dict) -> dict[str, object] | None:
+    """Turn one Pexels photo record into the shape this app uses.
+
+    The result has the same keys as a normalised video, so one ranking and one
+    import path serve both kinds of cutaway. A photo's duration is zero because it
+    has none: the timeline interval decides how long it stays on screen.
+    """
+
+    if not isinstance(photo, dict):
+        return None
+
+    photo_id = _positive_int(photo.get("id"))
+    if photo_id == 0:
+        return None
+
+    files = photo_files(photo)
+    best = choose_photo_file(files)
+    if best is None:
+        return None
+
+    user = photo.get("user") if isinstance(photo.get("user"), dict) else {}
+    source = photo_src(photo)
+    # The live API answers a search with ``photographer`` at the top level and only
+    # some responses carry the ``user`` object, so both are read. The credit is a
+    # licence requirement, so it must not depend on which shape arrived. Some
+    # records put a URL in that field; a link is then shown instead of a name.
+    credited = " ".join(str(photo.get("photographer") or user.get("name") or "").split())[:80]
+    photographer = "" if "://" in credited else credited
+    photographer_url = _CONTROL.sub(
+        "", str(photo.get("photographer_url") or user.get("url") or "")
+    ).strip()
+    preview = ""
+    for size in PHOTO_PREVIEW_SIZES:
+        preview = _CONTROL.sub("", str(source.get(size) or "")).strip()
+        if preview:
+            break
+
+    return {
+        "provider": PROVIDER,
+        "provider_name": PROVIDER_NAME,
+        "media_type": "photo",
+        "id": str(photo_id),
+        "width": _positive_int(best.get("width")) or _positive_int(photo.get("width")),
+        "height": _positive_int(best.get("height")) or _positive_int(photo.get("height")),
+        "duration": 0.0,
+        "alt": " ".join(str(photo.get("alt") or "").split())[:160],
+        # The rendition's own size: it is the file that gets downloaded and
+        # composited, so it is the size the ranking and the interface should see.
+        "original_width": _positive_int(photo.get("width")),
+        "original_height": _positive_int(photo.get("height")),
+        "page_url": _CONTROL.sub("", str(photo.get("url") or "")).strip(),
+        "preview_url": preview,
+        "photographer": photographer,
+        "photographer_url": photographer_url,
+        "attribution": ATTRIBUTION,
+        "license": {"name": LICENSE_NAME, "url": LICENSE_URL},
+        "files": files,
+        "best_file": best,
+    }
+
+
+def parse_photo_results(body: bytes) -> list[dict[str, object]]:
+    """Parse a photo search response, dropping anything unusable."""
+
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        raise ApiError(
+            "stock_unavailable",
+            "The stock provider returned a response that could not be read.",
+            502,
+        )
+
+    raw_photos = payload.get("photos") if isinstance(payload, dict) else None
+    if not isinstance(raw_photos, list):
+        return []
+
+    results: list[dict[str, object]] = []
+    for raw in raw_photos:
+        normalised = normalise_photo(raw) if isinstance(raw, dict) else None
         if normalised is not None:
             results.append(normalised)
     return results
@@ -459,6 +666,81 @@ def search_videos(
 
     path = f"/videos/search?{urllib.parse.urlencode(parameters)}"
     return parse_search_results(_request_json(settings, path, opener=opener))
+
+
+def search_photos(
+    settings: PexelsSettings,
+    query: str,
+    *,
+    per_page: int = DEFAULT_PER_PAGE,
+    orientation: str = "all",
+    opener: Opener | None = None,
+) -> list[dict[str, object]]:
+    """Search stock photos by keyword, returning metadata only.
+
+    A still image is often the better cutaway for a sentence about a place, an
+    object, or a diagram; both kinds are searched so the best one wins.
+    """
+
+    _require_settings(settings)
+
+    text = normalise_query(query)
+    if not text:
+        raise ApiError(
+            "invalid_stock_query",
+            "A stock search needs a keyword. Type one, or select a clip so the "
+            "search can use the transcript.",
+            422,
+        )
+
+    wanted = str(orientation or "all").strip().lower()
+    if wanted not in ORIENTATIONS:
+        raise ApiError(
+            "invalid_stock_query",
+            f"orientation must be one of {', '.join(ORIENTATIONS)} (got '{orientation}').",
+            422,
+        )
+
+    count = min(MAX_PER_PAGE, max(1, int(per_page or DEFAULT_PER_PAGE)))
+    parameters = {"query": text, "per_page": str(count)}
+    if wanted != "all":
+        parameters["orientation"] = wanted
+
+    path = f"/v1/search?{urllib.parse.urlencode(parameters)}"
+    return parse_photo_results(_request_json(settings, path, opener=opener))
+
+
+def fetch_photo(
+    settings: PexelsSettings, photo_id: object, *, opener: Opener | None = None
+) -> dict[str, object]:
+    """Read one Pexels photo by id, so only a provider URL is ever downloaded."""
+
+    _require_settings(settings)
+
+    identifier = _positive_int(photo_id)
+    if identifier == 0:
+        raise ApiError(
+            "invalid_stock_selection", "Send the numeric 'photo_id' to import.", 422
+        )
+
+    body = _request_json(settings, f"/v1/photos/{identifier}", opener=opener)
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        raise ApiError(
+            "stock_unavailable",
+            "The stock provider returned a response that could not be read.",
+            502,
+        )
+
+    photo = normalise_photo(payload if isinstance(payload, dict) else {})
+    if photo is None:
+        raise ApiError(
+            "stock_unavailable",
+            "That stock photo is no longer available from the provider.",
+            404,
+        )
+    return photo
 
 
 def fetch_video(
@@ -615,10 +897,14 @@ def provenance_for(video: dict, file: dict | None) -> dict[str, object]:
     """
 
     chosen = file or video.get("best_file") or {}
+    media_type = str(video.get("media_type") or "video")
     return {
         "provider": PROVIDER,
         "provider_name": PROVIDER_NAME,
         "provider_url": PROVIDER_URL,
+        # "video" or "photo": the credit is the same either way, but the record
+        # says which one it is so the interface can label it.
+        "media_type": media_type,
         "id": str(video.get("id") or ""),
         "page_url": str(video.get("page_url") or ""),
         "photographer": str(video.get("photographer") or ""),
@@ -662,10 +948,12 @@ def describe_result(video: dict, chosen: dict | None = None) -> dict[str, object
     return {
         "provider": video.get("provider"),
         "provider_name": video.get("provider_name"),
+        "media_type": video.get("media_type") or "video",
         "id": video.get("id"),
         "width": video.get("width"),
         "height": video.get("height"),
         "duration": video.get("duration"),
+        "alt": video.get("alt"),
         "page_url": video.get("page_url"),
         "preview_url": video.get("preview_url"),
         "photographer": video.get("photographer"),

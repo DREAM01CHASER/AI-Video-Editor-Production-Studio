@@ -19,10 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import api as api_module
+from app.captions import PRESETS
 from app.config import Settings
 from app.errors import ApiError
 from app.main import create_app
 from app.render import (
+    build_composite_filters,
     build_ffmpeg_command,
     build_filter_chain,
     escape_filter_path,
@@ -477,6 +479,21 @@ def _black_source(path: Path, seconds: int = 12) -> None:
     )
 
 
+def _green_image(path: Path, size: str = "800x800") -> None:
+    """A solid green still, so an image insert is unmistakable in the export."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=green:size={size}",
+        "-frames:v",
+        "1",
+        str(path),
+    )
+
+
 def _caption_area_luma(video: Path, at: float, crop: str = CAPTION_CROP) -> float:
     """Average luma of the caption area, measured by FFmpeg itself."""
 
@@ -608,6 +625,148 @@ def test_a_real_render_writes_a_captioned_vertical_mp4(tmp_path: Path) -> None:
         result["file"],
     ]
     assert all(entry["available"] for entry in listing["exports"])
+
+
+def test_a_still_image_b_roll_input_is_looped_for_its_interval() -> None:
+    """An image needs ``-loop 1``: without it the overlay shows one frame only."""
+
+    command = build_ffmpeg_command(
+        source_path=Path("in.mp4"),
+        output_path=Path("out.mp4"),
+        start=0.0,
+        end=6.0,
+        width=1080,
+        height=1920,
+        fps=30,
+        broll=[
+            {"path": Path("still.png"), "start": 2.0, "end": 5.0, "source": "broll-1"},
+            {"path": Path("clip.mp4"), "start": 1.0, "end": 2.0, "source": "broll-2"},
+        ],
+    )
+
+    image_at = command.index("still.png")
+    assert command[image_at - 7 : image_at] == [
+        "-loop",
+        "1",
+        "-framerate",
+        "30",
+        "-t",
+        "3.000",
+        "-i",
+    ]
+
+    # The video insert keeps seeking into its own file instead of being looped.
+    clip_at = command.index("clip.mp4")
+    assert command[clip_at - 5 : clip_at] == ["-ss", "0.000", "-t", "1.000", "-i"]
+
+
+def test_a_still_image_is_overlaid_for_exactly_its_interval() -> None:
+    graph = build_composite_filters(
+        width=1080,
+        height=1920,
+        duration=6.0,
+        broll=[
+            {
+                "item": {"path": Path("still.png"), "start": 2.0, "end": 5.0},
+                "index": 1,
+            }
+        ],
+    )["graph"]
+
+    assert "overlay=0:0:enable='between(t,2.000,5.000)'" in graph
+
+
+@requires_ffmpeg
+def test_an_image_b_roll_is_visible_in_the_exported_video(tmp_path: Path) -> None:
+    """A placed image has to reach the finished MP4, not just the timeline."""
+
+    client = _project(tmp_path)
+    workspace = tmp_path / "workspace" / "projects" / "abc123"
+    _black_source(workspace / "source" / "source-x.mp4")
+
+    still = tmp_path / "still.png"
+    _green_image(still)
+    with still.open("rb") as handle:
+        imported = client.post(
+            "/api/projects/abc123/assets",
+            data={"kind": "broll", "label": "Receipts", "tags": "desk"},
+            files={"file": ("still.png", handle, "image/png")},
+        )
+    assert imported.status_code == 201, imported.text
+    asset = imported.json()
+    assert asset["media_kind"] == "image"
+
+    placed = client.patch(
+        "/api/projects/abc123/timeline",
+        json={
+            "clip_id": "clip-1",
+            "broll": [{"source": asset["id"], "start": 2.0, "end": 5.0}],
+        },
+    )
+    assert placed.status_code == 200, placed.text
+    assert placed.json()["broll"][0]["end"] == pytest.approx(5.0, abs=0.05)
+
+    started = client.post(
+        "/api/projects/abc123/render",
+        json={"clip_id": "clip-1", "export": {"caption_mode": "none", "write_srt": False}},
+    )
+    assert started.status_code == 202, started.text
+    job = _run_job(client, started.json()["job_id"])
+    assert job["status"] == "succeeded", job.get("error")
+    result = job["result"]
+    assert result["broll_count"] == 1
+
+    output = workspace / "exports" / result["file"]
+    middle = "1080:600:0:600"
+
+    # Green inside the interval, black outside it: the image covers its whole
+    # window and nothing else is touched. A one-frame insert would measure black.
+    inside = _caption_area_luma(output, at=3.5, crop=middle)
+    outside = _caption_area_luma(output, at=0.5, crop=middle)
+    assert inside > 60.0, f"the image insert is not visible in the export (luma {inside})"
+    assert outside < 20.0, f"the image bleeds outside its interval (luma {outside})"
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("preset", PRESETS)
+def test_every_caption_preset_renders_into_the_export(tmp_path: Path, preset: str) -> None:
+    """Every preset the selector offers must survive the whole pipeline.
+
+    A preset that exists only in the interface is worse than no preset at all: the
+    user picks it, the export quietly ignores it, and nothing says so. Each one is
+    rendered with real FFmpeg here and the caption band of the finished file is
+    measured, so "this style works" is a measurement for all six rather than for
+    the default one.
+    """
+
+    client = _project(tmp_path)
+    source = tmp_path / "workspace" / "projects" / "abc123" / "source" / "source-x.mp4"
+    _black_source(source)
+
+    saved = client.patch(
+        "/api/projects/abc123/settings", json={"caption_style": {"preset": preset}}
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["caption_style"]["preset"] == preset
+
+    started = client.post(
+        "/api/projects/abc123/render",
+        json={"clip_id": "clip-1", "export": {"write_srt": False}},
+    )
+    assert started.status_code == 202, started.text
+    job = _run_job(client, started.json()["job_id"])
+    assert job["status"] == "succeeded", job.get("error")
+    result = job["result"]
+
+    # The style the user picked is the style the renderer used, not a default.
+    assert result["caption_preset"] == preset
+    assert result["caption_style"]["preset"] == preset
+    assert result["cue_count"] >= 1
+
+    output = tmp_path / "workspace" / "projects" / "abc123" / "exports" / result["file"]
+    assert output.is_file()
+    drawn = _caption_area_luma(output, at=4.0)
+    assert drawn > 18.0, f"{preset} produced no visible captions (luma {drawn})"
 
 
 @requires_ffmpeg

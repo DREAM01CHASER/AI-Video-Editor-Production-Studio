@@ -16,6 +16,10 @@ SUPPORTED_VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 )
 
+#: Still images are B-roll too. A stock photo is often the right cutaway for a
+#: sentence about an object, a place, or a diagram that no one filmed.
+SUPPORTED_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
 CONTENT_TYPES_BY_EXTENSION = {
     ".mp4": frozenset({"video/mp4"}),
     ".mov": frozenset({"video/quicktime"}),
@@ -24,6 +28,19 @@ CONTENT_TYPES_BY_EXTENSION = {
     ".mkv": frozenset({"video/x-matroska"}),
     ".webm": frozenset({"video/webm"}),
 }
+
+CONTENT_TYPES_BY_IMAGE_EXTENSION = {
+    ".jpg": frozenset({"image/jpeg", "image/jpg"}),
+    ".jpeg": frozenset({"image/jpeg", "image/jpg"}),
+    ".png": frozenset({"image/png"}),
+    ".webp": frozenset({"image/webp"}),
+}
+
+
+def is_image_filename(name: str | Path) -> bool:
+    """Whether a filename is a still image this app treats as B-roll."""
+
+    return Path(str(name)).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 

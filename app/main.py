@@ -56,6 +56,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "available": transcription_available(),
                 "model": runtime_settings.whisper_model,
                 "device": runtime_settings.whisper_device,
+                # Which device transcription can really use, and the reason when
+                # that is not the GPU the machine appears to have. Reported before
+                # a job runs so the choice is never a silent one.
+                "compute": application.state.transcriber.compute_plan(),
             },
         }
 

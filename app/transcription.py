@@ -21,6 +21,7 @@ Design notes:
 from __future__ import annotations
 
 import importlib
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,10 +29,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+from .compute import compute_diagnostics, inspect_compute
 from .config import Settings
 from .errors import ApiError
 
 TRANSCRIPT_VERSION = 1
+
+logger = logging.getLogger("app.transcription")
 
 #: Progress budget, so the bar reflects real phases instead of jumping to 100.
 _LOAD_SHARE = 5.0
@@ -146,6 +150,7 @@ def build_transcript_document(
     elapsed_seconds: float,
     requested_word_timestamps: bool,
     notes: Iterable[str] = (),
+    compute: dict | None = None,
 ) -> dict[str, object]:
     """Assemble the transcript JSON document that is saved to the project."""
 
@@ -162,6 +167,9 @@ def build_transcript_document(
         "model": model,
         "device": device,
         "compute_type": compute_type,
+        #: Why this device was chosen, and what is missing when it is not the GPU
+        #: the machine appears to have. Shown in the interface and in the logs.
+        "compute": dict(compute or {}),
         "language": language,
         "language_probability": round(float(probability), 4) if probability else None,
         "duration": round(float(duration), 3),
@@ -196,6 +204,9 @@ class _LoadedModel:
     device: str
     compute_type: str
     notes: list[str] = field(default_factory=list)
+    #: The device decision and its reason, kept with the model so the transcript
+    #: can record why it ran where it did.
+    diagnostics: dict = field(default_factory=dict)
 
 
 class _CudaRuntimeMissing(RuntimeError):
@@ -339,17 +350,37 @@ class TranscriptionService:
             if progress:
                 progress(0.0, self._loading_message())
 
-            device, note = resolve_device(
-                self.settings.whisper_device, cuda_device_count()
+            device_count = cuda_device_count()
+            # A visible device is not the same as a usable one: the CUDA runtime
+            # (cuBLAS/cuDNN) is a separate install, and its absence is the usual
+            # reason a GPU machine transcribes on the CPU. Inspecting it also adds
+            # this virtualenv's runtime directories to the DLL search path.
+            diagnostics = (
+                inspect_compute(device_count)
+                if device_count
+                else compute_diagnostics(device_count=0)
             )
-            if device == "cuda" and cuda_runtime_is_broken():
+
+            device, note = resolve_device(self.settings.whisper_device, device_count)
+
+            reasons: list[str] = []
+            if cuda_runtime_is_broken():
                 # A previous attempt in this process already proved the runtime
                 # unusable, so do not pay for the same failure twice.
-                device = "cpu"
-                note = (
+                reasons.append(
                     "The GPU runtime libraries are unavailable on this machine, so "
                     "transcription runs on CPU/int8."
                 )
+            if not diagnostics["usable"]:
+                # The driver reports a device, but the CUDA runtime cannot be
+                # loaded, so a CUDA model would fail — or, worse, hang — here.
+                reasons.append(str(diagnostics["summary"]))
+                if diagnostics.get("remedy"):
+                    reasons.append(str(diagnostics["remedy"]))
+
+            if device == "cuda" and reasons:
+                device = "cpu"
+                note = " ".join(reasons)
             compute_type = resolve_compute_type(device, self.settings.whisper_compute_type)
             notes = [note] if note else []
 
@@ -370,8 +401,38 @@ class TranscriptionService:
                 )
                 device, compute_type = "cpu", fallback_type
 
+            logger.info(
+                "transcription compute: model=%s device=%s compute_type=%s — %s",
+                self.settings.whisper_model,
+                device,
+                compute_type,
+                diagnostics["summary"],
+            )
+            if device == "cpu" and diagnostics["gpu_visible"]:
+                if str(self.settings.whisper_device).lower() in {"auto", "cuda", "gpu"}:
+                    # A GPU was expected and could not be used: this is the case the
+                    # user needs told about.
+                    logger.warning(
+                        "CUDA device is visible but the GPU path was not used: %s %s",
+                        diagnostics["summary"],
+                        diagnostics.get("remedy") or "",
+                    )
+                else:
+                    # CPU was asked for explicitly. Say what is available, without
+                    # warning about a choice the user made on purpose.
+                    logger.info(
+                        "WHISPER_DEVICE=%s was requested, so transcription runs on "
+                        "CPU/int8 even though %s",
+                        self.settings.whisper_device,
+                        str(diagnostics["summary"]).rstrip(".").lower(),
+                    )
+
             self._model = _LoadedModel(
-                instance=instance, device=device, compute_type=compute_type, notes=notes
+                instance=instance,
+                device=device,
+                compute_type=compute_type,
+                notes=notes,
+                diagnostics=diagnostics,
             )
             return self._model
 
@@ -503,6 +564,7 @@ class TranscriptionService:
                 elapsed_seconds=elapsed,
                 requested_word_timestamps=self.settings.whisper_word_timestamps,
                 notes=notes,
+                compute=loaded.diagnostics,
             )
 
             if not document["has_word_timestamps"] and self.settings.whisper_word_timestamps:
@@ -520,11 +582,51 @@ class TranscriptionService:
         compute_type = resolve_compute_type("cpu", self.settings.whisper_compute_type)
         instance = self._build_model("cpu", compute_type)
         loaded = _LoadedModel(
-            instance=instance, device="cpu", compute_type=compute_type, notes=[]
+            instance=instance,
+            device="cpu",
+            compute_type=compute_type,
+            notes=[],
+            diagnostics=inspect_compute(cuda_device_count()),
         )
         with self._model_lock:
             self._model = loaded
         return loaded
+
+    def compute_plan(self) -> dict[str, object]:
+        """What device transcription would use right now, and why.
+
+        Used by the interface so the GPU/CPU choice is visible before a job runs,
+        rather than only afterwards in the job result. Nothing is loaded from the
+        model cache here.
+        """
+
+        device_count = cuda_device_count()
+        diagnostics = (
+            inspect_compute(device_count)
+            if device_count
+            else compute_diagnostics(device_count=0)
+        )
+        device, note = resolve_device(self.settings.whisper_device, device_count)
+        notes = [note] if note else []
+
+        if device == "cuda" and not diagnostics["usable"]:
+            device = "cpu"
+            notes = []
+        if device == "cuda" and cuda_runtime_is_broken():
+            device = "cpu"
+            notes = [
+                "This process already proved the GPU runtime unavailable, so "
+                "transcription runs on CPU/int8."
+            ]
+
+        return {
+            "configured_device": self.settings.whisper_device,
+            "device": device,
+            "compute_type": resolve_compute_type(device, self.settings.whisper_compute_type),
+            "model": self.settings.whisper_model,
+            "notes": notes,
+            **diagnostics,
+        }
 
     def _collect_segments(
         self,

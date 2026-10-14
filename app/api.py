@@ -22,6 +22,8 @@ from fastapi.responses import FileResponse
 
 from .assets import (
     BROLL,
+    BROLL_EXTENSIONS,
+    BROLL_IMAGE_EXTENSIONS,
     SFX,
     allocate_asset_path,
     asset_from_import,
@@ -52,12 +54,13 @@ from .broll import (
     normalise_mode,
     propose_broll,
 )
+from .broll_auto import candidate_key, plan_fetches, plan_note
 from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
 from .llm import LlmSettings, make_ranker
 from .jobs import JobRegistry
 from .media import probe_media, probe_video
-from .projects import ProjectStore
+from .projects import ProjectStore, ProjectWorkspace
 from .sound_design import (
     describe as sound_design_note,
     materialise,
@@ -75,9 +78,11 @@ from .stock import (
     PROVIDER,
     PexelsSettings,
     describe_result,
+    fetch_photo,
     fetch_video,
     select_file,
     provenance_for,
+    search_photos,
     search_videos,
     suggest_placement,
     derive_keywords,
@@ -300,6 +305,7 @@ def start_transcription(project_id: str, request: Request) -> dict[str, object]:
             "language": document.get("language"),
             "model": document.get("model"),
             "device": document.get("device"),
+            "compute": document.get("compute"),
             "has_word_timestamps": document.get("has_word_timestamps"),
         }
 
@@ -753,6 +759,17 @@ def apply_project_broll(
             "invalid_broll_request", "Send a non-empty 'items' list.", 422
         )
 
+    placed = _resolve_broll_items(project, items)
+    return _place_broll_items(store, project_id, project, clip, placed)
+
+
+def _resolve_broll_items(project: dict, items: Sequence[dict]) -> list[dict]:
+    """Turn requested ``{asset_id, start, end}`` entries into timeline items.
+
+    Every referenced asset has to exist in this project and be B-roll, so a bad
+    item is refused before anything is written.
+    """
+
     assets = {
         str(asset.get("id")): asset
         for asset in (project.get("assets") or [])
@@ -782,6 +799,21 @@ def apply_project_broll(
                 fit=str(raw.get("fit") or "cover"),
             )
         )
+    return placed
+
+
+def _place_broll_items(
+    store: ProjectStore,
+    project_id: str,
+    project: dict,
+    clip: dict,
+    placed: Sequence[dict],
+) -> dict[str, object]:
+    """Append validated B-roll items to the clip's timeline and save it.
+
+    Shared by the hand-placed path and the automatic one, so an insert reaches the
+    renderer the same way however it was chosen.
+    """
 
     current = stored_timeline(project)
     existing = [item for item in (current.get("broll") or []) if isinstance(item, dict)]
@@ -817,6 +849,385 @@ def apply_project_broll(
             "is unchanged."
         ),
         **timeline,
+    }
+
+
+# ------------------------------------------------------- automatic B-roll
+
+#: How many results one query asks the provider for: enough to choose between,
+#: small enough that a five-insert pass stays well inside the rate limit.
+AUTO_SEARCH_PER_QUERY = 8
+
+
+def _orientation_for(width: int, height: int) -> str:
+    """The provider orientation that matches the export frame best."""
+
+    if width <= 0 or height <= 0:
+        return "all"
+    if width == height:
+        return "square"
+    return "portrait" if height > width else "landscape"
+
+
+def _stock_extension(candidate: dict, chosen: dict) -> str:
+    """The extension to store a stock file under.
+
+    The provider's own URL carries the real container, so it is used when it is
+    one this app accepts; otherwise the kind's safe default applies.
+    """
+
+    suffix = Path(str(chosen.get("link") or "")).suffix.lower()
+    if str(candidate.get("media_type")) == "photo":
+        return suffix if suffix in BROLL_IMAGE_EXTENSIONS else ".jpg"
+    # MP4 is what ``choose_file`` prefers for a video in the first place.
+    return suffix if suffix in BROLL_EXTENSIONS else ".mp4"
+
+
+def _stock_search(
+    settings: PexelsSettings,
+    query: str,
+    *,
+    per_page: int,
+    orientation: str = "all",
+    media: str = "both",
+) -> list[dict[str, object]]:
+    """Search stock video and photos for one query.
+
+    Both kinds are searched together because a still photo is often the better
+    cutaway for a place, a product, or a diagram — the ranking decides, not the
+    type. Provider order is preserved within each kind.
+    """
+
+    wanted = str(media or "both").strip().lower()
+    if wanted not in {"both", "video", "photo"}:
+        raise ApiError(
+            "invalid_stock_query",
+            f"media must be both, video, or photo (got '{media}').",
+            422,
+        )
+
+    results: list[dict[str, object]] = []
+    if wanted in {"both", "video"}:
+        results.extend(
+            search_videos(
+                settings, query, per_page=per_page, orientation=orientation
+            )
+        )
+    if wanted in {"both", "photo"}:
+        results.extend(
+            search_photos(
+                settings, query, per_page=per_page, orientation=orientation
+            )
+        )
+    return results
+
+
+def _import_stock_file(
+    settings: PexelsSettings,
+    candidate: dict,
+    workspace: ProjectWorkspace,
+    *,
+    max_bytes: int,
+    label: str | None = None,
+) -> dict[str, object]:
+    """Download one chosen stock file and return its asset record.
+
+    The only place a stock byte is written: the file is streamed into the
+    project's own assets folder under a generated name, probed, and stored with
+    the credit the provider's terms require. One file, one asset — the caller
+    decides whether to keep it.
+    """
+
+    chosen = select_file(candidate, None)
+    extension = _stock_extension(candidate, chosen)
+    media_type = str(candidate.get("media_type") or "video")
+
+    part_path = workspace.temp / f"stock-{uuid.uuid4().hex}.part"
+    destination: Path | None = None
+
+    try:
+        download_file(
+            str(chosen["link"]), part_path, max_bytes=max_bytes
+        )
+        metadata = probe_media(part_path)
+
+        fallback = str(candidate.get("alt") or "").strip() or (
+            "Stock photo" if media_type == "photo" else "Stock clip"
+        )
+        resolved_label = normalise_label(
+            " ".join(str(label or candidate.get("photographer") or fallback).split()),
+            fallback,
+        )
+
+        asset = asset_from_import(
+            asset_id=f"broll-{uuid.uuid4().hex[:12]}",
+            kind=BROLL,
+            label=resolved_label,
+            stored_name="",
+            # The provider's own name for the file, so the record knows whether
+            # this is a still image or a clip without probing again later.
+            original_name=f"pexels-{media_type}-{candidate.get('id')}{extension}",
+            tags="stock, pexels" if media_type == "video" else "stock, pexels, photo",
+            metadata=metadata,
+        )
+
+        destination = allocate_asset_path(workspace.assets, BROLL, extension)
+        part_path.replace(destination)
+        asset["file"] = destination.name
+        return with_provenance(asset, provenance_for(candidate, chosen))
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        raise
+
+
+@router.post("/projects/{project_id}/broll/auto")
+def add_project_broll(
+    request: Request, project_id: str, payload: dict | None = Body(default=None)
+) -> dict[str, object]:
+    """Add B-Rolls: find, download, and place inserts for the current clip.
+
+    One pass over the clip's own transcript sentences: plan where an insert goes
+    (:mod:`app.broll`), search the stock provider for video *and* photos, rank
+    what comes back against the export frame and the insert's length
+    (:mod:`app.broll_auto`), reuse a file this project already has instead of
+    downloading it twice, then place everything through the same validated
+    timeline path the manual insert uses — so the renderer sees exactly the same
+    data either way.
+    """
+
+    store = _store(request)
+    project = store.load(project_id)
+    body = payload or {}
+    if not isinstance(body, dict):
+        raise ApiError("invalid_broll_request", "Send a JSON object.", 422)
+
+    clip = _clip_by_id(project, body.get("clip_id"))
+    segments = _transcript_segments(store, project)
+    local_assets = _broll_assets(project)
+    settings = _stock_settings(request)
+    mode = normalise_mode(body.get("mode") or "auto")
+    max_items = normalise_max_items(body.get("max_items"))
+
+    plan = _export_plan(project)
+    box_width = int(plan.get("width") or 1080)
+    box_height = int(plan.get("height") or 1920)
+    orientation = _orientation_for(box_width, box_height)
+
+    proposal = propose_broll(
+        segments,
+        clip_start=float(clip.get("source_start") or 0.0),
+        clip_end=float(clip.get("source_end") or 0.0),
+        assets=local_assets,
+        mode=mode,
+        max_items=max_items,
+    )
+
+    base: dict[str, object] = {
+        "clip_id": str(clip.get("id")),
+        "mode": mode,
+        "stock_configured": settings.enabled,
+        "stock_note": (
+            None
+            if settings.enabled
+            else "Stock search is off: set PEXELS_API_KEY in .env to enable it. "
+            "Local B-roll keeps working without a key."
+        ),
+        "proposals": proposal["items"],
+        "proposal_note": proposal["note"],
+    }
+
+    if not proposal["items"]:
+        return {**base, "added": 0, "downloaded": 0, "reused": 0, "selected": []}
+
+    online_items = [
+        item
+        for item in proposal["items"]
+        if str((item.get("source") or {}).get("type")) == "online"
+    ]
+    if online_items and not settings.enabled:
+        raise ApiError(
+            "stock_not_configured",
+            "Adding stock B-roll needs a Pexels API key. Set PEXELS_API_KEY in .env "
+            "and restart the app, or choose the local library as the source.",
+            503,
+        )
+
+    # A provider file this project already imported is reused, never fetched
+    # twice: the credit record carries the provider id that identifies it.
+    cache: dict[str, dict] = {}
+    for asset in local_assets:
+        provenance = asset.get("provenance") or {}
+        if provenance.get("provider") and provenance.get("id"):
+            cache[
+                f"{provenance['provider']}:{provenance.get('media_type') or 'video'}:{provenance['id']}"
+            ] = asset
+
+    # Inserts already on this clip are avoided when choosing, so one automatic
+    # pass cannot stack the same clip twice.
+    on_timeline = {
+        str(item.get("source"))
+        for item in (stored_timeline(project).get("broll") or [])
+        if isinstance(item, dict)
+    }
+    used_ids = [
+        key for key, asset in cache.items() if str(asset.get("id")) in on_timeline
+    ]
+
+    def search(query: str) -> list[dict[str, object]]:
+        return _stock_search(
+            settings,
+            query,
+            per_page=AUTO_SEARCH_PER_QUERY,
+            orientation=orientation,
+        )
+
+    fetch_plan = plan_fetches(
+        proposal["items"],
+        search=search,
+        box_width=box_width,
+        box_height=box_height,
+        used_ids=used_ids,
+        per_query=AUTO_SEARCH_PER_QUERY,
+    )
+
+    if not fetch_plan["fetches"] and not [
+        item for item in proposal["items"] if str((item.get("source") or {}).get("type")) == "local"
+    ]:
+        # Nothing could be placed. Say why rather than reporting success with an
+        # empty timeline: the search errors are the interesting part.
+        detail = " ".join(fetch_plan["errors"]) or "; ".join(
+            str(entry.get("reason")) for entry in fetch_plan["skipped"]
+        )
+        return {
+            **base,
+            "added": 0,
+            "downloaded": 0,
+            "reused": 0,
+            "selected": [],
+            "skipped": fetch_plan["skipped"],
+            "errors": fetch_plan["errors"],
+            "note": (
+                "No B-roll could be added automatically. "
+                f"{detail}" if detail else "No B-roll could be added automatically."
+            ),
+        }
+
+    workspace = store.project_workspace(project_id)
+    new_assets: list[dict] = []
+    downloaded = 0
+    reused = 0
+    selected: list[dict] = []
+    references: list[dict] = []
+    failures: list[str] = []
+
+    for item in proposal["items"]:
+        source = item.get("source") or {}
+        if str(source.get("type")) == "local":
+            references.append(
+                {
+                    "asset_id": str(source.get("asset_id")),
+                    "start": item["start"],
+                    "end": item["end"],
+                }
+            )
+
+    for fetch in fetch_plan["fetches"]:
+        candidate = fetch["candidate"]
+        key = candidate_key(candidate)
+        asset = cache.get(key)
+
+        if asset is None:
+            try:
+                asset = _import_stock_file(
+                    settings,
+                    candidate,
+                    workspace,
+                    max_bytes=settings_max_upload_bytes(request),
+                )
+            except ApiError as exc:
+                failures.append(f"“{fetch['query']}”: {exc.message}")
+                continue
+            cache[key] = asset
+            new_assets.append(asset)
+            downloaded += 1
+        else:
+            reused += 1
+
+        references.append(
+            {
+                "asset_id": str(asset.get("id")),
+                "start": fetch["start"],
+                "end": fetch["end"],
+            }
+        )
+
+        provenance = asset.get("provenance") or {}
+        selected.append(
+            {
+                "index": fetch["index"],
+                "start": fetch["start"],
+                "end": fetch["end"],
+                "duration": fetch["duration"],
+                "query": fetch["query"],
+                "asset_id": str(asset.get("id")),
+                "media_type": str(provenance.get("media_type") or candidate.get("media_type")),
+                "label": asset.get("label"),
+                "photographer": provenance.get("photographer"),
+                "page_url": provenance.get("page_url"),
+                "attribution": provenance.get("attribution"),
+                "reason": fetch["reason"],
+                "url": f"/api/projects/{project_id}/assets/{asset.get('id')}/file",
+            }
+        )
+
+    if not references:
+        return {
+            **base,
+            "added": 0,
+            "downloaded": downloaded,
+            "reused": reused,
+            "selected": [],
+            "skipped": fetch_plan["skipped"],
+            "errors": [*fetch_plan["errors"], *failures],
+            "note": "No insert could be added: every candidate failed to download.",
+        }
+
+    if new_assets:
+        existing = [a for a in (project.get("assets") or []) if isinstance(a, dict)]
+        project = store.save_assets(project_id, [*new_assets, *existing])
+
+    placed = _resolve_broll_items(project, references)
+    timeline = _place_broll_items(store, project_id, project, clip, placed)
+
+    placement_note = timeline.pop("note", None)
+    notes = [
+        plan_note(
+            fetch_plan,
+            matched_locally=len(references) - len(fetch_plan["fetches"]),
+        )
+    ]
+    if isinstance(placement_note, str) and placement_note:
+        notes.append(placement_note)
+    if reused:
+        notes.append(f"{reused} insert(s) reuse a file already in this project.")
+    if failures:
+        notes.append("Some searches did not finish: " + " ".join(failures))
+    if fetch_plan["errors"]:
+        notes.append("Search errors: " + " ".join(fetch_plan["errors"]))
+
+    return {
+        **base,
+        **timeline,
+        "added": len(references),
+        "downloaded": downloaded,
+        "reused": reused,
+        "selected": selected,
+        "skipped": fetch_plan["skipped"],
+        "errors": [*fetch_plan["errors"], *failures],
+        "notes": notes,
+        "note": " ".join(notes),
     }
 
 
@@ -1075,12 +1486,15 @@ def search_stock(
     q: str | None = Query(default=None),
     clip_id: str | None = Query(default=None),
     per_page: int | None = Query(default=None),
+    orientation: str | None = Query(default=None),
+    media: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Search for stock B-roll, optionally using the clip's own transcript.
 
     With no explicit query, the keywords come from the transcript of the clip the
     user is editing, so the search matches what is actually being said at that
-    moment rather than a generic topic.
+    moment rather than a generic topic. Videos and photos are searched together;
+    ``media`` narrows that to one kind when the user asks for it.
     """
 
     settings = _stock_settings(request)
@@ -1104,17 +1518,19 @@ def search_stock(
         )
         text = ", ".join(keywords)
 
-    results = search_videos(
+    results = _stock_search(
         settings,
         text,
         per_page=per_page or STOCK_PER_PAGE,
+        orientation=str(orientation or "all"),
+        media=str(media or "both"),
     )
 
     payload: dict[str, object] = {
         **_stock_status(settings),
         "query": text,
         "keywords": keywords,
-        "results": [describe_result(video) for video in results],
+        "results": [describe_result(result) for result in results],
     }
 
     if clip is not None:
@@ -1132,12 +1548,12 @@ def search_stock(
 def import_stock(
     request: Request, project_id: str, payload: dict | None = Body(default=None)
 ) -> dict[str, object]:
-    """Import one chosen stock clip into the project's asset library.
+    """Import one chosen stock clip or photo into the project's asset library.
 
-    Nothing is downloaded until this call, and the clip's metadata is re-read from
-    the provider rather than taken from the browser, so only a URL the provider
-    itself returned can ever be fetched. The file is streamed to disk under a
-    generated name and its credit is saved with it.
+    Nothing is downloaded until this call, and the media's metadata is re-read
+    from the provider rather than taken from the browser, so only a URL the
+    provider itself returned can ever be fetched. The file is streamed to disk
+    under a generated name and its credit is saved with it.
     """
 
     settings = _stock_settings(request)
@@ -1149,45 +1565,26 @@ def import_stock(
     if not isinstance(body, dict):
         raise ApiError("invalid_stock_selection", "Send a JSON object.", 422)
 
-    video = fetch_video(settings, body.get("video_id"))
-    chosen = select_file(video, body.get("file_id"))
-
-    label = " ".join(str(body.get("label") or video.get("photographer") or "Stock clip").split())
-    tags = "stock, pexels"
-
-    part_path = workspace.temp / f"stock-{uuid.uuid4().hex}.part"
-    destination: Path | None = None
-
-    try:
-        download_file(
-            chosen["link"],
-            part_path,
-            max_bytes=settings_max_upload_bytes(request),
-        )
-        metadata = probe_media(part_path)
-        asset_id = f"broll-{uuid.uuid4().hex[:12]}"
-        asset = asset_from_import(
-            asset_id=asset_id,
-            kind="broll",
-            label=normalise_label(label, "Stock clip"),
-            stored_name="",
-            original_name=str(video.get("page_url") or "pexels-clip"),
-            tags=normalise_tags(tags),
-            metadata=metadata,
+    media_type = str(body.get("media_type") or "video").strip().lower()
+    if media_type == "photo":
+        candidate = fetch_photo(settings, body.get("photo_id"))
+    elif media_type == "video":
+        candidate = fetch_video(settings, body.get("video_id"))
+    else:
+        raise ApiError(
+            "invalid_stock_selection", "media_type must be video or photo.", 422
         )
 
-        destination = allocate_asset_path(workspace.assets, "broll", ".mp4")
-        part_path.replace(destination)
-        asset["file"] = destination.name
-        asset = with_provenance(asset, provenance_for(video, chosen))
+    asset = _import_stock_file(
+        settings,
+        candidate,
+        workspace,
+        max_bytes=settings_max_upload_bytes(request),
+        label=str(body.get("label") or "") or None,
+    )
 
-        assets = [a for a in (project.get("assets") or []) if isinstance(a, dict)]
-        saved = store.save_assets(project_id, [asset, *assets])
-    except BaseException:
-        part_path.unlink(missing_ok=True)
-        if destination is not None:
-            destination.unlink(missing_ok=True)
-        raise
+    assets = [a for a in (project.get("assets") or []) if isinstance(a, dict)]
+    saved = store.save_assets(project_id, [asset, *assets])
 
     imported = next(
         item for item in saved.get("assets") or [] if str(item.get("id")) == asset["id"]

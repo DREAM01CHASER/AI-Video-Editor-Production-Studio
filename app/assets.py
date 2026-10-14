@@ -18,7 +18,13 @@ from typing import Iterable, Sequence
 
 from .errors import ApiError
 from .media import MediaMetadata
-from .storage import CONTENT_TYPES_BY_EXTENSION, SUPPORTED_VIDEO_EXTENSIONS
+from .storage import (
+    CONTENT_TYPES_BY_EXTENSION,
+    CONTENT_TYPES_BY_IMAGE_EXTENSION,
+    SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS,
+    is_image_filename,
+)
 
 BROLL = "broll"
 SFX = "sfx"
@@ -36,6 +42,13 @@ CONTENT_TYPES_BY_AUDIO_EXTENSION = {
     ".flac": frozenset({"audio/flac", "audio/x-flac"}),
 }
 
+#: B-roll is a video clip or a still image. Both are composited the same way; an
+#: image simply has no duration of its own, so the timeline's interval decides how
+#: long it is on screen.
+BROLL_VIDEO_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS
+BROLL_IMAGE_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS
+BROLL_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
+
 #: A short B-roll insert is a cutaway; a very long one is a second edit.
 MAX_BROLL_SECONDS = 120.0
 #: Long enough for a whoosh or a riser, short enough to be an effect.
@@ -47,6 +60,7 @@ MAX_LABEL_LENGTH = 80
 
 _MEDIA_TYPES_BY_SUFFIX = {
     **{suffix: sorted(types)[0] for suffix, types in CONTENT_TYPES_BY_EXTENSION.items()},
+    **{suffix: sorted(types)[0] for suffix, types in CONTENT_TYPES_BY_IMAGE_EXTENSION.items()},
     **{suffix: sorted(types)[0] for suffix, types in CONTENT_TYPES_BY_AUDIO_EXTENSION.items()},
 }
 
@@ -75,7 +89,13 @@ def media_type_for(path: Path) -> str:
 
 
 def accepted_extensions(kind: str) -> frozenset[str]:
-    return SUPPORTED_VIDEO_EXTENSIONS if kind == BROLL else AUDIO_EXTENSIONS
+    return BROLL_EXTENSIONS if kind == BROLL else AUDIO_EXTENSIONS
+
+
+def media_kind_for(name: str) -> str:
+    """Whether a B-roll file is a still image or a moving clip."""
+
+    return "image" if is_image_filename(name) else "video"
 
 
 def validate_asset_filename(filename: str, kind: str) -> str:
@@ -108,8 +128,10 @@ def validate_asset_metadata(
     extension = validate_asset_filename(filename, kind)
 
     normalized = (content_type or "").split(";", 1)[0].strip().lower()
-    known = CONTENT_TYPES_BY_EXTENSION.get(extension) or CONTENT_TYPES_BY_AUDIO_EXTENSION.get(
-        extension
+    known = (
+        CONTENT_TYPES_BY_EXTENSION.get(extension)
+        or CONTENT_TYPES_BY_IMAGE_EXTENSION.get(extension)
+        or CONTENT_TYPES_BY_AUDIO_EXTENSION.get(extension)
     )
     if normalized and known and normalized not in known:
         # A browser often reports a generic type, so only a *conflicting* claim is
@@ -219,14 +241,18 @@ def asset_from_import(
             422,
         )
 
+    # A still image has no duration to read and no length to check: how long it
+    # stays on screen is decided by its interval on the timeline, not by the file.
+    is_image = kind == BROLL and is_image_filename(original_name or stored_name)
+
     limit = MAX_BROLL_SECONDS if kind == BROLL else MAX_SFX_SECONDS
-    if metadata.duration <= 0:
+    if not is_image and metadata.duration <= 0:
         raise ApiError(
             "invalid_asset",
             "The file's duration could not be read, so it cannot be placed on the timeline.",
             422,
         )
-    if metadata.duration > limit:
+    if not is_image and metadata.duration > limit:
         raise ApiError(
             "invalid_asset",
             f"A {kind} file cannot be longer than {limit:g}s (this one is "
@@ -243,6 +269,11 @@ def asset_from_import(
         "file": stored_name,
         "original_name": original_name[:120],
         "tags": list(tags),
+        # ``media_kind`` travels with the record so the renderer can loop a still
+        # image for its interval instead of asking FFprobe again at export time.
+        "media_kind": media_kind_for(stored_name or original_name)
+        if kind == BROLL
+        else "audio",
         "duration": metadata.duration,
         "width": metadata.width,
         "height": metadata.height,

@@ -26,11 +26,16 @@ from app.stock import (
     derive_keywords,
     download_file,
     download_host_allowed,
+    fetch_photo,
     fetch_video,
+    normalise_photo,
     normalise_query,
     normalise_video,
+    parse_photo_results,
+    rendition_size,
     parse_search_results,
     provenance_for,
+    search_photos,
     search_videos,
     select_file,
     suggest_placement,
@@ -341,6 +346,147 @@ def test_provenance_records_the_source_and_creator() -> None:
     assert record["file_quality"] == "hd"
 
 
+# ------------------------------------------------------------------- photos
+
+#: A photo response, so the still-image path is checked against the shape the
+#: provider really returns (``src`` renditions rather than ``video_files``).
+PHOTO_BODY = json.dumps(
+    {
+        "page": 1,
+        "per_page": 1,
+        "total_results": 1,
+        "photos": [
+            {
+                "id": 777,
+                "width": 1200,
+                "height": 1800,
+                "url": "https://www.pexels.com/photo/a-desk-of-documents-777/",
+                "photographer": "Kelly",
+                "photographer_url": "https://www.pexels.com/@kelly",
+                "alt": "a desk of documents",
+                "src": {
+                    "medium": "https://images.pexels.com/photos/777/pexels-photo-777-medium.jpeg",
+                    "large2x": "https://images.pexels.com/photos/777/pexels-photo-777-large2x.jpg",
+                    "original": "https://images.pexels.com/photos/777/pexels-photo-777.jpeg",
+                },
+                "user": {"id": 1, "name": "Kelly", "url": "https://www.pexels.com/@kelly"},
+            },
+            # No renditions at all: dropped, not offered and then refused.
+            {"id": 778, "width": 0, "height": 0, "src": {}},
+        ],
+    }
+).encode("utf-8")
+
+
+def test_a_photo_carries_a_downloadable_rendition_and_its_credit() -> None:
+    photo = normalise_photo(json.loads(PHOTO_BODY)["photos"][0])
+    assert photo is not None
+
+    assert photo["media_type"] == "photo"
+    # A still has no length of its own; the timeline interval decides.
+    assert photo["duration"] == 0.0
+    assert photo["best_file"]["quality"] == "large2x"
+    assert photo["best_file"]["link"].startswith("https://images.pexels.com/")
+    assert photo["preview_url"].endswith("-medium.jpeg")
+    assert photo["photographer"] == "Kelly"
+
+    record = provenance_for(photo, photo["best_file"])
+    assert record["media_type"] == "photo"
+    assert record["attribution"] == ATTRIBUTION
+    assert record["photographer"] == "Kelly"
+
+
+def test_the_original_photo_is_not_the_default_download() -> None:
+    """The original is often thousands of pixels wide; the export is 1080."""
+
+    photo = normalise_photo(json.loads(PHOTO_BODY)["photos"][0])
+    assert photo is not None
+
+    qualities = [item["quality"] for item in photo["files"]]
+    assert qualities[0] == "large2x"
+    assert qualities[-1] == "original"
+
+
+def test_a_rendition_reports_the_size_it_will_really_be() -> None:
+    """The downloaded file's size, not the original's: the ranking uses it."""
+
+    # The URL's own transform parameters are the delivered size (dpr included).
+    assert rendition_size(
+        "https://images.pexels.com/photos/1/x.jpg?auto=compress&dpr=2&h=650&w=940",
+        "medium",
+        (4480, 6720),
+    ) == (1880, 1300)
+
+    # Without them, the documented long side is scaled by the photo's own aspect.
+    assert rendition_size("https://images.pexels.com/photos/1/x.jpg", "large2x", (4480, 6720)) == (
+        1253,
+        1880,
+    )
+    assert rendition_size("https://images.pexels.com/photos/1/x.jpg", "large2x", (6720, 4480)) == (
+        1880,
+        1253,
+    )
+
+    # A cropped rendition has its own fixed shape whatever the original was.
+    assert rendition_size("https://images.pexels.com/photos/1/x.jpg", "portrait", (4480, 6720)) == (
+        800,
+        1200,
+    )
+
+
+def test_a_photo_is_judged_by_its_rendition_not_its_original_size() -> None:
+    photo = normalise_photo(json.loads(PHOTO_BODY)["photos"][0])
+    assert photo is not None
+    assert photo["best_file"]["quality"] == "large2x"
+
+    assert photo["original_width"] == 1200
+    assert (photo["width"], photo["height"]) == (
+        photo["best_file"]["width"],
+        photo["best_file"]["height"],
+    )
+
+
+def test_a_photographer_url_is_not_shown_as_a_name() -> None:
+    """Some records put a link in the name field; a link is then not shown as one."""
+
+    record = dict(json.loads(PHOTO_BODY)["photos"][0])
+    record.pop("user")
+    record["photographer"] = "https://kaboompics.com/"
+
+    photo = normalise_photo(record)
+    assert photo is not None
+    assert photo["photographer"] == ""
+
+
+def test_a_photo_without_renditions_is_dropped() -> None:
+    assert parse_photo_results(PHOTO_BODY) != []
+    assert len(parse_photo_results(PHOTO_BODY)) == 1
+    assert normalise_photo(json.loads(PHOTO_BODY)["photos"][1]) is None
+
+
+def test_photo_search_needs_a_query_and_a_key() -> None:
+    with pytest.raises(ApiError):
+        search_photos(PexelsSettings(api_key="key"), "   ")
+    with pytest.raises(ApiError) as error:
+        search_photos(PexelsSettings(api_key=None), "desk")
+    assert error.value.code == "stock_not_configured"
+
+
+def test_fetching_a_photo_re_reads_it_from_the_provider() -> None:
+    body = json.dumps(json.loads(PHOTO_BODY)["photos"][0]).encode("utf-8")
+
+    photo = fetch_photo(PexelsSettings(api_key="key"), 777, opener=_opener(body))
+
+    assert photo["id"] == "777"
+    assert photo["page_url"] == "https://www.pexels.com/photo/a-desk-of-documents-777/"
+
+
+def test_a_pexels_image_host_may_be_downloaded_and_others_may_not() -> None:
+    assert download_host_allowed("https://images.pexels.com/photos/777/x.jpg")
+    assert not download_host_allowed("https://example.com/photos/777/x.jpg")
+    assert not download_host_allowed("http://images.pexels.com/photos/777/x.jpg")
+
+
 # ----------------------------------------------------------- placement
 
 
@@ -459,6 +605,79 @@ def test_search_uses_the_clip_transcript_and_shows_provenance(tmp_path, monkeypa
 
     suggestion = payload["suggested_placement"]
     assert 0.0 <= suggestion["start"] < suggestion["end"] <= 8.0
+
+
+def test_the_search_returns_photos_and_videos_together(tmp_path, monkeypatch) -> None:
+    """Both kinds are searched; a still is often the better cutaway."""
+
+    import app.stock as stock_module
+
+    both = json.dumps(
+        {
+            "videos": json.loads(SEARCH_BODY)["videos"],
+            "photos": json.loads(PHOTO_BODY)["photos"],
+        }
+    ).encode("utf-8")
+
+    client = _project(tmp_path, api_key="k")
+    monkeypatch.setattr(stock_module, "_urlopen", _opener(both))
+
+    payload = client.get(
+        "/api/projects/abc123/stock/search", params={"q": "documents"}
+    ).json()
+    kinds = {result["media_type"] for result in payload["results"]}
+    assert kinds == {"video", "photo"}
+
+    # ``media`` narrows it to one kind when the user asks for that.
+    photos_only = client.get(
+        "/api/projects/abc123/stock/search",
+        params={"q": "documents", "media": "photo"},
+    ).json()
+    assert {result["media_type"] for result in photos_only["results"]} == {"photo"}
+    assert photos_only["results"][0]["file"]["quality"] == "large2x"
+
+
+def test_importing_a_stock_photo_stores_an_image_with_its_credit(
+    tmp_path, monkeypatch
+) -> None:
+    """A chosen photo is imported through the same route a clip is."""
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg/FFprobe are not on PATH, so an image import cannot be verified.")
+
+    import app.stock as stock_module
+
+    from tests.test_broll_auto import _real_jpeg
+
+    client = _project(tmp_path, api_key="k")
+    single = json.dumps(json.loads(PHOTO_BODY)["photos"][0]).encode("utf-8")
+    monkeypatch.setattr(stock_module, "_urlopen", _opener(single))
+    photo_bytes = _real_jpeg(tmp_path)
+    monkeypatch.setattr(
+        stock_module, "_urlopen_stream", lambda request, timeout: _FakeResponse(photo_bytes)
+    )
+
+    response = client.post(
+        "/api/projects/abc123/stock/import",
+        json={"media_type": "photo", "photo_id": 777},
+    )
+
+    assert response.status_code == 201, response.text
+    asset = response.json()
+    assert asset["kind"] == "broll"
+    assert asset["media_kind"] == "image"
+    assert asset["file"].endswith(".jpg")
+    assert asset["provenance"]["media_type"] == "photo"
+    assert asset["provenance"]["attribution"] == ATTRIBUTION
+
+
+def test_an_unknown_stock_media_type_is_refused(tmp_path) -> None:
+    response = _project(tmp_path, api_key="k").post(
+        "/api/projects/abc123/stock/import", json={"media_type": "gif", "photo_id": 1}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_stock_selection"
 
 
 def test_importing_a_chosen_clip_keeps_its_credit(tmp_path, monkeypatch) -> None:

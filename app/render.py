@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .errors import ApiError
+from .storage import is_image_filename
 from .timeline import DEFAULT_FPS, normalise_fps
 from .transitions import build_transition_chain
 
@@ -547,7 +548,30 @@ def _build_composite_command(
             )
         asset_start = max(0.0, float(item.get("source_start") or 0.0))
         length = max(0.05, float(item.get("end") or 0.0) - float(item.get("start") or 0.0))
-        inputs += ["-ss", f"{asset_start:.3f}", "-t", f"{length:.3f}", "-i", str(path)]
+
+        if is_image_filename(path):
+            # A still image has no timeline of its own, so it is looped over the
+            # whole interval. Without `-loop 1` the overlay would show a single
+            # frame at the start of the cutaway and then nothing.
+            inputs += [
+                "-loop",
+                "1",
+                "-framerate",
+                str(int(fps or DEFAULT_FPS)),
+                "-t",
+                f"{length:.3f}",
+                "-i",
+                str(path),
+            ]
+        else:
+            inputs += [
+                "-ss",
+                f"{asset_start:.3f}",
+                "-t",
+                f"{length:.3f}",
+                "-i",
+                str(path),
+            ]
         broll_entries.append({"item": item, "index": index})
         index += 1
 

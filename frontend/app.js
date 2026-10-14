@@ -216,6 +216,7 @@ const els = {
   captionPositionValue: document.getElementById("caption-position-value"),
   brollMode: document.getElementById("broll-mode"),
   brollMax: document.getElementById("broll-max"),
+  btnBrollAuto: document.getElementById("btn-broll-auto"),
   btnBrollSuggest: document.getElementById("btn-broll-suggest"),
   brollStatus: document.getElementById("broll-status"),
   brollError: document.getElementById("broll-error"),
@@ -297,6 +298,10 @@ const state = {
   broll: {
     proposals: [],
     payload: null,
+    //: The inserts a one-click pass actually downloaded and placed, with their
+    //: credit, so the panel can show what went into the edit and from where.
+    selected: [],
+    busy: false,
   },
   //: The composed edit for the selected clip: in/out points, captions, render
   //: settings, and the item tracks. The project JSON stays the source of truth.
@@ -371,6 +376,18 @@ async function checkHealth() {
     els.healthStatus.textContent = "Backend ready";
     els.healthStatus.className = "status status-ready";
     els.healthMessage.textContent = `${data.service} is running locally. Workspace: ${data.workspace}.`;
+    // Which device transcription can really use, shown before any job runs: a
+    // visible GPU whose CUDA runtime is missing is a CPU run, and that has to be
+    // stated rather than discovered from a slow transcription.
+    const compute = data.transcription?.compute;
+    if (compute) {
+      const device = compute.usable ? "GPU (CUDA)" : "CPU";
+      els.healthMessage.textContent +=
+        ` Transcription: ${device} — ${compute.model || "model"}` +
+        (compute.usable ? ` on ${compute.device_count} CUDA device.` : `/int8.`) +
+        ` ${compute.summary}`;
+      if (compute.remedy) els.healthMessage.textContent += ` ${compute.remedy}`;
+    }
   } catch (error) {
     els.healthStatus.textContent = "Backend unavailable";
     els.healthStatus.className = "status status-error";
@@ -784,7 +801,9 @@ function renderStockResults() {
 
     const title = document.createElement("span");
     title.className = "stock-card__title";
-    title.textContent = `${result.width || "?"}×${result.height || "?"} · ${formatAssetDuration(result.duration)}`;
+    title.textContent =
+      `${result.width || "?"}×${result.height || "?"} · ` +
+      (result.media_type === "photo" ? "still image" : formatAssetDuration(result.duration));
 
     const credit = document.createElement("span");
     credit.className = "stock-card__credit";
@@ -897,7 +916,11 @@ async function importStockResult(result) {
       {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ video_id: result.id }),
+        body: JSON.stringify(
+          result.media_type === "photo"
+            ? { media_type: "photo", photo_id: result.id }
+            : { media_type: "video", video_id: result.id }
+        ),
       }
     );
     const asset = await response.json().catch(() => ({}));
@@ -953,7 +976,8 @@ async function placeStockAssetOnTimeline(asset, result) {
         start: round3(start),
         end: round3(end),
         placement: "full",
-        fit: "contain",
+        // A still fills the frame; a clip keeps its own framing.
+        fit: result?.media_type === "photo" ? "cover" : "contain",
       },
     ],
   });
@@ -1577,11 +1601,20 @@ function hideBrollError() {
 }
 
 function updateBrollControls() {
-  els.btnBrollSuggest.disabled = !isRealProject() || !state.timeline;
+  const ready = isRealProject() && Boolean(state.timeline) && !state.broll.busy;
+  els.btnBrollSuggest.disabled = !ready;
+  els.btnBrollAuto.disabled = !ready;
+  els.btnBrollAuto.title = !isRealProject()
+    ? "Import a video first — B-roll follows a clip's transcript."
+    : !state.timeline
+      ? "Select a clip first — the search follows its transcript."
+      : state.broll.busy
+        ? "A B-roll pass is already running."
+        : "Search stock videos and photos for this clip and place them on the timeline.";
 }
 
 function resetBroll(note) {
-  state.broll = { proposals: [], payload: null };
+  state.broll = { proposals: [], payload: null, selected: [], busy: false };
   els.brollProposals.replaceChildren();
   els.brollCount.textContent = "0";
   hideBrollError();
@@ -1592,8 +1625,41 @@ function resetBroll(note) {
 /** Render the proposed insert times and where each one would come from. */
 function renderBrollProposals() {
   els.brollProposals.replaceChildren();
+  const placed = state.broll.selected || [];
   const proposals = state.broll.proposals || [];
-  els.brollCount.textContent = String(proposals.length);
+  els.brollCount.textContent = String(placed.length || proposals.length);
+
+  for (const item of placed) {
+    const entry = document.createElement("li");
+    entry.className = "list__item";
+
+    const time = document.createElement("p");
+    time.className = "list__title";
+    time.textContent = `${Number(item.start).toFixed(1)}s to ${Number(item.end).toFixed(1)}s · ${item.media_type === "photo" ? "still image" : "video"}`;
+    entry.append(time);
+
+    const detail = document.createElement("p");
+    detail.className = "panel__hint";
+    detail.textContent = `${item.label || "Stock media"} — ${item.reason || ""}`;
+    entry.append(detail);
+
+    // Pexels' terms require the credit to appear where the media is shown.
+    const credit = document.createElement("p");
+    credit.className = "panel__hint";
+    if (item.page_url) {
+      const link = document.createElement("a");
+      link.href = item.page_url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = item.photographer || "View on Pexels";
+      credit.append(link, document.createTextNode(" · Media provided by Pexels"));
+    } else {
+      credit.textContent = "From your own library";
+    }
+    entry.append(credit);
+
+    els.brollProposals.append(entry);
+  }
 
   for (const proposal of proposals) {
     const item = document.createElement("li");
@@ -1633,6 +1699,69 @@ function renderBrollProposals() {
   }
 }
 
+/**
+ * Add B-Rolls: search the clip's transcript, download the best match for each
+ * moment, and place them on the timeline in one pass.
+ *
+ * This is the whole workflow the button promises — analysis, stock search,
+ * download, and timeline insertion — so the export uses the result rather than
+ * only the panel showing it.
+ */
+async function addBrolls() {
+  if (!isRealProject() || !state.timeline || state.broll.busy) return;
+
+  state.broll.busy = true;
+  hideBrollError();
+  els.brollStatus.textContent =
+    "Reading the clip's transcript, searching stock video and photos, and downloading the best match for each moment…";
+  updateBrollControls();
+
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(state.project.id)}/broll/auto`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          clip_id: state.timeline.clip_id,
+          mode: els.brollMode.value,
+          max_items: Number(els.brollMax.value) || 3,
+        }),
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        apiErrorMessage(payload, `Could not add B-roll (HTTP ${response.status}).`)
+      );
+    }
+
+    const summary = [payload.note, payload.stock_note].filter(Boolean).join(" ");
+    log(
+      `Add B-Rolls: ${payload.added ?? 0} insert(s) placed, ` +
+        `${payload.downloaded ?? 0} downloaded, ${payload.reused ?? 0} reused.`
+    );
+
+    // The timeline is what the renderer reads, so reload it from the server
+    // rather than assuming the local copy matches — and show the result *after*
+    // that reload, because loading a timeline resets this panel.
+    await loadTimeline(state.project.id, state.timeline.clip_id);
+    await fetchAssets(state.project.id);
+
+    state.broll.selected = Array.isArray(payload.selected) ? payload.selected : [];
+    // A placed set supersedes the earlier draft proposals.
+    state.broll.proposals = [];
+    state.broll.payload = payload;
+    renderBrollProposals();
+    els.brollStatus.textContent = summary;
+  } catch (error) {
+    showBrollError(error.message);
+  } finally {
+    state.broll.busy = false;
+    updateBrollControls();
+  }
+}
+
 /** Ask the backend where B-roll should go, for how long, and from where. */
 async function suggestBroll() {
   if (!isRealProject() || !state.timeline) return;
@@ -1658,7 +1787,7 @@ async function suggestBroll() {
       throw new Error(apiErrorMessage(payload, `Could not suggest B-roll (HTTP ${response.status}).`));
     }
 
-    state.broll = { proposals: payload.items || [], payload };
+    state.broll = { proposals: payload.items || [], payload, selected: [], busy: false };
     renderBrollProposals();
     els.brollStatus.textContent = [payload.note, payload.stock_note]
       .filter(Boolean)
@@ -3542,6 +3671,7 @@ els.btnTimelineIn.addEventListener("click", () => setClipEdgeFromPlayhead("in"))
 els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"));
 els.btnAddBroll.addEventListener("click", addBrollAtPlayhead);
 els.btnBrollSuggest.addEventListener("click", suggestBroll);
+els.btnBrollAuto.addEventListener("click", addBrolls);
 els.btnAddSfx.addEventListener("click", addSfxAtPlayhead);
 els.btnAddTransition.addEventListener("click", addTransition);
 

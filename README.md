@@ -266,10 +266,31 @@ anymore. The sample project stays clearly labelled as sample data.
 
 ## Automatic B-roll
 
-`POST /api/projects/{project_id}/broll/propose` reads the clip's transcript and
-suggests where a cutaway should go, **how long it should run, and from where** — a
-draft the user accepts or ignores. `POST .../broll/apply` places accepted items
-through the same validated timeline path as a hand-placed insert.
+**Add B-Rolls** (`POST /api/projects/{project_id}/broll/auto`) is one click from
+the clip's transcript to inserts that are already on the timeline and ready to
+export:
+
+1. **Read the clip, not the whole video.** Only the selected clip's transcript
+   window is analysed, so the search follows what is being said *here*.
+2. **Turn sentences into queries.** Concrete words are pulled from each sentence
+   (Hindi and Hinglish transcripts included), and one search is made per sentence —
+   never one per word.
+3. **Search videos *and* photos.** Both kinds come back from Pexels and are ranked
+   together, because a still is often the better cutaway for a place, an object, or
+   a document.
+4. **Rank for this clip.** Same orientation as the export, a rendition that still
+   covers the frame (a photo is judged by the rendition that will actually be
+   downloaded, not by its original), a length that covers the insert without being
+   wildly long, keyword overlap, then a small preference for motion. An asset
+   already used in the pass is skipped rather than repeated.
+5. **Download once, place, and credit.** The chosen file is streamed into the
+   project's own `assets/` folder under a generated name, stored with its provider
+   credit, and placed through the same validated timeline path a hand-placed insert
+   uses. A file the project already has is reused instead of downloaded again.
+
+`POST .../broll/propose` still exists for planning first: it returns where a
+cutaway should go and how long it should run as a draft to edit or ignore, and
+`POST .../broll/apply` places accepted items.
 
 - **Placement follows the words.** A moment is suggested only where a sentence has
   concrete, visual words to illustrate; filler and short lines are skipped.
@@ -279,6 +300,12 @@ through the same validated timeline path as a hand-placed insert.
 - **The speaker keeps the screen.** Inserts cover at most 40% of the clip, stay at
   least 0.5s apart, and a short asset shortens the insert instead of freezing or
   blacking the frame.
+- **Video and stills both work.** An image has no duration of its own, so FFmpeg
+  loops it for exactly its interval (`-loop 1 -t …`) and the overlay covers the
+  whole cutaway rather than flashing one frame at the start of it.
+- **The spoken audio is never touched.** Stock footage is composited as video only;
+  its own audio is not mapped into the export, so an unrelated sound never leaks
+  into the edit.
 - **Three source modes.** *Local* uses only imported B-roll; *Online* queries the
   configured Pexels key; *Auto* prefers a local asset whose label or tags match the
   words and falls back to a stock query. Nothing is downloaded until the user
@@ -319,9 +346,12 @@ Stated plainly, because a feature that is not finished should not look finished.
 - **Clip scores are estimates, never predictions.** A score describes how
   self-contained and information-dense a moment is. Nothing here predicts whether
   a clip will perform well on a platform.
-- **Transcription runs on CPU here.** This machine has a visible NVIDIA GPU but no
-  cuBLAS runtime, so it falls back to CPU/int8 — correct, but noticeably slower
-  than the GPU path on a machine with a working CUDA runtime.
+- **GPU transcription needs the CUDA runtime installed.** A visible NVIDIA GPU is
+  not a usable one: the cuBLAS and cuDNN libraries are a separate install, so
+  `pip install -r requirements.txt` alone leaves the machine transcribing on
+  CPU/int8. `python -m pip install -r requirements-gpu.txt` adds them to the
+  virtualenv and the app picks them up; until then the interface, the log, and
+  `/api/health` all say CPU and name the missing libraries.
 - **Whisper does not always punctuate.** When a transcript has little sentence
   punctuation, clip edges are described as estimates that may need a trim rather
   than as exact sentence boundaries.
@@ -385,6 +415,42 @@ For development checks, install the test dependency too:
 python -m pip install -r requirements-dev.txt
 ```
 
+### NVIDIA GPU transcription (optional, Windows and Linux x86_64)
+
+`pip install -r requirements.txt` installs `faster-whisper` and CTranslate2 but
+**not** the CUDA runtime they load at inference time, so a machine with a working
+NVIDIA GPU still transcribes on the CPU. That is the single most common reason GPU
+acceleration appears not to work: the driver reports the card, CTranslate2 says it
+can see one device, and the model still cannot be created because `cuBLAS` and
+`cuDNN` are not loadable.
+
+Install the runtime inside the virtualenv:
+
+```powershell
+python -m pip install -r requirements-gpu.txt
+```
+
+That puts the libraries in `.venv\Lib\site-packages\nvidia\<package>\bin`; the
+application adds those directories to its DLL search path at startup, so nothing
+else has to be configured. It needs:
+
+* an up-to-date **NVIDIA driver** (591 or newer on Windows 11 is a known-good
+  combination; the wheels ship the CUDA libraries, not the driver);
+* **Windows or Linux on x86_64** — the CUDA wheels are not published for macOS or
+  for ARM, and transcription then runs on the CPU, which is supported and correct.
+* about **1 GB** of disk for the three wheels.
+
+Check that it worked before blaming the app:
+
+```powershell
+python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
+```
+
+Anything other than `0` means a device is visible. Whether transcription actually
+uses is reported by `GET /api/health` under `transcription.compute`, shown in the
+interface as *Transcription: GPU (CUDA)* or *CPU*, and written to the app log with
+the reason when the GPU path is unavailable.
+
 The application uses `workspace/` inside the repository by default. To point it
 at another local directory, set `AI_VIDEO_WORKSPACE` before starting the server.
 See `.env.example` for the supported foundation settings. Keep `.env` local;
@@ -435,8 +501,11 @@ Stop the server with `Ctrl+C`.
 | `GET` | `/api/projects/{project_id}/timeline` | Read the editable edit for one clip. |
 | `PATCH` | `/api/projects/{project_id}/timeline` | Save an edited timeline (clip, captions, render settings, tracks). |
 | `GET` | `/api/projects/{project_id}/stock` | Whether stock B-roll search is configured, and on what terms. |
-| `GET` | `/api/projects/{project_id}/stock/search` | Search stock B-roll; empty query uses the clip's own transcript words. |
-| `POST` | `/api/projects/{project_id}/stock/import` | Download one chosen stock clip into the project, with its credit. |
+| `GET` | `/api/projects/{project_id}/stock/search` | Search stock videos and photos; empty query uses the clip's own transcript words. |
+| `POST` | `/api/projects/{project_id}/stock/import` | Download one chosen stock clip or photo into the project, with its credit. |
+| `POST` | `/api/projects/{project_id}/broll/propose` | Plan where B-roll should go and for how long, without downloading anything. |
+| `POST` | `/api/projects/{project_id}/broll/apply` | Place accepted proposals on the clip's timeline. |
+| `POST` | `/api/projects/{project_id}/broll/auto` | **Add B-Rolls**: search, download, and place inserts for the clip in one pass. |
 | `POST` | `/api/projects/{project_id}/render` | Render the selected clip to a captioned MP4 (`202` + job). |
 | `GET` | `/api/projects/{project_id}/exports` | List finished renders, newest first. |
 | `GET` | `/api/projects/{project_id}/exports/{filename}` | Download a rendered MP4 or its `.srt` sidecar. |
@@ -562,10 +631,18 @@ needs an internet connection; after that the model is reused from the normal
 Hugging Face cache. Set `WHISPER_ALLOW_DOWNLOAD=false` to stay offline —
 transcription then reports a clear error unless the model is already cached.
 A CUDA device that is visible but missing its cuDNN/cuBLAS runtime falls back to
-CPU automatically, and the fallback is recorded in the transcript. This includes a
+CPU automatically, and the fallback is recorded in the transcript — including the
+reason, which points at `pip install -r requirements-gpu.txt`. This includes a
 runtime that only fails on the **first inference** — CTranslate2 loads a CUDA model
 successfully and only then fails on the CUDA libraries, so the retry is applied
 during transcription as well as at model load.
+
+The chosen device is visible in three places: `GET /api/health`
+(`transcription.compute`), the transcript summary in the interface (which shows
+`CUDA` or `CPU` next to the model), and the app log, where a GPU that could not be
+used is logged as a warning explaining what is missing. The decision itself is
+made by `app/compute.py`, which loads the virtualenv's CUDA runtime, probes the
+libraries, and reports the result as data.
 
 ## Optional LLM clip labels
 
