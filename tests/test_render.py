@@ -494,6 +494,60 @@ def _green_image(path: Path, size: str = "800x800") -> None:
     )
 
 
+def _loud_insert(path: Path, seconds: int = 6) -> None:
+    """A bright insert that is also loud: if its audio were mixed in, this shows."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=green:size=320x240:rate=25:duration={seconds}",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=880:duration={seconds}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(path),
+    )
+
+
+def _mean_volume_db(path: Path) -> float:
+    """Average loudness of a file's audio, measured by FFmpeg itself."""
+
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-v",
+            "info",
+            "-i",
+            str(path),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    found = re.findall(
+        r"mean_volume:\s*(-?[0-9.]+) dB", completed.stdout + completed.stderr
+    )
+    assert found, f"FFmpeg reported no volume statistics: {completed.stderr[-400:]}"
+    return float(found[-1])
+
+
 def _caption_area_luma(video: Path, at: float, crop: str = CAPTION_CROP) -> float:
     """Average luma of the caption area, measured by FFmpeg itself."""
 
@@ -725,6 +779,60 @@ def test_an_image_b_roll_is_visible_in_the_exported_video(tmp_path: Path) -> Non
     outside = _caption_area_luma(output, at=0.5, crop=middle)
     assert inside > 60.0, f"the image insert is not visible in the export (luma {inside})"
     assert outside < 20.0, f"the image bleeds outside its interval (luma {outside})"
+
+
+@requires_ffmpeg
+def test_a_stock_inserts_own_audio_is_not_mixed_into_the_export(tmp_path: Path) -> None:
+    """B-roll audio is muted by default, measured rather than assumed.
+
+    An 880 Hz tone in the insert would raise the export's level if it leaked into
+    the mix, so the loudest possible insert is used and the finished file's mean
+    volume is compared with the same render without any insert at all.
+    """
+
+    client = _project(tmp_path)
+    workspace = tmp_path / "workspace" / "projects" / "abc123"
+    _black_source(workspace / "source" / "source-x.mp4")
+
+    loud = tmp_path / "loud.mp4"
+    _loud_insert(loud)
+    with loud.open("rb") as handle:
+        imported = client.post(
+            "/api/projects/abc123/assets",
+            data={"kind": "broll", "label": "Loud insert"},
+            files={"file": ("loud.mp4", handle, "video/mp4")},
+        )
+    assert imported.status_code == 201, imported.text
+    asset = imported.json()
+
+    plain = client.post(
+        "/api/projects/abc123/render",
+        json={"clip_id": "clip-1", "export": {"write_srt": False}},
+    )
+    plain_job = _run_job(client, plain.json()["job_id"])
+    assert plain_job["status"] == "succeeded", plain_job.get("error")
+    plain_output = workspace / "exports" / plain_job["result"]["file"]
+
+    placed = client.patch(
+        "/api/projects/abc123/timeline",
+        json={"clip_id": "clip-1", "broll": [{"source": asset["id"], "start": 2.0, "end": 5.0}]},
+    )
+    assert placed.status_code == 200, placed.text
+
+    started = client.post(
+        "/api/projects/abc123/render",
+        json={"clip_id": "clip-1", "export": {"write_srt": False}},
+    )
+    job = _run_job(client, started.json()["job_id"])
+    assert job["status"] == "succeeded", job.get("error")
+    assert job["result"]["broll_count"] == 1
+    output = workspace / "exports" / job["result"]["file"]
+
+    # The insert is on screen for its interval...
+    assert _caption_area_luma(output, at=3.5, crop="1080:600:0:600") > 60.0
+    # ...and the spoken audio is intact to within a tenth of a decibel, so the
+    # insert's own tone never entered the mix.
+    assert _mean_volume_db(output) == pytest.approx(_mean_volume_db(plain_output), abs=0.3)
 
 
 @requires_ffmpeg

@@ -442,6 +442,36 @@ def test_a_second_pass_reuses_the_file_instead_of_downloading_it_again(
     assert second["added"] == 1
 
 
+def test_a_failed_download_is_reported_and_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted download must not fail the request or leave a partial file."""
+
+    import app.stock as stock_module
+
+    client = _project(tmp_path)
+    monkeypatch.setattr(stock_module, "_urlopen", _opener(PHOTO_BODY))
+
+    def broken(request, timeout):
+        raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(stock_module, "_urlopen_stream", broken)
+
+    response = client.post("/api/projects/abc123/broll/auto", json={"clip_id": "clip-1"})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["added"] == 0
+    assert payload["downloaded"] == 0
+    assert payload["errors"], "the failure was not reported"
+    assert "insert" in payload["note"].lower()
+
+    assets = tmp_path / "workspace" / "projects" / "abc123" / "assets"
+    assert list(assets.glob("*")) == [], "a partial download was left in the library"
+    assert list(assets.parent.rglob("*.part")) == []
+    assert client.get("/api/projects/abc123/timeline?clip_id=clip-1").json()["broll"] == []
+
+
 def test_adding_stock_b_roll_without_a_key_explains_itself(tmp_path: Path) -> None:
     client = _project(tmp_path, api_key=None)
 
