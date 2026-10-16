@@ -87,8 +87,12 @@ def build_prompt(candidates: list[dict]) -> str:
     )
 
 
-def _extract_json(content: str) -> object | None:
-    """Pull a JSON object out of a response that may be fenced in markdown."""
+def extract_json_object(content: str) -> object | None:
+    """Pull a JSON object out of a response that may be fenced in markdown.
+
+    Shared with :mod:`app.broll_ai`, which asks the same endpoint a different
+    question and has to survive the same chatty answers.
+    """
 
     text = content.strip()
     if text.startswith("```"):
@@ -125,7 +129,7 @@ def parse_ranking(body: bytes, valid_ids: set[str]) -> dict[str, dict] | None:
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
         return None
 
-    data = _extract_json(content if isinstance(content, str) else "")
+    data = extract_json_object(content if isinstance(content, str) else "")
     if not isinstance(data, dict):
         return None
 

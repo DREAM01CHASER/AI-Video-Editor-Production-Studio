@@ -214,6 +214,65 @@ def test_the_stock_search_panel_is_present_and_off_by_default(tmp_path: Path) ->
     assert "Nothing is downloaded until you press" in body
 
 
+def test_the_automatic_b_roll_panel_asks_for_a_clip_not_an_import(tmp_path: Path) -> None:
+    """The prerequisite is the selected clip, never a video that is already in."""
+
+    body = _client(tmp_path).get("/").text
+    for element_id in [
+        "broll-count",
+        "broll-mode",
+        "broll-max",
+        "btn-broll-auto",
+        "btn-broll-suggest",
+        "btn-broll-retry",
+        "broll-stages",
+        "broll-status",
+        "broll-error",
+        "broll-proposals",
+    ]:
+        assert f'id="{element_id}"' in body, element_id
+
+    # Both passes ship disabled with a reason, and the retry stays out of the way
+    # until a pass has something to retry.
+    assert 'id="btn-broll-auto" class="btn btn-primary btn--block" type="button" disabled' in body
+    assert 'id="btn-broll-suggest" class="btn btn-secondary btn--block" type="button" disabled' in body
+    assert (
+        'id="btn-broll-retry" class="btn btn-ghost btn--block is-hidden" type="button"'
+        in body
+    )
+    # Neither pass may claim the transcript needs importing.
+    assert "Import a video first — B-roll follows a clip's transcript." not in body
+
+
+def test_the_automatic_b_roll_controls_are_wired_to_the_api(tmp_path: Path) -> None:
+    """Guards against the two dead ends the panel used to hit."""
+
+    script = _client(tmp_path).get("/static/app.js").text
+
+    assert 'els.btnBrollRetry.addEventListener("click", addBrolls);' in script
+    assert 'els.btnBrollAuto.addEventListener("click", addBrolls);' in script
+    assert "function brollBlockedReason()" in script
+    assert "function renderBrollStages()" in script
+    assert "payload.stages" in script
+
+    # The clip the panels act on is the selected one, or the one whose edit is
+    # already open — not the project's absence of a selected clip.
+    assert "return state.selectedId || state.timeline?.clip_id || null;" in script
+    assert "selectCandidate(state.project.candidates[0]?.id ?? null);" in script
+
+    # An empty search box is no longer answered by naming a missing keyword; the
+    # backend now derives the query, and the interface shows its own note.
+    assert "needs a keyword" not in script
+    # The empty-box answer is the backend's own note, not a client-side refusal.
+    assert "} else if (state.stock.results.length === 0) {" in script
+    assert 'else if (activeClipId()) parameters.set("clip_id", activeClipId());' in script
+
+    # The pass cannot be gated on a loaded timeline, which is exactly what used
+    # to disable it while a real, transcribed clip was open.
+    assert "const ready = isRealProject() && Boolean(state.timeline)" not in script
+    assert "if (!isRealProject() || !clipId || state.broll.busy) return;" in script
+
+
 def test_transitions_and_sound_design_have_real_controls(tmp_path: Path) -> None:
     """Milestone 9: no control may ship that does not reach the live API."""
 

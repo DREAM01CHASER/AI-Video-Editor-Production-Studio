@@ -218,6 +218,8 @@ const els = {
   brollMax: document.getElementById("broll-max"),
   btnBrollAuto: document.getElementById("btn-broll-auto"),
   btnBrollSuggest: document.getElementById("btn-broll-suggest"),
+  btnBrollRetry: document.getElementById("btn-broll-retry"),
+  brollStageList: document.getElementById("broll-stages"),
   brollStatus: document.getElementById("broll-status"),
   brollError: document.getElementById("broll-error"),
   brollProposals: document.getElementById("broll-proposals"),
@@ -302,6 +304,13 @@ const state = {
     //: credit, so the panel can show what went into the edit and from where.
     selected: [],
     busy: false,
+    //: Whether the last pass left anything to retry — a failed search, a query
+    //: with no usable result — so the panel can offer the retry instead of
+    //: silently dropping it.
+    retryable: false,
+    //: The stages the last pass reported, shown as progress rather than a
+    //: single vague message.
+    stages: [],
   },
   //: The composed edit for the selected clip: in/out points, captions, render
   //: settings, and the item tracks. The project JSON stays the source of truth.
@@ -759,9 +768,21 @@ function hideStockError() {
   els.stockError.classList.add("is-hidden");
 }
 
-/** The clip whose transcript should drive an empty search box. */
+/**
+ * The clip the stock and B-roll panels act on.
+ *
+ * The selection in the clip list is the first choice, and the clip whose edit is
+ * already open is the second: an empty stock search used to fail with "a keyword
+ * is required" whenever the list selection had not been set yet, even though a
+ * clip was plainly open in the editor.
+ */
 function activeClipId() {
-  return state.selectedId || null;
+  return state.selectedId || state.timeline?.clip_id || null;
+}
+
+/** Whether this project has words to read, from the flag or the loaded transcript. */
+function hasSpokenWords() {
+  return Boolean(state.project.hasTranscript) || (state.transcript?.segments?.length || 0) > 0;
 }
 
 function updateStockControls() {
@@ -776,7 +797,8 @@ function updateStockControls() {
       ? "Set PEXELS_API_KEY in .env to enable stock search."
       : busy
         ? "A search is already running."
-        : "Search Pexels for stock B-roll to overlay on the selected clip.";
+        : "Search Pexels for stock B-roll — leave the box empty to search the " +
+          "selected clip's own words.";
 
   els.stockQuery.disabled = !real || !configured || busy;
   els.stockOrientation.disabled = !real || !configured || busy;
@@ -929,9 +951,19 @@ async function searchStock() {
     state.stock.results = Array.isArray(payload.results) ? payload.results : [];
     state.stock.keywords = Array.isArray(payload.keywords) ? payload.keywords : [];
     state.stock.placement = payload.suggested_placement || null;
-    els.stockStatus.textContent = payload.query
-      ? `“${payload.query}” — ${state.stock.results.length} result(s). Preview first; nothing is downloaded until you add one.`
-      : "No results.";
+    if (!payload.query) {
+      // Nothing was searchable: the backend says what to do about it, which is a
+      // more useful answer than one naming a missing keyword.
+      els.stockStatus.textContent =
+        payload.note ||
+        "Type a keyword, or transcribe this video so the search can use the clip's own words.";
+    } else if (state.stock.results.length === 0) {
+      els.stockStatus.textContent = `No results for “${payload.query}”. ${
+        payload.note || "Try a different word or a different orientation."
+      }`;
+    } else {
+      els.stockStatus.textContent = `“${payload.query}” — ${state.stock.results.length} result(s). Preview first; nothing is downloaded until you add one.`;
+    }
     renderStockResults();
     log(`Stock search “${payload.query}” returned ${state.stock.results.length} result(s).`);
   } catch (error) {
@@ -1644,26 +1676,86 @@ function hideBrollError() {
   els.brollError.classList.add("is-hidden");
 }
 
+/**
+ * Why automatic B-roll cannot run yet, or null when it can.
+ *
+ * The prerequisite is a real project with a selected clip — the transcript comes
+ * from that clip. Saying "import a video first" to someone who already imported
+ * one, transcribed it and selected a clip is what this replaces.
+ */
+function brollBlockedReason() {
+  if (!isRealProject()) {
+    return state.project.id === DEMO_PROJECT.id
+      ? "Open or import a real video — the sample project has no media or transcript."
+      : "Import a video first — B-roll follows a clip's transcript.";
+  }
+  if (!activeClipId()) {
+    return hasSpokenWords()
+      ? "Select a clip above — B-roll follows the selected clip's transcript."
+      : "Transcribe this video and select a clip — B-roll reads what the clip says.";
+  }
+  if (!hasSpokenWords()) {
+    return "Transcribe this video first — B-roll comes from what the clip says.";
+  }
+  if (!state.stock.status?.configured && els.brollMode.value === "online") {
+    return "Set PEXELS_API_KEY in .env to search stock, or switch Source to your local library.";
+  }
+  return null;
+}
+
 function updateBrollControls() {
-  const ready = isRealProject() && Boolean(state.timeline) && !state.broll.busy;
+  const reason = brollBlockedReason();
+  const ready = reason === null && !state.broll.busy;
   els.btnBrollSuggest.disabled = !ready;
   els.btnBrollAuto.disabled = !ready;
-  els.btnBrollAuto.title = !isRealProject()
-    ? "Import a video first — B-roll follows a clip's transcript."
-    : !state.timeline
-      ? "Select a clip first — the search follows its transcript."
-      : state.broll.busy
-        ? "A B-roll pass is already running."
-        : "Search stock videos and photos for this clip and place them on the timeline.";
+  els.btnBrollAuto.title = reason
+    ? reason
+    : state.broll.busy
+      ? "A B-roll pass is already running."
+      : "Read this clip's transcript, search stock video and photos, download the " +
+        "best match for each moment, and place them on the timeline.";
+  els.btnBrollSuggest.title = reason
+    ? reason
+    : state.broll.busy
+      ? "A B-roll pass is already running."
+      : "Plan where an insert goes and what it should show, without downloading anything.";
+  els.btnBrollRetry.classList.toggle("is-hidden", !state.broll.retryable || state.broll.busy);
 }
 
 function resetBroll(note) {
-  state.broll = { proposals: [], payload: null, selected: [], busy: false };
+  state.broll = { proposals: [], payload: null, selected: [], busy: false, retryable: false, stages: [] };
   els.brollProposals.replaceChildren();
   els.brollCount.textContent = "0";
   hideBrollError();
   els.brollStatus.textContent = note || "";
   updateBrollControls();
+}
+
+/**
+ * Paint the stages the last pass reported.
+ *
+ * Each stage says what was done and how much of it, so "it worked" or "it did
+ * not" is followed by which of the five steps produced that outcome.
+ */
+function renderBrollStages() {
+  const stages = state.broll.stages || [];
+  els.brollStageList.replaceChildren();
+  els.brollStageList.classList.toggle("is-hidden", stages.length === 0);
+
+  for (const stage of stages) {
+    const item = document.createElement("li");
+    item.className = `steps__item steps__item--${stage.status || "done"}`;
+    const dot = document.createElement("span");
+    dot.className = "steps__dot";
+    dot.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = stage.label || "";
+    const detail = document.createElement("span");
+    detail.className = "steps__status";
+    detail.textContent = stage.detail || "";
+    item.append(dot, label, detail);
+    els.brollStageList.append(item);
+  }
 }
 
 /** Render the proposed insert times and where each one would come from. */
@@ -1702,7 +1794,34 @@ function renderBrollProposals() {
     }
     entry.append(credit);
 
+    // An insert that does not suit the moment has to be removable where it is
+    // listed, not only by hunting for it on the timeline.
+    const actions = document.createElement("div");
+    actions.className = "stock-card__actions";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "btn btn-ghost";
+    remove.textContent = "Remove this insert";
+    remove.addEventListener("click", () => removePlacedBroll(item));
+    actions.append(remove);
+    entry.append(actions);
+
     els.brollProposals.append(entry);
+  }
+
+  // Anything the pass could not place is listed with its own reason, rather than
+  // vanishing from a panel that claims success.
+  for (const entry of state.broll.payload?.skipped || []) {
+    const item = document.createElement("li");
+    item.className = "list__item";
+    const title = document.createElement("p");
+    title.className = "list__title";
+    title.textContent = `Skipped insert ${entry.index}`;
+    const reason = document.createElement("p");
+    reason.className = "panel__hint";
+    reason.textContent = entry.reason || "";
+    item.append(title, reason);
+    els.brollProposals.append(item);
   }
 
   for (const proposal of proposals) {
@@ -1737,6 +1856,18 @@ function renderBrollProposals() {
         searchStock();
       });
       item.append(button);
+    } else if (source.type === "none") {
+      // No local match: say so, and let the user search stock by hand instead of
+      // leaving a proposal that looks applyable but is not.
+      const button = document.createElement("button");
+      button.className = "btn btn-ghost";
+      button.type = "button";
+      button.textContent = `No local match — search stock for “${source.query}”`;
+      button.addEventListener("click", () => {
+        els.stockQuery.value = source.query;
+        searchStock();
+      });
+      item.append(button);
     }
 
     els.brollProposals.append(item);
@@ -1744,20 +1875,26 @@ function renderBrollProposals() {
 }
 
 /**
- * Add B-Rolls: search the clip's transcript, download the best match for each
- * moment, and place them on the timeline in one pass.
+ * Add B-Rolls: read the selected clip's transcript, search stock for each moment
+ * it names, download the best match, and place them on the timeline in one pass.
  *
  * This is the whole workflow the button promises — analysis, stock search,
  * download, and timeline insertion — so the export uses the result rather than
  * only the panel showing it.
  */
 async function addBrolls() {
-  if (!isRealProject() || !state.timeline || state.broll.busy) return;
+  const clipId = activeClipId();
+  if (!isRealProject() || !clipId || state.broll.busy) return;
 
   state.broll.busy = true;
+  state.broll.retryable = false;
   hideBrollError();
+  // The request is one call, so the honest progress is: what it is doing now,
+  // then the stages it actually completed once the reply arrives.
   els.brollStatus.textContent =
-    "Reading the clip's transcript, searching stock video and photos, and downloading the best match for each moment…";
+    "Analysing this clip's transcript, generating the search queries, searching " +
+    "Pexels, downloading the chosen assets and placing them on the timeline…";
+  renderBrollStages();
   updateBrollControls();
 
   try {
@@ -1767,7 +1904,7 @@ async function addBrolls() {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({
-          clip_id: state.timeline.clip_id,
+          clip_id: clipId,
           mode: els.brollMode.value,
           max_items: Number(els.brollMax.value) || 3,
         }),
@@ -1780,7 +1917,9 @@ async function addBrolls() {
       );
     }
 
-    const summary = [payload.note, payload.stock_note].filter(Boolean).join(" ");
+    const summary = [plannerNote(payload), payload.note, payload.stock_note]
+      .filter(Boolean)
+      .join(" ");
     log(
       `Add B-Rolls: ${payload.added ?? 0} insert(s) placed, ` +
         `${payload.downloaded ?? 0} downloaded, ${payload.reused ?? 0} reused.`
@@ -1789,29 +1928,76 @@ async function addBrolls() {
     // The timeline is what the renderer reads, so reload it from the server
     // rather than assuming the local copy matches — and show the result *after*
     // that reload, because loading a timeline resets this panel.
-    await loadTimeline(state.project.id, state.timeline.clip_id);
+    await loadTimeline(state.project.id, clipId);
     await fetchAssets(state.project.id);
 
     state.broll.selected = Array.isArray(payload.selected) ? payload.selected : [];
     // A placed set supersedes the earlier draft proposals.
     state.broll.proposals = [];
     state.broll.payload = payload;
+    state.broll.stages = Array.isArray(payload.stages) ? payload.stages : [];
+    state.broll.retryable = Boolean(
+      (payload.errors || []).length || (payload.skipped || []).length || !payload.added
+    );
+    renderBrollStages();
     renderBrollProposals();
-    els.brollStatus.textContent = summary;
+    els.brollStatus.textContent = summary + " Completed.";
   } catch (error) {
     showBrollError(connectionErrorMessage(error));
+    state.broll.retryable = true;
   } finally {
     state.broll.busy = false;
     updateBrollControls();
   }
 }
 
+/** One sentence naming which pass planned the inserts, so the AI is not invisible. */
+function plannerNote(payload) {
+  if (payload?.planner === "ai") {
+    return `Planned by the AI model ${payload.ai?.model || ""}:${
+      payload.ai?.note ? ` ${payload.ai.note}` : ""
+    }`;
+  }
+  return payload?.ai?.note ? `AI planning unavailable — ${payload.ai.note}` : "";
+}
+
+/** Remove one placed insert from the clip, through the validated timeline path. */
+async function removePlacedBroll(entry) {
+  const timeline = currentTimeline();
+  if (!timeline) return;
+
+  const item = timeline.broll.find(
+    (candidate) =>
+      String(candidate.source) === String(entry.asset_id) &&
+      Math.abs(Number(candidate.start) - Number(entry.start)) < 0.01
+  );
+  if (!item) {
+    showBrollError("That insert is no longer on the timeline; reload the clip and try again.");
+    return;
+  }
+
+  state.selectedItem = null;
+  const saved = await saveTimeline({
+    broll: timeline.broll.filter((candidate) => String(candidate.id) !== String(item.id)),
+  });
+  if (saved) {
+    state.broll.selected = (state.broll.selected || []).filter(
+      (candidate) => !(String(candidate.asset_id) === String(entry.asset_id) &&
+        Math.abs(Number(candidate.start) - Number(entry.start)) < 0.01)
+    );
+    renderBrollProposals();
+    els.brollStatus.textContent = `Removed the insert at ${Number(entry.start).toFixed(1)}s.`;
+  }
+}
+
 /** Ask the backend where B-roll should go, for how long, and from where. */
 async function suggestBroll() {
-  if (!isRealProject() || !state.timeline) return;
+  const clipId = activeClipId();
+  if (!isRealProject() || !clipId) return;
   hideBrollError();
   els.btnBrollSuggest.disabled = true;
-  els.brollStatus.textContent = "Reading the transcript…";
+  els.brollStatus.textContent = "Reading the clip's transcript for moments worth showing…";
+  renderBrollStages();
 
   try {
     const response = await apiFetch(
@@ -1820,7 +2006,7 @@ async function suggestBroll() {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({
-          clip_id: state.timeline.clip_id,
+          clip_id: clipId,
           mode: els.brollMode.value,
           max_items: Number(els.brollMax.value) || 3,
         }),
@@ -1831,9 +2017,16 @@ async function suggestBroll() {
       throw new Error(apiErrorMessage(payload, `Could not suggest B-roll (HTTP ${response.status}).`));
     }
 
-    state.broll = { proposals: payload.items || [], payload, selected: [], busy: false };
+    state.broll = {
+      proposals: payload.items || [],
+      payload,
+      selected: [],
+      busy: false,
+      retryable: false,
+      stages: [],
+    };
     renderBrollProposals();
-    els.brollStatus.textContent = [payload.note, payload.stock_note]
+    els.brollStatus.textContent = [plannerNote(payload), payload.note, payload.stock_note]
       .filter(Boolean)
       .join(" ");
   } catch (error) {
@@ -1846,7 +2039,8 @@ async function suggestBroll() {
 
 /** Place one accepted proposal through the validated timeline path. */
 async function applyBrollProposal(proposal) {
-  if (!isRealProject() || !state.timeline) return;
+  const clipId = activeClipId();
+  if (!isRealProject() || !clipId) return;
   hideBrollError();
   els.btnBrollSuggest.disabled = true;
 
@@ -1857,7 +2051,7 @@ async function applyBrollProposal(proposal) {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({
-          clip_id: state.timeline.clip_id,
+          clip_id: clipId,
           items: [{
             asset_id: proposal.source?.asset_id,
             start: proposal.start,
@@ -1872,7 +2066,7 @@ async function applyBrollProposal(proposal) {
     }
 
     els.brollStatus.textContent = payload.note || "Placed.";
-    await loadTimeline(state.project.id, state.timeline.clip_id);
+    await loadTimeline(state.project.id, clipId);
   } catch (error) {
     showBrollError(connectionErrorMessage(error));
   } finally {
@@ -2165,6 +2359,10 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
   if (!isRealProject() || !clipId) {
     state.timeline = null;
     renderTimeline();
+    // The B-roll panel follows the clip that is open, so it is refreshed here as
+    // well: otherwise it keeps describing the clip the user just left — or the
+    // demo project that was open first — and asks for a video that is imported.
+    resetBroll(brollBlockedReason() || "Select a clip to load its edit.");
     return null;
   }
 
@@ -3439,7 +3637,10 @@ function projectFromServer(payload) {
   renderProjectList();
   renderProject();
   setPreviewSource(`/api/projects/${payload.project_id}/source`);
-  selectCandidate(null);
+  // A project with saved candidates opens on its first one, because the stock,
+  // B-roll, caption and timeline panels all work on the clip being edited. Not
+  // selecting anything left B-roll asking for a video that was already imported.
+  selectCandidate(state.project.candidates[0]?.id ?? null);
 
   // Restore an existing transcript without re-running the model.
   if (payload.transcript) {
@@ -3723,6 +3924,7 @@ els.btnTimelineOut.addEventListener("click", () => setClipEdgeFromPlayhead("out"
 els.btnAddBroll.addEventListener("click", addBrollAtPlayhead);
 els.btnBrollSuggest.addEventListener("click", suggestBroll);
 els.btnBrollAuto.addEventListener("click", addBrolls);
+els.btnBrollRetry.addEventListener("click", addBrolls);
 els.btnAddSfx.addEventListener("click", addSfxAtPlayhead);
 els.btnAddTransition.addEventListener("click", addTransition);
 

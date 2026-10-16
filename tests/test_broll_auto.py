@@ -180,10 +180,10 @@ def _online(query: str, index: int = 1, duration: float = 3.0) -> dict:
 
 
 def test_one_search_per_sentence_never_one_per_word() -> None:
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
 
-    def search(query: str) -> list[dict]:
-        calls.append(query)
+    def search(query: str, media_type: str = "both") -> list[dict]:
+        calls.append((query, media_type))
         # A different asset per query, so neither insert is skipped as a repeat.
         return [_photo(id=query.replace(" ", "-"), alt=query)]
 
@@ -194,14 +194,35 @@ def test_one_search_per_sentence_never_one_per_word() -> None:
         box_height=1920,
     )
 
-    assert calls == ["insurance fraud", "receipts photographs"]
+    # One search per proposal, never one per word — and a proposal that names no
+    # kind of media lets the provider offer both, which the ranking then decides.
+    assert calls == [("insurance fraud", "both"), ("receipts photographs", "both")]
     assert len(plan["fetches"]) == 2
+
+
+def test_a_moment_asks_the_provider_for_the_kind_of_media_it_chose() -> None:
+    """A moment that wants a still is searched for photos, not clips."""
+
+    calls: list[tuple[str, str]] = []
+
+    def search(query: str, media_type: str = "both") -> list[dict]:
+        calls.append((query, media_type))
+        return [_photo(id=query.replace(" ", "-"))]
+
+    items = [_online("receipts on a desk"), _online("city traffic", index=2)]
+    items[0]["source"]["media_type"] = "photo"
+    items[1]["source"]["media_type"] = "video"
+
+    plan = plan_fetches(items, search=search, box_width=1080, box_height=1920)
+
+    assert calls == [("receipts on a desk", "photo"), ("city traffic", "video")]
+    assert [fetch["media_type"] for fetch in plan["fetches"]] == ["photo", "video"]
 
 
 def test_a_local_proposal_is_not_searched_at_all() -> None:
     calls: list[str] = []
 
-    def search(query: str) -> list[dict]:  # pragma: no cover - must not be called
+    def search(query: str, media_type: str = "both") -> list[dict]:  # pragma: no cover
         calls.append(query)
         return []
 
@@ -225,7 +246,7 @@ def test_a_local_proposal_is_not_searched_at_all() -> None:
 
 
 def test_a_failed_query_is_reported_and_the_rest_continue() -> None:
-    def search(query: str) -> list[dict]:
+    def search(query: str, media_type: str = "both") -> list[dict]:
         if query == "broken":
             raise RuntimeError("provider said no")
         return [_photo()]
@@ -243,7 +264,7 @@ def test_a_failed_query_is_reported_and_the_rest_continue() -> None:
 
 
 def test_the_same_asset_is_not_used_for_two_inserts() -> None:
-    def search(query: str) -> list[dict]:
+    def search(query: str, media_type: str = "both") -> list[dict]:
         return [_photo()]
 
     plan = plan_fetches(

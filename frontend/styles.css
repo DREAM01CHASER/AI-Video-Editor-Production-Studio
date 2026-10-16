@@ -775,6 +775,12 @@ select.input {
   background: var(--error);
 }
 
+/* A stage the pass did not need to run: neither a success nor a failure. */
+.steps__item--skipped .steps__dot {
+  background: #55627033;
+  border: 1px solid #556270;
+}
+
 .steps__status {
   margin-left: auto;
   color: var(--text-dim);

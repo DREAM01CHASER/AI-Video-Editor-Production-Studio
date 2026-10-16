@@ -128,7 +128,9 @@ Provide a basic timeline/editor where the user can modify clip start/end, captio
 ## Milestone 8 — Stock search and semantic suggestions (P1/P2)
 
 - Add a provider adapter for Pexels video search if API access is available.
-- Search using concise keywords derived from transcript context.
+- Search using concise keywords derived from transcript context, or the visual
+  moments named by the optional LLM pass (each with its own query and asset type);
+  the transcript keywords remain the fallback when no model is configured.
 - Show preview, source, attribution/credit, and license/terms information where required.
 - Do not silently download or use assets if provider terms prohibit the intended use.
 - Let the user choose results; automated placement can be a suggested draft.

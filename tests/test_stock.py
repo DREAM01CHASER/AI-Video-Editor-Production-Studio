@@ -576,11 +576,77 @@ def test_search_without_a_key_reports_a_clear_error(tmp_path: Path) -> None:
     assert response.json()["error"]["code"] == "stock_not_configured"
 
 
-def test_search_without_a_query_is_refused(tmp_path: Path) -> None:
+def test_an_empty_search_falls_back_to_the_projects_own_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    """An empty box is not an error: the words already in the project drive it.
+
+    This is the empty-search path the button used to answer with "a keyword is
+    required", which is a dead end when the clip is open and transcribed.
+    """
+
+    import app.stock as stock_module
+
+    seen: list[str] = []
+
+    def opener(request, timeout):
+        seen.append(request.full_url)
+        return 200, SEARCH_BODY
+
+    monkeypatch.setattr(stock_module, "_urlopen", opener)
+
     response = _project(tmp_path, api_key="k").get("/api/projects/abc123/stock/search")
 
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "invalid_stock_query"
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "insurance" in payload["query"]
+    assert payload["results"]
+    # Both kinds are searched, and each request carried the derived keywords.
+    assert len(seen) == 2
+    assert all("insurance" in url for url in seen)
+
+
+def test_an_empty_search_with_nothing_to_search_for_answers_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    client = _project(tmp_path, api_key="k")
+    client.app.state.projects.save_transcript(
+        "abc123",
+        {
+            "version": 1,
+            "project_id": "abc123",
+            "generated_at": TRANSCRIPT_GENERATED_AT,
+            "segments": [],
+        },
+    )
+
+    response = client.get("/api/projects/abc123/stock/search")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["query"] == ""
+    assert payload["results"] == []
+    assert "type a keyword" in payload["note"].lower()
+    assert "transcribe" in payload["note"].lower()
+
+
+def test_an_empty_search_without_a_key_says_the_search_is_off(tmp_path: Path) -> None:
+    client = _project(tmp_path)
+    client.app.state.projects.save_transcript(
+        "abc123",
+        {
+            "version": 1,
+            "project_id": "abc123",
+            "generated_at": TRANSCRIPT_GENERATED_AT,
+            "segments": [],
+        },
+    )
+
+    payload = client.get("/api/projects/abc123/stock/search").json()
+
+    assert payload["configured"] is False
+    assert payload["results"] == []
+    assert "PEXELS_API_KEY" in payload["note"]
 
 
 def test_search_uses_the_clip_transcript_and_shows_provenance(tmp_path, monkeypatch) -> None:

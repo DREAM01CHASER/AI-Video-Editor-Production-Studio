@@ -449,8 +449,13 @@
           </button>
           <button id="btn-broll-suggest" class="btn btn-secondary btn--block" type="button" disabled
             title="Select a clip first — suggestions follow its transcript.">
-            Suggest B-roll from the transcript
+            Suggest B-rolls from the transcript
           </button>
+          <button id="btn-broll-retry" class="btn btn-ghost btn--block is-hidden" type="button"
+            title="Run the pass again — a search that failed or found nothing may succeed now.">
+            Retry the searches that did not produce an insert
+          </button>
+          <ol id="broll-stages" class="steps is-hidden" aria-live="polite"></ol>
           <p id="broll-status" class="panel__hint">
             <strong>Add B-Rolls</strong> reads the current clip's own transcript, finds
             stock videos and photos that match what is being said, downloads the best

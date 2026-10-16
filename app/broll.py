@@ -135,11 +135,22 @@ def _candidates(
     return found
 
 
+def overlap(
+    start: float,
+    end: float,
+    other_start: float,
+    other_end: float,
+    gap: float = MIN_GAP_SECONDS,
+) -> bool:
+    """Whether two intervals are closer than ``gap``, so they read as one jumpy edit."""
+
+    return start < float(other_end) + gap and end > float(other_start) - gap
+
+
 def _overlaps(start: float, end: float, chosen: Iterable[dict]) -> bool:
-    for item in chosen:
-        if start < float(item["end"]) + MIN_GAP_SECONDS and end > float(item["start"]) - MIN_GAP_SECONDS:
-            return True
-    return False
+    return any(
+        overlap(start, end, float(item["start"]), float(item["end"])) for item in chosen
+    )
 
 
 def _local_match(assets: Sequence[dict], keywords: Sequence[str]) -> dict | None:
@@ -294,9 +305,18 @@ def propose_broll(
 
 
 def _resolve_source(
-    mode: str, assets: Sequence[dict], keywords: Sequence[str], query: str
+    mode: str,
+    assets: Sequence[dict],
+    keywords: Sequence[str],
+    query: str,
+    media_type: str | None = None,
 ) -> dict[str, object]:
-    """Where the visual for one proposal would come from, without fetching it."""
+    """Where the visual for one proposal would come from, without fetching it.
+
+    ``media_type`` is the kind the moment asked for (a video, a still image), which
+    the search then honours; "both" lets the ranking decide, which is what the
+    transcript-keyword pass does.
+    """
 
     if mode in {"local", "auto"}:
         match = _local_match(assets, keywords)
@@ -319,9 +339,83 @@ def _resolve_source(
         "type": "online",
         "provider": "pexels",
         "query": query,
+        "media_type": normalise_media_type(media_type),
         "label": f"Search stock for “{query}”",
         "label_kind": "stock",
     }
+
+
+#: The stock kinds one moment can ask for.
+MEDIA_TYPES = ("both", "video", "photo")
+
+
+def normalise_media_type(value: object) -> str:
+    """One of the provider's media kinds, defaulting to whichever fits better."""
+
+    wanted = str(value or "both").strip().lower()
+    return wanted if wanted in MEDIA_TYPES else "both"
+
+
+def propose_from_moments(
+    moments: Sequence[dict],
+    *,
+    assets: Sequence[dict] = (),
+    mode: str = "online",
+) -> dict[str, object]:
+    """Turn the AI pass's visual moments into the same proposals the interface edits.
+
+    The shape is identical to :func:`propose_broll`'s items on purpose — the panel,
+    the accepted-proposal path, and the renderer all read one shape, so which pass
+    produced a placement makes no difference to what happens next. Times arrive
+    clip-relative and stay that way.
+    """
+
+    chosen_mode = normalise_mode(mode)
+    items: list[dict] = []
+
+    for index, moment in enumerate(moments, start=1):
+        if not isinstance(moment, dict):
+            continue
+        start = round(float(moment.get("start") or 0.0), 3)
+        end = round(float(moment.get("end") or 0.0), 3)
+        duration = round(end - start, 3)
+        query = " ".join(str(moment.get("query") or "").split())
+        if not query or duration <= 0:
+            continue
+
+        media_type = normalise_media_type(moment.get("media_type"))
+        keywords = derive_keywords(f"{query} {moment.get('reason') or ''}")[:6]
+        source = _resolve_source(chosen_mode, assets, keywords, query, media_type)
+        picked = " ".join(str(moment.get("reason") or "").split())
+
+        items.append(
+            {
+                "index": index,
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "query": query,
+                "keywords": keywords,
+                "media_type": media_type,
+                "source": source,
+                "reason": (
+                    picked
+                    or f"The clip describes {query} here, so a cutaway shows it."
+                ),
+                "duration_reason": (
+                    f"{duration:g}s of a still frame or moving shot, long enough to "
+                    "read and short enough to stay a cutaway."
+                ),
+            }
+        )
+
+    note = (
+        f"The AI model proposed {len(items)} B-roll insert(s) for this clip, each "
+        "with its own visual search."
+        if items
+        else "The AI model proposed no moment inside this clip that is worth a cutaway."
+    )
+    return {"mode": chosen_mode, "items": items, "note": note}
 
 
 def build_broll_item(

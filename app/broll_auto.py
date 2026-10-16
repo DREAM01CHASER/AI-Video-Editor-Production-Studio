@@ -15,8 +15,10 @@ from __future__ import annotations
 
 from typing import Callable, Iterable, Sequence
 
-#: One search, as the caller provides it: a query in, normalised stock metadata out.
-SearchFn = Callable[[str], list[dict]]
+#: One search, as the caller provides it: a query and the kind of media the moment
+#: asked for ("both" when the transcript keywords decide), normalised stock
+#: metadata out.
+SearchFn = Callable[[str, str], list[dict]]
 
 #: Ranking weights, kept in one place so the order is explainable rather than
 #: a pile of magic numbers buried in a comparison.
@@ -208,8 +210,10 @@ def plan_fetches(
     """Decide which online insert would download which provider file.
 
     Each online proposal is searched once — never once per word — and the best
-    result that has not already been used wins. A query that fails is recorded and
-    the rest continue, so one unlucky topic cannot empty the whole clip.
+    result that has not already been used wins. The search is told which kind of
+    media the moment asked for, so an image-only moment never settles for a clip
+    and vice versa. A query that fails is recorded and the rest continue, so one
+    unlucky topic cannot empty the whole clip.
     """
 
     avoid = {str(item) for item in used_ids}
@@ -242,8 +246,11 @@ def plan_fetches(
             skipped.append({"index": index, "reason": "The proposal had no search query."})
             continue
 
+        # The search is the caller's business, but it is told which kind of media
+        # this moment asked for so an image-only moment cannot settle for a clip.
+        media_type = str(source.get("media_type") or item.get("media_type") or "both")
         try:
-            results = list(search(query))
+            results = list(search(query, media_type))
         except Exception as exc:  # noqa: BLE001 - one bad query must not stop the pass
             errors.append(f"“{query}”: {exc}")
             skipped.append({"index": index, "reason": f"The stock search failed ({exc})."})
@@ -284,6 +291,7 @@ def plan_fetches(
                 "end": item.get("end"),
                 "duration": item.get("duration"),
                 "query": query,
+                "media_type": media_type,
                 "keywords": keywords,
                 "candidate": choice,
                 "reason": describe_choice(

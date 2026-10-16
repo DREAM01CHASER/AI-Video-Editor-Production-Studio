@@ -272,21 +272,41 @@ export:
 
 1. **Read the clip, not the whole video.** Only the selected clip's transcript
    window is analysed, so the search follows what is being said *here*.
-2. **Turn sentences into queries.** Concrete words are pulled from each sentence
-   (Hindi and Hinglish transcripts included), and one search is made per sentence —
-   never one per word.
-3. **Search videos *and* photos.** Both kinds come back from Pexels and are ranked
+2. **The AI model picks the visual moments.** With `LLM_API_KEY` set, the
+   configured model reads the clip's transcript with its timestamps and returns the
+   few moments worth illustrating, each with a *visual* search query —
+   `snowy mountain road at dawn`, not `marathon`. It is told to skip one-cutaway-
+   per-sentence, fixed-interval placement, and anything abstract. Every time it
+   returns is validated against the clip's length, so a hallucinated range cannot
+   reach the timeline. With no key, a network failure, or an unparseable answer, the
+   transparent keyword pass runs instead and the reply says which one was used.
+3. **Turn a moment into one query.** Each moment is searched once — never once per
+   word — and a moment that asked for an image is searched for photos, a moment
+   that asked for movement for clips. The keyword pass pulls concrete words from
+   each sentence (Hindi and Hinglish transcripts included).
+4. **Search videos *and* photos.** Both kinds come back from Pexels and are ranked
    together, because a still is often the better cutaway for a place, an object, or
    a document.
-4. **Rank for this clip.** Same orientation as the export, a rendition that still
+5. **Rank for this clip.** Same orientation as the export, a rendition that still
    covers the frame (a photo is judged by the rendition that will actually be
    downloaded, not by its original), a length that covers the insert without being
    wildly long, keyword overlap, then a small preference for motion. An asset
    already used in the pass is skipped rather than repeated.
-5. **Download once, place, and credit.** The chosen file is streamed into the
+6. **Download once, place, and credit.** The chosen file is streamed into the
    project's own `assets/` folder under a generated name, stored with its provider
    credit, and placed through the same validated timeline path a hand-placed insert
    uses. A file the project already has is reused instead of downloaded again.
+7. **Show every stage.** The reply carries the five stages it ran — analysing the
+   transcript, generating the queries, searching Pexels, downloading, placing — and
+   the panel prints them with their counts, so a partial pass is visible as a
+   partial pass. Anything it could not place is listed with its own reason, an
+   insert can be removed from the panel, and a pass that lost a search offers a
+   retry.
+
+The clip the panel acts on is the one selected in the clip list, or the one whose
+edit is already open. A project with saved candidates opens on its first clip, so
+the panel never asks for a video that is already imported, and an empty stock box
+searches the clip's own words rather than reporting a missing keyword.
 
 `POST .../broll/propose` still exists for planning first: it returns where a
 cutaway should go and how long it should run as a draft to edit or ignore, and
@@ -369,7 +389,10 @@ Stated plainly, because a feature that is not finished should not look finished.
 - **Video is rendered by FFmpeg in software.** Hardware encoding is not wired up,
   so a 1440 × 2560 export is slower than the 1080 × 1920 default.
 - **The LLM pass may only rewrite titles, reasons, and scores.** Clip times always
-  come from the transcript, so a hallucinated time can never reach a render.
+  come from the transcript, so a hallucinated time can never reach a render. The
+  B-roll pass does ask the model for *times*, and every one it returns is clamped
+  inside the clip, padded to a readable minimum, trimmed to the cutaway maximum,
+  and dropped when it cannot be placed.
 
 ## AI tools used
 
@@ -505,7 +528,7 @@ Stop the server with `Ctrl+C`.
 | `GET` | `/api/projects/{project_id}/timeline` | Read the editable edit for one clip. |
 | `PATCH` | `/api/projects/{project_id}/timeline` | Save an edited timeline (clip, captions, render settings, tracks). |
 | `GET` | `/api/projects/{project_id}/stock` | Whether stock B-roll search is configured, and on what terms. |
-| `GET` | `/api/projects/{project_id}/stock/search` | Search stock videos and photos; empty query uses the clip's own transcript words. |
+| `GET` | `/api/projects/{project_id}/stock/search` | Search stock videos and photos; an empty query uses the clip's own transcript words, or the project's transcript when no clip is named. |
 | `POST` | `/api/projects/{project_id}/stock/import` | Download one chosen stock clip or photo into the project, with its credit. |
 | `POST` | `/api/projects/{project_id}/broll/propose` | Plan where B-roll should go and for how long, without downloading anything. |
 | `POST` | `/api/projects/{project_id}/broll/apply` | Place accepted proposals on the clip's timeline. |
@@ -650,10 +673,11 @@ logged as a warning explaining what is missing. The decision itself is made by
 `app/compute.py`, which loads the virtualenv's CUDA runtime, probes the
 libraries, and reports the result as data.
 
-## Optional LLM clip labels
+## Optional LLM clip labels and B-roll moments
 
-Clip detection works with no key at all. If you want model-written titles and
-reasons, set an OpenAI-compatible endpoint in `.env`:
+Clip detection and B-roll work with no key at all. If you want model-written
+titles and reasons, *and* model-chosen visual moments for B-roll, set an
+OpenAI-compatible endpoint in `.env`:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -661,10 +685,12 @@ reasons, set an OpenAI-compatible endpoint in `.env`:
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible base URL. |
 | `LLM_MODEL` | `gpt-4o-mini` | Model used to re-label candidates. |
 
-The model may only rewrite titles, reasons, and scores. Clip **times always come
-from the transcript**, so a hallucinated time range can never reach the timeline or
-a render. If the call fails for any reason, the heuristic result is used and the
-analysis explains that the optional pass was unavailable.
+For clip labels, the model may only rewrite titles, reasons, and scores. Clip
+**times always come from the transcript**, so a hallucinated time range can never
+reach the timeline or a render. For B-roll it is asked for timestamps as well as
+queries, and each one is validated against the clip's own length before it is used.
+If either call fails for any reason — no key, no route, a non-200, an answer that
+is not JSON — the transparent transcript result is used and the reply says so.
 
 ## Optional stock B-roll search (Pexels)
 
@@ -677,7 +703,11 @@ Stock search is **off by default**. To enable it, create a free key at
 | `PEXELS_BASE_URL` | `https://api.pexels.com` | Override only for a compatible endpoint. |
 
 With a key set, the **Stock B-roll** panel in the sidebar searches Pexels. Leave
-the search box empty to search using the selected clip's own transcript words.
+the search box empty to search using the selected clip's own transcript words (or
+this project's transcript, when no clip is selected); with nothing transcribed yet
+the panel says what to do instead of reporting a missing keyword. The same key
+powers **Add B-Rolls**, which searches each moment the model chose for the kind of
+media it asked for.
 Nothing is downloaded until you press *Add as B-roll* on a result; the clip is
 then stored in the project's `assets/` folder under a generated name, with its
 creator, page URL, and licence saved alongside it and shown in the library.

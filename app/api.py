@@ -53,7 +53,9 @@ from .broll import (
     normalise_max_items,
     normalise_mode,
     propose_broll,
+    propose_from_moments,
 )
+from .broll_ai import plan_moments
 from .broll_auto import candidate_key, plan_fetches, plan_note
 from .clips import GENERATOR_HEURISTIC, suggest_clips
 from .errors import ApiError
@@ -688,6 +690,91 @@ def _broll_assets(project: dict) -> list[dict]:
     ]
 
 
+def _llm_settings(request: Request) -> LlmSettings:
+    """The optional model, configured server-side from ``.env``."""
+
+    runtime = request.app.state.settings
+    return LlmSettings(
+        api_key=runtime.llm_api_key,
+        base_url=runtime.llm_base_url,
+        model=runtime.llm_model,
+    )
+
+
+#: Which pass produced a B-roll plan: the model that read the clip, or the
+#: transcript's own keywords when the model was unavailable.
+PLANNER_AI = "ai"
+PLANNER_TRANSCRIPT = "transcript"
+
+
+def _plan_broll_moments(
+    request: Request,
+    segments: list[dict],
+    clip: dict,
+    *,
+    assets: Sequence[dict],
+    mode: str,
+    max_items: int,
+) -> dict[str, object]:
+    """Where the picture should change, and what should be shown there.
+
+    The configured model reads the clip's transcript first and names the visual
+    moments itself. When no model is configured, or it answers with nothing
+    usable, the transparent transcript-keyword pass runs instead — so the feature
+    works with no key, no network, and no paid service, and the reply always says
+    which of the two happened.
+    """
+
+    clip_start = float(clip.get("source_start") or 0.0)
+    clip_end = float(clip.get("source_end") or 0.0)
+    settings = _llm_settings(request)
+
+    ai: dict[str, object] = {
+        "configured": settings.enabled,
+        "model": settings.model if settings.enabled else None,
+        "moments": 0,
+        "note": "",
+    }
+
+    if settings.enabled:
+        plan = plan_moments(
+            settings,
+            segments,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            max_items=max_items,
+        )
+        ai["note"] = plan["note"]
+        ai["sentences"] = plan.get("sentences", 0)
+        if plan["planner"] == "llm":
+            proposal = propose_from_moments(plan["moments"], assets=assets, mode=mode)
+            ai["moments"] = len(proposal["items"])
+            return {
+                "planner": PLANNER_AI,
+                "items": proposal["items"],
+                "note": proposal["note"],
+                "ai": ai,
+            }
+        ai["note"] = (
+            f"{plan['note']} The clip's own keywords were used instead."
+        )
+
+    proposal = propose_broll(
+        segments,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        assets=assets,
+        mode=mode,
+        max_items=max_items,
+    )
+    return {
+        "planner": PLANNER_TRANSCRIPT,
+        "items": proposal["items"],
+        "note": proposal["note"],
+        "ai": ai,
+    }
+
+
 @router.post("/projects/{project_id}/broll/propose")
 def propose_project_broll(
     request: Request, project_id: str, payload: dict | None = Body(default=None)
@@ -695,8 +782,10 @@ def propose_project_broll(
     """Suggest where B-roll should go, for how long, and from where.
 
     This is a draft: nothing is downloaded, nothing is written to the project. The
-    proposals follow the transcript's own sentences, so an insert lands on a moment
-    the words actually describe rather than at an arbitrary time.
+    configured model reads the *selected clip's* transcript and proposes the
+    moments worth illustrating, each with its own visual search query; when no
+    model is available the transcript's own keywords are used, and the reply says
+    which one produced the plan.
     """
 
     store = _store(request)
@@ -710,19 +799,32 @@ def propose_project_broll(
     assets = _broll_assets(project)
     settings = _stock_settings(request)
     mode = normalise_mode(body.get("mode"))
+    max_items = normalise_max_items(body.get("max_items"))
 
-    proposal = propose_broll(
-        segments,
-        clip_start=float(clip.get("source_start") or 0.0),
-        clip_end=float(clip.get("source_end") or 0.0),
-        assets=assets,
-        mode=mode,
-        max_items=normalise_max_items(body.get("max_items")),
+    plan = _plan_broll_moments(
+        request, segments, clip, assets=assets, mode=mode, max_items=max_items
+    )
+
+    clipless_note = (
+        None
+        if segments
+        else "This project has no transcript yet, so there is nothing to illustrate. "
+        "Transcribe it first."
     )
 
     return {
-        **proposal,
         "clip_id": str(clip.get("id")),
+        "clip_start": round(float(clip.get("source_start") or 0.0), 3),
+        "clip_end": round(float(clip.get("source_end") or 0.0), 3),
+        "clip_duration": round(
+            max(0.0, float(clip.get("source_end") or 0.0) - float(clip.get("source_start") or 0.0)),
+            3,
+        ),
+        "mode": mode,
+        "planner": plan["planner"],
+        "ai": plan["ai"],
+        "items": plan["items"],
+        "note": clipless_note or plan["note"],
         "local_broll_count": len(assets),
         "stock_configured": settings.enabled,
         "stock_note": (
@@ -988,13 +1090,15 @@ def add_project_broll(
 ) -> dict[str, object]:
     """Add B-Rolls: find, download, and place inserts for the current clip.
 
-    One pass over the clip's own transcript sentences: plan where an insert goes
-    (:mod:`app.broll`), search the stock provider for video *and* photos, rank
-    what comes back against the export frame and the insert's length
-    (:mod:`app.broll_auto`), reuse a file this project already has instead of
-    downloading it twice, then place everything through the same validated
-    timeline path the manual insert uses — so the renderer sees exactly the same
-    data either way.
+    One pass over the *selected clip*: the configured model reads its transcript
+    and names the moments worth illustrating with a visual query each
+    (:mod:`app.broll_ai`), or the transcript's own keywords are used when no model
+    is available. Each query then searches the stock provider for the kind of
+    media that moment asked for, what comes back is ranked against the export
+    frame and the insert's length (:mod:`app.broll_auto`), a file this project
+    already has is reused instead of downloaded twice, and everything is placed
+    through the same validated timeline path the manual insert uses — so the
+    renderer sees exactly the same data either way.
     """
 
     store = _store(request)
@@ -1015,10 +1119,10 @@ def add_project_broll(
     box_height = int(plan.get("height") or 1920)
     orientation = _orientation_for(box_width, box_height)
 
-    proposal = propose_broll(
+    proposal = _plan_broll_moments(
+        request,
         segments,
-        clip_start=float(clip.get("source_start") or 0.0),
-        clip_end=float(clip.get("source_end") or 0.0),
+        clip,
         assets=local_assets,
         mode=mode,
         max_items=max_items,
@@ -1027,6 +1131,29 @@ def add_project_broll(
     base: dict[str, object] = {
         "clip_id": str(clip.get("id")),
         "mode": mode,
+        "planner": proposal["planner"],
+        "ai": proposal["ai"],
+        "stages": [
+            {
+                "label": "Analysed the clip's transcript",
+                "detail": (
+                    f"{proposal['ai']['moments']} visual moment(s) chosen by "
+                    f"{proposal['ai']['model']}"
+                    if proposal["planner"] == PLANNER_AI
+                    else f"{proposal['ai'].get('sentences') or len(segments)} sentence(s) "
+                    "read with the clip's own keywords"
+                ),
+                "status": "done",
+            },
+            {
+                "label": "Generated the search queries",
+                "detail": ", ".join(
+                    f"“{item.get('query')}”" for item in proposal["items"][:3]
+                )
+                or "none",
+                "status": "done" if proposal["items"] else "skipped",
+            },
+        ],
         "stock_configured": settings.enabled,
         "stock_note": (
             None
@@ -1039,7 +1166,14 @@ def add_project_broll(
     }
 
     if not proposal["items"]:
-        return {**base, "added": 0, "downloaded": 0, "reused": 0, "selected": []}
+        return {
+            **base,
+            "added": 0,
+            "downloaded": 0,
+            "reused": 0,
+            "selected": [],
+            "note": proposal["note"],
+        }
 
     online_items = [
         item
@@ -1075,12 +1209,15 @@ def add_project_broll(
         key for key, asset in cache.items() if str(asset.get("id")) in on_timeline
     ]
 
-    def search(query: str) -> list[dict[str, object]]:
+    def search(query: str, media_type: str = "both") -> list[dict[str, object]]:
+        """One provider search for one moment, in the kind that moment asked for."""
+
         return _stock_search(
             settings,
             query,
             per_page=AUTO_SEARCH_PER_QUERY,
             orientation=orientation,
+            media=media_type,
         )
 
     fetch_plan = plan_fetches(
@@ -1102,6 +1239,14 @@ def add_project_broll(
         )
         return {
             **base,
+            "stages": [
+                *base["stages"],
+                {
+                    "label": "Searched the stock provider",
+                    "detail": detail or "no query could be made",
+                    "status": "skipped",
+                },
+            ],
             "added": 0,
             "downloaded": 0,
             "reused": 0,
@@ -1185,6 +1330,19 @@ def add_project_broll(
     if not references:
         return {
             **base,
+            "stages": [
+                *base["stages"],
+                {
+                    "label": "Searched the stock provider",
+                    "detail": f"{len(fetch_plan['fetches'])} query(ies) returned a candidate",
+                    "status": "done",
+                },
+                {
+                    "label": "Downloaded the chosen assets",
+                    "detail": " | ".join(failures) or "nothing could be downloaded",
+                    "status": "failed",
+                },
+            ],
             "added": 0,
             "downloaded": downloaded,
             "reused": reused,
@@ -1220,6 +1378,31 @@ def add_project_broll(
     return {
         **base,
         **timeline,
+        "stages": [
+            *base["stages"],
+            {
+                "label": "Searched the stock provider",
+                "detail": (
+                    f"{len(fetch_plan['fetches'])} search(es) returned a usable asset"
+                    + (f", {len(fetch_plan['errors'])} failed" if fetch_plan["errors"] else "")
+                ),
+                "status": "done",
+            },
+            {
+                "label": "Downloaded the chosen assets",
+                "detail": (
+                    f"{downloaded} downloaded, {reused} reused from this project"
+                    if downloaded or reused
+                    else "nothing needed downloading"
+                ),
+                "status": "done" if downloaded or reused or not fetch_plan["fetches"] else "failed",
+            },
+            {
+                "label": "Placed the B-roll on the timeline",
+                "detail": f"{len(references)} insert(s) now in this clip's edit",
+                "status": "done",
+            },
+        ],
         "added": len(references),
         "downloaded": downloaded,
         "reused": reused,
@@ -1492,9 +1675,10 @@ def search_stock(
     """Search for stock B-roll, optionally using the clip's own transcript.
 
     With no explicit query, the keywords come from the transcript of the clip the
-    user is editing, so the search matches what is actually being said at that
-    moment rather than a generic topic. Videos and photos are searched together;
-    ``media`` narrows that to one kind when the user asks for it.
+    user is editing — and when no clip is named, from the project's transcript as a
+    whole — so an empty search box still searches what is being said rather than
+    demanding a keyword. Only when there is genuinely nothing to search for does
+    the reply say so, and it says it as an answer rather than an error.
     """
 
     settings = _stock_settings(request)
@@ -1516,7 +1700,33 @@ def search_stock(
                 float(clip.get("source_end") or 0.0),
             )
         )
-        text = ", ".join(keywords)
+    if not text and not keywords:
+        # No clip context: the project's own transcript is still a better search
+        # than refusing the request.
+        keywords = derive_keywords(
+            " ".join(str(segment.get("text") or "") for segment in segments)
+        )
+    text = text or ", ".join(keywords)
+
+    if not text:
+        # Nothing to search for yet. This is a plain answer, not a failure: with an
+        # empty box and no transcript, "a keyword is required" is a dead end.
+        note = (
+            "Search off: set PEXELS_API_KEY in .env to enable stock search."
+            if not settings.enabled
+            else "Nothing to search for yet: type a keyword, or transcribe this "
+            "video so the search can use the clip's own words."
+        )
+        payload: dict[str, object] = {
+            **_stock_status(settings),
+            "query": "",
+            "keywords": [],
+            "results": [],
+            "note": note,
+        }
+        if clip is not None:
+            payload["clip_id"] = str(clip.get("id"))
+        return payload
 
     results = _stock_search(
         settings,

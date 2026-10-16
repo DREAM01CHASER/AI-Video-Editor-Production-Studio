@@ -123,6 +123,7 @@ FastAPI backend
   ├── clip candidate service
   ├── caption/ASS generation service
   ├── local asset and optional Pexels search service
+  ├── optional LLM pass for clip labels and B-roll moments
   ├── timeline/project JSON service
   └── FFmpeg render service
         |
