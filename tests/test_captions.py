@@ -97,11 +97,15 @@ def test_normalise_style_rejects_unknown_values(field: str, value: str) -> None:
     assert field in error.value.message
 
 
-def test_normalise_style_rejects_a_non_boolean_high_contrast() -> None:
+@pytest.mark.parametrize("field", ["high_contrast", "uppercase", "highlighting"])
+def test_normalise_style_rejects_a_non_boolean_flag_and_names_it(field: str) -> None:
     with pytest.raises(ApiError) as error:
-        normalise_style({**default_style(), "high_contrast": "maybe"})
+        normalise_style({**default_style(), field: "maybe"})
 
     assert error.value.code == "invalid_caption_style"
+    # The message has to name the field that was refused; a style has three
+    # flags, so "high_contrast" must not be blamed for all of them.
+    assert field in error.value.message
 
 
 # ----------------------------------------------------------------- geometry

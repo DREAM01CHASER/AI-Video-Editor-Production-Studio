@@ -172,6 +172,11 @@ def propose_broll(
     Returns a dictionary with the chosen ``items`` and a plain-language ``note``
     that always says what happened — including why nothing could be placed, so a
     silent "no B-roll" is not possible.
+
+    Item ``start``/``end`` are **clip-relative** (0 = the clip's first frame),
+    matching what the timeline validates and what the renderer expects. The
+    absolute position of the clip in the source is reported separately through
+    ``clip_start``/``clip_end``.
     """
 
     chosen_mode = normalise_mode(mode)
@@ -233,10 +238,19 @@ def propose_broll(
             continue
 
         placed.append({"start": start, "end": end, "keywords": candidate["keywords"],
-                       "text": candidate["text"]})
+                       "text": candidate["text"],
+                       "segment": candidate["end"] - candidate["start"]})
         covered += end - start
 
     placed.sort(key=lambda item: item["start"])
+
+    # Transcript times are absolute source times, but a timeline B-roll item is
+    # always measured from the clip's first frame (see timeline._check_range).
+    # Convert once here, after spacing/budget math, so proposals are directly
+    # applyable to the clip that produced them.
+    for item in placed:
+        item["start"] = round(item["start"] - clip_start, 3)
+        item["end"] = round(item["end"] - clip_start, 3)
 
     items: list[dict] = []
     for index, item in enumerate(placed, start=1):
@@ -257,7 +271,7 @@ def propose_broll(
                     "shows what is being described."
                 ),
                 "duration_reason": (
-                    f"{duration:g}s covers most of a {round(item['end'] - item['start'], 1)}s "
+                    f"{duration:g}s covers most of a {round(item['segment'], 1)}s "
                     "spoken turn without hiding the speaker for the whole sentence."
                 ),
             }

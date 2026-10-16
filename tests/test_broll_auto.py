@@ -362,6 +362,63 @@ def _real_jpeg(tmp_path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _real_mp4(tmp_path: Path) -> Path:
+    """A tiny real MP4, so FFprobe reads a genuine clip on import."""
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is not on PATH, so a real clip cannot be made.")
+    path = tmp_path / "cutaway.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:size=320x180:rate=25:duration=3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return path
+
+
+def _late_clip_project(client: TestClient) -> None:
+    """Re-seed the project with a clip at 20s→28s and a matching transcript.
+
+    Transcript times stay absolute source times; only the clip moved. A clip
+    that starts later than zero is where absolute-times proposals used to break.
+    """
+
+    store = client.app.state.projects
+    late_clip = {**CLIP, "source_start": 20.0, "source_end": 28.0}
+    store.save_clips("abc123", [late_clip], {"generator": "heuristic"})
+    store.save_transcript(
+        "abc123",
+        {
+            "version": 1,
+            "project_id": "abc123",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "segments": [
+                {**segment, "start": segment["start"] + 20.0, "end": segment["end"] + 20.0}
+                for segment in SEGMENTS
+            ],
+        },
+    )
+
+
 def test_add_b_rolls_downloads_places_and_credits_a_stock_photo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -410,6 +467,88 @@ def test_add_b_rolls_downloads_places_and_credits_a_stock_photo(
 
     # And the file really is servable, which is what the browser previews.
     assert client.get(asset["url"]).status_code == 200
+
+
+def test_add_b_rolls_on_a_late_clip_places_relative_to_the_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a clip that starts at 20s must still receive its inserts.
+
+    The transcript speaks in absolute source times, but a timeline B-roll item
+    is validated against the clip's own length. The pass used to hand the
+    timeline 20s+ starts for an 8s clip, and the placement was refused.
+    """
+
+    import app.stock as stock_module
+
+    photo_bytes = _real_jpeg(tmp_path)
+    client = _project(tmp_path)
+    _late_clip_project(client)
+    monkeypatch.setattr(stock_module, "_urlopen", _opener(PHOTO_BODY))
+    monkeypatch.setattr(
+        stock_module, "_urlopen_stream", lambda request, timeout: _FakeResponse(photo_bytes)
+    )
+
+    response = client.post(
+        "/api/projects/abc123/broll/auto",
+        json={"clip_id": "clip-1", "mode": "auto", "max_items": 2},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["added"] >= 1
+    for chosen in payload["selected"]:
+        assert 0.0 <= chosen["start"] < chosen["end"] <= 8.0
+
+    # The insert really is stored clip-relative on the clip's timeline.
+    timeline = client.get("/api/projects/abc123/timeline?clip_id=clip-1").json()
+    assert timeline["broll"]
+    for item in timeline["broll"]:
+        assert 0.0 <= item["start"] < item["end"] <= 8.0
+
+
+def test_propose_then_apply_round_trips_for_a_late_starting_clip(tmp_path: Path) -> None:
+    """The draft a user sees must be directly applyable, even off the clip's start.
+
+    This is the exact path the interface takes when a proposal is accepted.
+    """
+
+    client = _project(tmp_path)
+    _late_clip_project(client)
+
+    proposal = client.post(
+        "/api/projects/abc123/broll/propose", json={"clip_id": "clip-1", "mode": "auto"}
+    ).json()
+    assert proposal["items"]
+    for item in proposal["items"]:
+        assert 0.0 <= item["start"] < item["end"] <= 8.0
+
+    source = _real_mp4(tmp_path)
+    with source.open("rb") as handle:
+        imported = client.post(
+            "/api/projects/abc123/assets",
+            files={"file": ("cutaway.mp4", handle, "video/mp4")},
+            data={"kind": "broll", "label": "City traffic", "tags": "city,traffic"},
+        )
+    assert imported.status_code == 201, imported.text
+    asset_id = imported.json()["id"]
+
+    applied = client.post(
+        "/api/projects/abc123/broll/apply",
+        json={
+            "clip_id": "clip-1",
+            "items": [
+                {"asset_id": asset_id, "start": item["start"], "end": item["end"]}
+                for item in proposal["items"]
+            ],
+        },
+    )
+
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    assert body["placed"] == len(proposal["items"])
+    for item in body["broll"]:
+        assert 0.0 <= item["start"] < item["end"] <= 8.0
 
 
 def test_a_second_pass_reuses_the_file_instead_of_downloading_it_again(

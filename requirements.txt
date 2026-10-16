@@ -7,6 +7,11 @@ python-multipart==0.0.20
 # Local speech-to-text (Milestone 3). Pulls in CTranslate2 and PyAV. Model
 # weights are downloaded on first use into the normal Hugging Face cache and are
 # never committed to the repository.
+#
+# This installs the CPU path only — CTranslate2 needs a separate CUDA runtime
+# (cuBLAS/cuDNN) to use an NVIDIA GPU, and those wheels live in
+# requirements-gpu.txt. Until they are installed, transcription runs on
+# CPU/int8 by design, and the log and /api/health say so.
 faster-whisper==1.2.1
 
 # Subtitle serialisation (Milestone 5), the library named in TECH_STACK.md: style

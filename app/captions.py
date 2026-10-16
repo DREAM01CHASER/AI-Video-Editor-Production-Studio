@@ -175,7 +175,7 @@ def _enum(value: object, allowed: Sequence[str], field: str, fallback: str) -> s
     return text
 
 
-def _flag(value: object, fallback: bool) -> bool:
+def _flag(value: object, fallback: bool, name: str) -> bool:
     if value is None:
         return fallback
     if isinstance(value, bool):
@@ -187,7 +187,7 @@ def _flag(value: object, fallback: bool) -> bool:
         return False
     raise ApiError(
         "invalid_caption_style",
-        f"high_contrast must be true or false (got '{value}').",
+        f"{name} must be true or false (got '{value}').",
         422,
     )
 
@@ -245,14 +245,16 @@ def normalise_style(raw: dict | None) -> dict[str, object]:
             "line_length",
             str(defaults["line_length"]),
         ),
-        "high_contrast": _flag(source.get("high_contrast"), bool(defaults["high_contrast"])),
+        "high_contrast": _flag(
+            source.get("high_contrast"), bool(defaults["high_contrast"]), "high_contrast"
+        ),
         "position": _percent(source.get("position"), float(defaults["position"])),
         "font_family": _enum(
             source.get("font_family"), FONT_FAMILIES, "font_family", str(defaults["font_family"])
         ),
-        "uppercase": _flag(source.get("uppercase"), bool(defaults["uppercase"])),
+        "uppercase": _flag(source.get("uppercase"), bool(defaults["uppercase"]), "uppercase"),
         "highlighting": _flag(
-            source.get("highlighting"), bool(defaults["highlighting"])
+            source.get("highlighting"), bool(defaults["highlighting"]), "highlighting"
         ),
         "animation": _enum(
             source.get("animation"), ANIMATION_LEVELS, "animation", str(defaults["animation"])

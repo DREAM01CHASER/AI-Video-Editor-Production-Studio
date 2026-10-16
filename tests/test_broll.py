@@ -92,6 +92,30 @@ def test_inserts_are_spaced_apart() -> None:
         assert later["start"] >= earlier["end"]
 
 
+def test_proposals_are_clip_relative_even_when_the_clip_starts_late() -> None:
+    """Regression: transcript times are absolute, but timeline items are not.
+
+    A clip at 30s→42s used to be offered inserts at 31s+, which the timeline
+    refuses ("must sit inside the 12.00s clip"). Shifting the clip and its
+    transcript together must move the clip's own view of the insert, not the
+    insert itself: the same sentences must land at the same clip-relative times.
+    """
+
+    shifted = [
+        {**segment, "start": segment["start"] + 30.0, "end": segment["end"] + 30.0}
+        for segment in SEGMENTS
+    ]
+    proposal = propose_broll(shifted, clip_start=30.0, clip_end=42.0, mode="online")
+    at_zero = propose_broll(SEGMENTS, clip_start=0.0, clip_end=12.0, mode="online")
+
+    assert proposal["items"]
+    for item in proposal["items"]:
+        assert 0.0 <= item["start"] < item["end"] <= 12.0 + 0.01
+    assert [(item["start"], item["end"]) for item in proposal["items"]] == [
+        (item["start"], item["end"]) for item in at_zero["items"]
+    ]
+
+
 def test_a_clip_with_nothing_to_show_explains_itself() -> None:
     proposal = propose_broll(
         [{"id": "s1", "start": 0.0, "end": 3.0, "text": "um okay yeah so"}],

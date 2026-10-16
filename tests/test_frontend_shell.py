@@ -5,10 +5,12 @@ layout the interface is meant to provide and that the demo data is labelled
 honestly rather than presented as real processing.
 """
 
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.captions import PRESETS
 from app.config import Settings
 from app.main import create_app
 
@@ -87,6 +89,22 @@ def test_shell_labels_sample_data_and_explains_export_requirements(tmp_path: Pat
     assert "arrive with the next milestone" not in flat
     assert "Transitions arrive with" not in flat
     assert "Milestone 9" in flat  # the footer names the milestone that is now built
+
+
+def test_caption_preset_options_match_the_backend_presets(tmp_path: Path) -> None:
+    """The interface offers exactly the presets the backend can render.
+
+    A name that drifts between the two sides either makes a preset unreachable
+    or offers one the renderer would refuse, so both directions are asserted.
+    """
+
+    body = _client(tmp_path).get("/").text
+    select = re.search(r'<select id="caption-style".*?</select>', body, re.S)
+    assert select, "the caption preset select is missing"
+
+    offered = re.findall(r'<option value="([^"]+)"', select.group(0))
+    assert len(offered) == len(PRESETS), f"preset count drifted: {offered}"
+    assert set(offered) == set(PRESETS), f"preset names drifted: {offered}"
 
 
 def test_render_controls_and_result_player_are_present(tmp_path: Path) -> None:

@@ -294,6 +294,9 @@ cutaway should go and how long it should run as a draft to edit or ignore, and
 
 - **Placement follows the words.** A moment is suggested only where a sentence has
   concrete, visual words to illustrate; filler and short lines are skipped.
+- **Times are clip-relative.** A proposal always sits inside the clip it belongs
+  to — 0s is the clip's first frame — even when the clip starts deep into the
+  source video, so an accepted draft applies and renders unchanged.
 - **Duration reasons are explicit.** An insert covers about 80% of the spoken turn,
   bounded between 1.5s and 4s, so a short line still gets a readable glance and a
   long sentence stays a cutaway rather than a second edit.
@@ -475,6 +478,7 @@ Stop the server with `Ctrl+C`.
 | `ModuleNotFoundError: No module named 'app'` | You are in the wrong folder. `cd` into the project folder and retry. |
 | `ModuleNotFoundError: No module named 'uvicorn'` | Dependencies are not installed for the Python you are running. Activate `.venv`, or `python -m pip install -r requirements.txt`. |
 | `[Errno 10048] address already in use` | A server is already on port 8000. Stop it, or start this one with `--port 8001`. |
+| Transcription still says **CPU** although an NVIDIA GPU is installed | Check *which Python* is running: the app's `studio ready:` log line names the interpreter and the device transcription will use, and `GET /api/health` → `transcription.compute` reports the same device. If the interpreter is not `.venv\Scripts\python.exe`, start with `Start Studio.bat` (or activate `.venv` first). If it is, the CUDA wheels are missing: `python -m pip install -r requirements-gpu.txt`, then confirm with `python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"` — anything but `0` is a visible device. |
 
 ## API
 
@@ -639,9 +643,11 @@ during transcription as well as at model load.
 
 The chosen device is visible in three places: `GET /api/health`
 (`transcription.compute`), the transcript summary in the interface (which shows
-`CUDA` or `CPU` next to the model), and the app log, where a GPU that could not be
-used is logged as a warning explaining what is missing. The decision itself is
-made by `app/compute.py`, which loads the virtualenv's CUDA runtime, probes the
+`CUDA` or `CPU` next to the model), and the app log. The log opens with a
+`studio ready:` line naming the **Python interpreter** the server is running and
+the device transcription will use, and a visible GPU that could not be used is
+logged as a warning explaining what is missing. The decision itself is made by
+`app/compute.py`, which loads the virtualenv's CUDA runtime, probes the
 libraries, and reports the result as data.
 
 ## Optional LLM clip labels
