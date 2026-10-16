@@ -1155,6 +1155,10 @@ def add_project_broll(
             },
         ],
         "stock_configured": settings.enabled,
+        # ``auto`` deliberately skips Pexels for a matching local asset. Expose
+        # the count and query list so the UI can distinguish that choice from a
+        # provider request that failed or was never configured.
+        "stock_searches": [],
         "stock_note": (
             None
             if settings.enabled
@@ -1239,6 +1243,7 @@ def add_project_broll(
         )
         return {
             **base,
+            "stock_searches": fetch_plan.get("searched", []),
             "stages": [
                 *base["stages"],
                 {
@@ -1377,6 +1382,7 @@ def add_project_broll(
 
     return {
         **base,
+        "stock_searches": fetch_plan.get("searched", []),
         **timeline,
         "stages": [
             *base["stages"],

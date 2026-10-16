@@ -1920,6 +1920,10 @@ async function addBrolls() {
     const summary = [plannerNote(payload), payload.note, payload.stock_note]
       .filter(Boolean)
       .join(" ");
+    const searched = Array.isArray(payload.stock_searches)
+      ? payload.stock_searches.length
+      : 0;
+    const localOnly = payload.mode === "auto" && searched === 0 && (payload.added ?? 0) > 0;
     log(
       `Add B-Rolls: ${payload.added ?? 0} insert(s) placed, ` +
         `${payload.downloaded ?? 0} downloaded, ${payload.reused ?? 0} reused.`
@@ -1941,7 +1945,9 @@ async function addBrolls() {
     );
     renderBrollStages();
     renderBrollProposals();
-    els.brollStatus.textContent = summary + " Completed.";
+    els.brollStatus.textContent = summary + (localOnly
+      ? " Auto mode used matching local assets, so Pexels was not queried. Choose Stock (Pexels) only to force provider searches."
+      : " Completed.");
   } catch (error) {
     showBrollError(connectionErrorMessage(error));
     state.broll.retryable = true;

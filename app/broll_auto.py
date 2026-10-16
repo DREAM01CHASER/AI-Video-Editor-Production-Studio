@@ -221,6 +221,7 @@ def plan_fetches(
     fetches: list[dict] = []
     skipped: list[dict] = []
     errors: list[str] = []
+    searched: list[dict] = []
 
     for position, item in enumerate(items, start=1):
         source = item.get("source") or {}
@@ -249,6 +250,10 @@ def plan_fetches(
         # The search is the caller's business, but it is told which kind of media
         # this moment asked for so an image-only moment cannot settle for a clip.
         media_type = str(source.get("media_type") or item.get("media_type") or "both")
+        # Keep this trace in the response path.  In ``auto`` mode a local match
+        # is intentionally resolved before this point, which can otherwise look
+        # like a broken Pexels integration when no network request is expected.
+        searched.append({"index": index, "query": query, "media_type": media_type})
         try:
             results = list(search(query, media_type))
         except Exception as exc:  # noqa: BLE001 - one bad query must not stop the pass
@@ -307,6 +312,7 @@ def plan_fetches(
         "fetches": fetches,
         "skipped": skipped,
         "errors": errors,
+        "searched": searched,
         "used_ids": [*avoid, *taken],
     }
 
