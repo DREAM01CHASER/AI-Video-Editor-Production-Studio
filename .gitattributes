@@ -1,0 +1,12 @@
+# Windows scripts must be checked out with CRLF.
+#
+# Without this, `git add` reports "LF will be replaced by CRLF" on every commit,
+# and a clone could check the .bat out with bare LF — which cmd.exe misreads.
+# Everything else is already normalised to LF in the index by `core.autocrlf`,
+# so no other rules are needed.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Git reads this file itself with LF, so keep it that way.
+.gitattributes text eol=lf
