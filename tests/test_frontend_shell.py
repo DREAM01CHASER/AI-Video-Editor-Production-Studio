@@ -258,3 +258,25 @@ def test_static_assets_are_served(tmp_path: Path) -> None:
     assert ".workspace" in css.text
     # The previous shell shipped a non-existent DOM API; guard against a revival.
     assert "addChange" not in js.text
+
+
+def test_a_dropped_request_is_retried_or_explained(tmp_path: Path) -> None:
+    """A localhost page outlives server restarts, so a request written to a
+    connection that has already gone away must not surface as the browser's bare
+    "Failed to fetch", which names nothing and suggests nothing to do."""
+
+    script = _client(tmp_path).get("/static/app.js").text
+
+    # Every request goes through the one wrapper that can recover a dead
+    # connection, so none can bypass the retry.
+    assert script.count("await fetch(") == 1, "only the apiFetch wrapper may call fetch directly"
+    assert "async function apiFetch(url, options = {})" in script
+
+    # The two uploads that can strand a large file opt into the retry.
+    assert script.count("retry: true") >= 2
+
+    # A request that never reached the server is named in plain language, and no
+    # path echoes the browser's own raw wording to the user.
+    assert "function connectionErrorMessage(" in script
+    assert "could not reach its local server" in script
+    assert "error.message" not in script

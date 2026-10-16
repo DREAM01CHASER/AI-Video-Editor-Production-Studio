@@ -359,6 +359,48 @@ function apiErrorMessage(payload, fallback) {
   return payload?.error?.message || fallback;
 }
 
+/**
+ * Say what a failed request means in words the user can act on.
+ *
+ * `fetch` rejects with a bare `TypeError` when the request never reached the
+ * server at all: the process is not running, it restarted, or a connection the
+ * browser kept alive had already gone away. The browser's own wording for that
+ * is "Failed to fetch", which explains nothing and suggests nothing to do.
+ */
+function connectionErrorMessage(error, fallback = "The request could not be completed.") {
+  if (error instanceof TypeError) {
+    return (
+      "The app could not reach its local server, so nothing was sent. " +
+      "The server may have stopped — start it again (Start Studio.bat), " +
+      "reload this page, then retry."
+    );
+  }
+  return error?.message || fallback;
+}
+
+/**
+ * `fetch` that survives a connection the browser thought was still open.
+ *
+ * On localhost the browser keeps connections alive. When the server is
+ * restarted while the page stays open, the next request can be written to the
+ * dead connection and rejected instantly even though the server is healthy. One
+ * retry, after a short pause, opens a fresh connection and turns that transient
+ * failure back into a success. Reads are always safe to repeat; a request that
+ * changes something opts in with `retry: true`.
+ */
+async function apiFetch(url, options = {}) {
+  const { retry = false, ...init } = options;
+  const method = (init.method || "GET").toUpperCase();
+  const repeatable = retry || method === "GET" || method === "HEAD";
+  try {
+    return await fetch(url, init);
+  } catch (error) {
+    if (!(error instanceof TypeError) || !repeatable) throw error;
+    await sleep(400);
+    return fetch(url, init);
+  }
+}
+
 /** True when the open project is a real imported one that has a source file. */
 function isRealProject() {
   return Boolean(state.project.id) && state.project.id !== DEMO_PROJECT.id;
@@ -368,7 +410,7 @@ function isRealProject() {
 
 async function checkHealth() {
   try {
-    const response = await fetch("/api/health", { headers: { Accept: "application/json" } });
+    const response = await apiFetch("/api/health", { headers: { Accept: "application/json" } });
     if (!response.ok) {
       throw new Error(`Backend returned HTTP ${response.status}`);
     }
@@ -451,7 +493,7 @@ function renderProjectList() {
 
 async function fetchProjects() {
   try {
-    const response = await fetch("/api/projects", { headers: { Accept: "application/json" } });
+    const response = await apiFetch("/api/projects", { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     state.projects = Array.isArray(data.projects) ? data.projects : [];
@@ -622,7 +664,7 @@ async function fetchAssets(projectId) {
   }
 
   try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
+    const response = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
       headers: { Accept: "application/json" },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -636,7 +678,7 @@ async function fetchAssets(projectId) {
     hideAssetError();
   } catch (error) {
     state.assets = [];
-    showAssetError(`Could not list the asset library: ${error.message}`);
+    showAssetError(`Could not list the asset library: ${connectionErrorMessage(error)}`);
   }
 
   renderAssetList();
@@ -657,9 +699,11 @@ async function importAsset(file, kind) {
   formData.append("label", file.name.replace(/\.[^.]+$/, ""));
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/assets`,
-      { method: "POST", body: formData }
+      // Same reasoning as the source upload: a dropped connection leaves no
+      // half-imported asset, so repeating a large import is safe.
+      { method: "POST", body: formData, retry: true }
     );
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -671,9 +715,9 @@ async function importAsset(file, kind) {
     log(`Imported ${kind} asset ${payload.label}.`);
     await fetchAssets(state.project.id);
   } catch (error) {
-    showAssetError(error.message);
+    showAssetError(connectionErrorMessage(error));
     els.assetStatus.textContent = "The asset was not imported.";
-    log(`Error: ${error.message}`);
+    log(`Error: ${connectionErrorMessage(error)}`);
   } finally {
     state.assetBusy = false;
     els.assetFileInput.value = "";
@@ -686,7 +730,7 @@ async function deleteAsset(asset) {
 
   hideAssetError();
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/assets/${encodeURIComponent(asset.id)}`,
       { method: "DELETE", headers: { Accept: "application/json" } }
     );
@@ -699,7 +743,7 @@ async function deleteAsset(asset) {
     log(`Deleted asset ${asset.label || asset.id}.`);
     await fetchAssets(state.project.id);
   } catch (error) {
-    showAssetError(error.message);
+    showAssetError(connectionErrorMessage(error));
   }
 }
 
@@ -744,7 +788,7 @@ async function loadStockStatus(projectId) {
   if (!isRealProject()) return;
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/stock`,
       { headers: { Accept: "application/json" } }
     );
@@ -755,8 +799,8 @@ async function loadStockStatus(projectId) {
     state.stock.status = payload;
     els.stockStatus.textContent = payload.note || "";
   } catch (error) {
-    state.stock.status = { configured: false, note: error.message };
-    els.stockStatus.textContent = error.message;
+    state.stock.status = { configured: false, note: connectionErrorMessage(error) };
+    els.stockStatus.textContent = connectionErrorMessage(error);
   }
 
   updateStockControls();
@@ -873,7 +917,7 @@ async function searchStock() {
   if (orientation && orientation !== "all") parameters.set("orientation", orientation);
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/stock/search?${parameters}`,
       { headers: { Accept: "application/json" } }
     );
@@ -891,7 +935,7 @@ async function searchStock() {
     renderStockResults();
     log(`Stock search “${payload.query}” returned ${state.stock.results.length} result(s).`);
   } catch (error) {
-    showStockError(error.message);
+    showStockError(connectionErrorMessage(error));
     els.stockStatus.textContent = "The search did not finish.";
     state.stock.results = [];
     renderStockResults();
@@ -911,7 +955,7 @@ async function importStockResult(result) {
   updateStockControls();
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/stock/import`,
       {
         method: "POST",
@@ -936,7 +980,7 @@ async function importStockResult(result) {
     // Place it on the timeline so the search leads to a real edit, not just a file.
     await placeStockAssetOnTimeline(asset, result);
   } catch (error) {
-    showStockError(error.message);
+    showStockError(connectionErrorMessage(error));
     els.stockStatus.textContent = "The clip was not imported.";
   } finally {
     state.assetBusy = false;
@@ -1717,7 +1761,7 @@ async function addBrolls() {
   updateBrollControls();
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/broll/auto`,
       {
         method: "POST",
@@ -1755,7 +1799,7 @@ async function addBrolls() {
     renderBrollProposals();
     els.brollStatus.textContent = summary;
   } catch (error) {
-    showBrollError(error.message);
+    showBrollError(connectionErrorMessage(error));
   } finally {
     state.broll.busy = false;
     updateBrollControls();
@@ -1770,7 +1814,7 @@ async function suggestBroll() {
   els.brollStatus.textContent = "Reading the transcript…";
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/broll/propose`,
       {
         method: "POST",
@@ -1793,7 +1837,7 @@ async function suggestBroll() {
       .filter(Boolean)
       .join(" ");
   } catch (error) {
-    showBrollError(error.message);
+    showBrollError(connectionErrorMessage(error));
     els.brollStatus.textContent = "";
   } finally {
     updateBrollControls();
@@ -1807,7 +1851,7 @@ async function applyBrollProposal(proposal) {
   els.btnBrollSuggest.disabled = true;
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/broll/apply`,
       {
         method: "POST",
@@ -1830,7 +1874,7 @@ async function applyBrollProposal(proposal) {
     els.brollStatus.textContent = payload.note || "Placed.";
     await loadTimeline(state.project.id, state.timeline.clip_id);
   } catch (error) {
-    showBrollError(error.message);
+    showBrollError(connectionErrorMessage(error));
   } finally {
     updateBrollControls();
   }
@@ -2131,7 +2175,7 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
 
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/timeline?clip_id=${encodeURIComponent(clipId)}`,
       { headers: { Accept: "application/json" } }
     );
@@ -2153,7 +2197,7 @@ async function loadTimeline(projectId, clipId, { quiet = false } = {}) {
   } catch (error) {
     state.timeline = null;
     renderTimeline();
-    showTimelineError(error.message);
+    showTimelineError(connectionErrorMessage(error));
     setTimelineSaveState("Unavailable", "badge status-error");
     return null;
   }
@@ -2194,7 +2238,7 @@ async function sendTimelinePatch(patch, { reloadCaptions = false } = {}) {
   updateTimelineControls();
 
   try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/timeline`, {
+    const response = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/timeline`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ clip_id: state.timeline.clip_id, ...patch }),
@@ -2235,13 +2279,13 @@ async function sendTimelinePatch(patch, { reloadCaptions = false } = {}) {
     if (reloadCaptions) await loadCaptionPreview();
     return payload;
   } catch (error) {
-    log(`Error: ${error.message}`);
+    log(`Error: ${connectionErrorMessage(error)}`);
     setTimelineSaveState("Not saved", "badge status-error");
     // Re-read the stored edit so the timeline never shows a rejected change, but
     // quietly: the explanation of what was refused has to stay on screen.
     const clipId = state.timeline?.clip_id;
     if (clipId) await loadTimeline(projectId, clipId, { quiet: true });
-    showTimelineError(error.message);
+    showTimelineError(connectionErrorMessage(error));
     return null;
   } finally {
     state.timelineSaving = false;
@@ -2528,7 +2572,7 @@ function seekToSegment(index) {
 /** Load a saved transcript, returning null when there is nothing to show yet. */
 async function loadTranscript(projectId) {
   try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/transcript`, {
+    const response = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/transcript`, {
       headers: { Accept: "application/json" },
     });
 
@@ -2547,7 +2591,7 @@ async function loadTranscript(projectId) {
     return document_;
   } catch (error) {
     resetTranscript("The saved transcript could not be read.");
-    showTranscriptError(error.message);
+    showTranscriptError(connectionErrorMessage(error));
     return null;
   }
 }
@@ -2566,7 +2610,7 @@ async function startTranscription() {
   log(`Starting local transcription for ${projectId}.`);
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/transcribe`,
       { method: "POST" }
     );
@@ -2584,7 +2628,7 @@ async function startTranscription() {
     state.transcript.failed = true;
     setTranscriptBadge("Failed", "badge status-error");
     els.transcriptStatus.textContent = "Transcription could not start.";
-    showTranscriptError(error.message);
+    showTranscriptError(connectionErrorMessage(error));
     updateTranscribeControls();
   }
 }
@@ -2599,7 +2643,7 @@ async function pollTranscription(jobId, projectId) {
   const stillOpen = state.project.id === projectId;
 
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
       headers: { Accept: "application/json" },
     });
     const job = await response.json().catch(() => ({}));
@@ -2636,7 +2680,7 @@ async function pollTranscription(jobId, projectId) {
       TRANSCRIBE_POLL_MS
     );
   } catch (error) {
-    onTranscriptionFailed(error.message, stillOpen);
+    onTranscriptionFailed(connectionErrorMessage(error), stillOpen);
   }
 }
 
@@ -2707,7 +2751,7 @@ async function cancelTranscription() {
 
   els.btnTranscribeCancel.disabled = true;
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
       method: "POST",
     });
     const job = await response.json().catch(() => ({}));
@@ -2716,7 +2760,7 @@ async function cancelTranscription() {
     }
     els.transcriptStatus.textContent = "Cancelling…";
   } catch (error) {
-    showTranscriptError(error.message);
+    showTranscriptError(connectionErrorMessage(error));
   } finally {
     els.btnTranscribeCancel.disabled = false;
   }
@@ -2802,7 +2846,7 @@ async function suggestClips() {
   els.candidatesStatus.textContent = "Analysing the transcript for strong moments…";
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/suggest-clips`,
       { method: "POST" }
     );
@@ -2822,9 +2866,9 @@ async function suggestClips() {
     selectCandidate(null);
     log(`Suggested ${state.project.candidates.length} candidate clips.`);
   } catch (error) {
-    showCandidateError(error.message);
+    showCandidateError(connectionErrorMessage(error));
     els.candidatesStatus.textContent = "Clip suggestion failed.";
-    log(`Error: ${error.message}`);
+    log(`Error: ${connectionErrorMessage(error)}`);
   } finally {
     state.clips.busy = false;
     updateSuggestControls();
@@ -3014,7 +3058,7 @@ async function loadCaptionPreview() {
   els.captionPreviewStatus.textContent = "Building captions from the saved transcript…";
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/captions` +
         `?clip_id=${encodeURIComponent(clipId)}`,
       { headers: { Accept: "application/json" } }
@@ -3029,7 +3073,7 @@ async function loadCaptionPreview() {
     state.captions.clipId = clipId;
     renderCaptionPreview(payload);
   } catch (error) {
-    renderCaptionPreview(null, error.message);
+    renderCaptionPreview(null, connectionErrorMessage(error));
   } finally {
     state.captions.busy = false;
   }
@@ -3061,7 +3105,7 @@ async function saveProjectSettings({ reloadCaptions = false } = {}) {
   }
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(state.project.id)}/settings`,
       {
         method: "PATCH",
@@ -3086,7 +3130,7 @@ async function saveProjectSettings({ reloadCaptions = false } = {}) {
 
     if (reloadCaptions) await loadCaptionPreview();
   } catch (error) {
-    showExportError(error.message);
+    showExportError(connectionErrorMessage(error));
   }
 }
 
@@ -3166,7 +3210,7 @@ function showExportResult(result, available = true) {
 /** Show the newest render already saved for this project, if there is one. */
 async function loadExports(projectId) {
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/exports`,
       { headers: { Accept: "application/json" } }
     );
@@ -3211,7 +3255,7 @@ async function startExport() {
   updateExportControls();
 
   try {
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/projects/${encodeURIComponent(projectId)}/render`,
       {
         method: "POST",
@@ -3233,9 +3277,9 @@ async function startExport() {
     pollRender(job.job_id, projectId);
   } catch (error) {
     state.export.busy = false;
-    showExportError(error.message);
+    showExportError(connectionErrorMessage(error));
     els.exportStatus.textContent = "The export could not start.";
-    log(`Error: ${error.message}`);
+    log(`Error: ${connectionErrorMessage(error)}`);
     updateExportControls();
   }
 }
@@ -3244,7 +3288,7 @@ async function pollRender(jobId, projectId) {
   const stillOpen = state.project.id === projectId;
 
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
       headers: { Accept: "application/json" },
     });
     const job = await response.json().catch(() => ({}));
@@ -3272,7 +3316,7 @@ async function pollRender(jobId, projectId) {
 
     state.export.timer = setTimeout(() => pollRender(jobId, projectId), RENDER_POLL_MS);
   } catch (error) {
-    onRenderFinished("failed", error.message, stillOpen);
+    onRenderFinished("failed", connectionErrorMessage(error), stillOpen);
   }
 }
 
@@ -3331,7 +3375,7 @@ async function cancelExport() {
 
   els.btnExportCancel.disabled = true;
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
       method: "POST",
     });
     const job = await response.json().catch(() => ({}));
@@ -3340,7 +3384,7 @@ async function cancelExport() {
     }
     els.exportStatus.textContent = "Cancelling…";
   } catch (error) {
-    showExportError(error.message);
+    showExportError(connectionErrorMessage(error));
   } finally {
     els.btnExportCancel.disabled = false;
   }
@@ -3412,7 +3456,7 @@ function projectFromServer(payload) {
 
 async function openProject(projectId) {
   try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+    const response = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}`, {
       headers: { Accept: "application/json" },
     });
     const payload = await response.json().catch(() => ({}));
@@ -3423,7 +3467,7 @@ async function openProject(projectId) {
     projectFromServer(payload);
     log(`Opened project ${projectId}`);
   } catch (error) {
-    showError(error.message);
+    showError(connectionErrorMessage(error));
   }
 }
 
@@ -3494,7 +3538,14 @@ async function uploadFile(file) {
   formData.append("name", file.name.replace(/\.[^.]+$/, ""));
 
   try {
-    const response = await fetch("/api/projects", { method: "POST", body: formData });
+    const response = await apiFetch("/api/projects", {
+      method: "POST",
+      body: formData,
+      // A connection dropped mid-upload leaves no half-written project behind
+      // (the backend removes it), so repeating the upload is safe and it saves
+      // the user from re-picking a large file after a stale connection.
+      retry: true,
+    });
     const payload = await response.json().catch(() => ({}));
 
     if (!response.ok) {
@@ -3511,8 +3562,8 @@ async function uploadFile(file) {
     await fetchProjects();
   } catch (error) {
     setProgress(0);
-    showError(error.message);
-    log(`Error: ${error.message}`);
+    showError(connectionErrorMessage(error));
+    log(`Error: ${connectionErrorMessage(error)}`);
   } finally {
     state.busy = false;
     els.btnImport.disabled = false;
